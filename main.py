@@ -1,123 +1,115 @@
-from fastapi import FastAPI, Query, HTTPException
-import httpx  # Thay thế requests bằng httpx async
+from fastapi import FastAPI, Query, HTTPException, Depends, Request
+import httpx
 import os
 import logging
 from openai import OpenAI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime
+from cachetools import TTLCache
+import json
+from fastapi.security import APIKeyHeader
 
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO)
+# 1. CẤU HÌNH NÂNG CAO
+# ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
+# 2. CACHE HIỆU NĂNG
+# ==================
+weather_cache = TTLCache(maxsize=1000, ttl=3600)  # Cache 1 giờ
+advice_cache = TTLCache(maxsize=500, ttl=1800)    # Cache 30 phút
+
+# 3. BẢO MẬT API
+# ==============
+api_key_header = APIKeyHeader(name="X-API-KEY")
+
+def get_api_key(api_key: str = Depends(api_key_header)):
+    if api_key != os.getenv("API_SECRET_KEY"):
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return api_key
+
 app = FastAPI(
-    title="AgriBot API",
-    description="API tư vấn nông nghiệp thông minh",
-    version="2.0",
-    docs_url="/api-docs"
+    title="AgriBot Pro API",
+    description="API thông minh cho nông nghiệp với AI và dữ liệu thời tiết",
+    version="3.1",
+    docs_url="/api-docs",
+    redoc_url=None,
+    openapi_tags=[{
+        "name": "Agriculture",
+        "description": "Các endpoint tư vấn nông nghiệp"
+    }]
 )
 
-# Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=json.loads(os.getenv("ALLOWED_ORIGINS", "[]")),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Model request
-class AdviceRequest(BaseModel):
-    crop: str
-    location: str
-    lang: Optional[str] = "vi"
+# 4. MODELS NÂNG CẤP
+# ==================
+class WeatherData(BaseModel):
+    temp: float = Field(..., example=27.5)
+    humidity: int = Field(..., example=65)
+    description: str = Field(..., example="mây rải rác")
+    icon: str = Field(..., example="04d")
 
-# Lấy API key từ biến môi trường
-try:
-    OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-    WEATHER_API_KEY = os.environ["WEATHER_API_KEY"]
-except KeyError as e:
-    logger.error(f"Missing environment variable: {str(e)}")
-    raise
+class AdviceResponse(BaseModel):
+    metadata: dict
+    data: dict
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Timeout cấu hình
-TIMEOUT_CONFIG = httpx.Timeout(15.0, connect=5.0)
-WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/forecast"
-
-@app.get("/")
+# 5. ENDPOINTS NÂNG CẤP
+# =====================
+@app.get("/", include_in_schema=False)
 async def home():
-    return {"status": "running", "version": app.version}
+    return {"status": "running", "version": app.version, "timestamp": datetime.utcnow()}
 
-@app.head("/")
-async def healthcheck():
-    return PlainTextResponse("OK")
+@app.get("/health", tags=["Monitoring"])
+async def health_check():
+    """Endpoint kiểm tra tình trạng hệ thống"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-@app.get("/advise", response_model=dict)
-async def get_advise(
-    crop: str = Query(..., min_length=2, max_length=50),
-    location: str = Query(..., min_length=2, max_length=100)
+@app.get("/advise", response_model=AdviceResponse, tags=["Agriculture"])
+async def get_advice(
+    request: Request,
+    crop: str = Query(..., min_length=2, max_length=50, example="lúa"),
+    location: str = Query(..., min_length=2, max_length=100, example="Hà Nội"),
+    _: str = Depends(get_api_key)
 ):
-    """Endpoint chính cung cấp tư vấn nông nghiệp"""
+    """Nhận tư vấn nông nghiệp dựa trên cây trồng và địa điểm"""
+    cache_key = f"{crop}_{location}"
+    
+    # Kiểm tra cache
+    if cache_key in advice_cache:
+        logger.info(f"Returning cached advice for {cache_key}")
+        return advice_cache[cache_key]
+
     try:
-        # 1. Lấy dữ liệu thời tiết với timeout
-        async with httpx.AsyncClient(timeout=TIMEOUT_CONFIG) as client_http:
-            weather_response = await client_http.get(
-                WEATHER_API_URL,
-                params={
-                    "q": location,
-                    "appid": WEATHER_API_KEY,
-                    "units": "metric",
-                    "lang": "vi"
-                }
-            )
-            weather_response.raise_for_status()
-            weather_data = weather_response.json()
-
-            if not weather_data.get("list"):
-                raise HTTPException(
-                    status_code=404,
-                    detail="Không tìm thấy dữ liệu thời tiết cho địa điểm này"
-                )
-
-            forecast = weather_data["list"][0]
-            weather_info = {
-                "temp": forecast["main"]["temp"],
-                "humidity": forecast["main"]["humidity"],
-                "description": forecast["weather"][0]["description"],
-                "icon": forecast["weather"][0]["icon"]
-            }
-
+        # 1. Lấy dữ liệu thời tiết (có cache)
+        weather_info = await get_weather_data(location)
+        
         # 2. Gọi OpenAI API
-        prompt = f"""
-        Bạn là chuyên gia nông nghiệp. Hãy cung cấp lời khuyên cụ thể về:
-        - Cây trồng: {crop}
-        - Địa điểm: {location}
-        - Điều kiện thời tiết: {weather_info['description']}, nhiệt độ {weather_info['temp']}°C
-        Yêu cầu:
-        1. Ngắn gọn (dưới 150 từ)
-        2. Chia thành các mục rõ ràng
-        3. Bao gồm cả cảnh báo rủi ro nếu có
-        """
-
-        completion = await client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "Bạn là chuyên gia nông nghiệp với 20 năm kinh nghiệm."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=300
-        )
-
-        advice = completion.choices[0].message.content
-
-        return JSONResponse({
+        advice = await generate_ai_advice(crop, location, weather_info)
+        
+        response = {
             "metadata": {
                 "model": "gpt-3.5-turbo",
-                "weather_source": "OpenWeatherMap"
+                "weather_source": "OpenWeatherMap",
+                "timestamp": datetime.utcnow().isoformat()
             },
             "data": {
                 "crop": crop,
@@ -125,28 +117,91 @@ async def get_advise(
                 "weather": weather_info,
                 "advice": advice
             }
-        })
+        }
+        
+        # Lưu vào cache
+        advice_cache[cache_key] = response
+        return JSONResponse(response)
 
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Weather API error: {str(e)}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Lỗi khi lấy dữ liệu thời tiết: {e.response.status_code}"
-        )
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        logger.error(f"Error in get_advice: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="Đã xảy ra lỗi hệ thống"
+            detail=str(e)
         )
 
+# 6. HELPER FUNCTIONS
+# ===================
+async def get_weather_data(location: str) -> dict:
+    """Lấy dữ liệu thời tiết với cache"""
+    if location in weather_cache:
+        return weather_cache[location]
+
+    async with httpx.AsyncClient(timeout=TIMEOUT_CONFIG) as client:
+        response = await client.get(
+            WEATHER_API_URL,
+            params={
+                "q": location,
+                "appid": os.getenv("WEATHER_API_KEY"),
+                "units": "metric",
+                "lang": "vi"
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if not data.get("list"):
+            raise HTTPException(status_code=404, detail="Weather data not found")
+        
+        forecast = data["list"][0]
+        weather_info = {
+            "temp": forecast["main"]["temp"],
+            "humidity": forecast["main"]["humidity"],
+            "description": forecast["weather"][0]["description"],
+            "icon": forecast["weather"][0]["icon"]
+        }
+        
+        weather_cache[location] = weather_info
+        return weather_info
+
+async def generate_ai_advice(crop: str, location: str, weather: dict) -> str:
+    """Tạo lời khuyên từ AI"""
+    prompt = f"""
+    Là chuyên gia nông nghiệp, hãy đưa ra lời khuyên cụ thể về:
+    - Cây trồng: {crop}
+    - Địa điểm: {location}
+    - Thời tiết: {weather['description']}, {weather['temp']}°C, độ ẩm {weather['humidity']}%
+    
+    Yêu cầu:
+    1. Ngắn gọn (150-200 từ)
+    2. Có cấu trúc rõ ràng
+    3. Bao gồm cảnh báo rủi ro
+    4. Ngôn ngữ tự nhiên, thân thiện
+    """
+    
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = await client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Bạn là chuyên gia nông nghiệp 20 năm kinh nghiệm."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        max_tokens=350
+    )
+    
+    return response.choices[0].message.content
+
+# 7. CẤU HÌNH SERVER
+# ===================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
         port=port,
+        reload=os.getenv("DEBUG", "false").lower() == "true",
         timeout_keep_alive=30,
         log_config="log.ini"
     )
