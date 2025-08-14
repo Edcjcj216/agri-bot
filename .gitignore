@@ -1,3 +1,62 @@
-AppData/
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyd
+*.pyo
+*.so
+.python-version
+.venv/
+venv/
+env/
+venv*/
+ENV/
+
+# Environment variables
+.env
+.env.local
+.env.*
+secrets.json
+config.ini
+
+# FastAPI specific
+instance/
+.webassets-cache
+
+# Logs và temp files
 *.log
 *.tmp
+*.bak
+*.swp
+*.swo
+
+# Thư mục hệ thống
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Build/output
+dist/
+build/
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Render
+render.yaml
+render.yml
+
+# Windows
+AppData/
+Local/
+[Tt]humbs.db

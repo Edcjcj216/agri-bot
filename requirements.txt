@@ -1,4 +1,5 @@
-fastapi
-uvicorn
-requests
-openai
+fastapi==0.95.2
+openai==0.27.8
+httpx==0.24.1
+uvicorn==0.22.0
+python-dotenv==1.0.0
