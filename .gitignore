@@ -1,3 +1,15 @@
-AppData/
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs and temp files
 *.log
 *.tmp
+
+# Environment variables
+.env
+
+# OS-specific
+.DS_Store
+Thumbs.db
+AppData/

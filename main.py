@@ -1,21 +1,23 @@
 from fastapi import FastAPI, Query
 import requests
 import os
-from openai import OpenAI
+import google.generativeai as genai  # Dùng Gemini API
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Lấy API key từ biến môi trường Render
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
-if not OPENAI_API_KEY:
-    raise ValueError("Thiếu OPENAI_API_KEY. Hãy đặt key trong Render → Environment.")
+if not GEMINI_API_KEY:
+    raise ValueError("Thiếu GEMINI_API_KEY. Hãy đặt key trong Render → Environment.")
 
 if not WEATHER_API_KEY:
     raise ValueError("Thiếu WEATHER_API_KEY. Hãy đặt key trong Render → Environment.")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Khởi tạo client Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 @app.get("/")
 def home():
@@ -24,8 +26,8 @@ def home():
         media_type="application/json; charset=utf-8"
     )
 
+# Healthcheck cho UptimeRobot
 @app.head("/")
-
 async def healthcheck():
     return PlainTextResponse("OK", media_type="text/plain; charset=utf-8")
 
@@ -42,25 +44,27 @@ def advise(crop: str = Query(...), location: str = Query(...)):
             content={"error": "Không lấy được dữ liệu thời tiết."},
             media_type="application/json; charset=utf-8"
         )
+    
     forecast = weather_data["list"][0]
     temp = forecast["main"]["temp"]
     desc = forecast["weather"][0]["description"]
 
-    # 2. Gọi AI để phân tích
+    # 2. Gọi AI để phân tích với Gemini
     prompt = (
         f"Tôi là chuyên gia nông nghiệp. Với cây {crop} ở {location}, "
         f"nhiệt độ {temp}°C và thời tiết {desc}, "
         "hãy đưa ra gợi ý dinh dưỡng và chăm sóc phù hợp trong tuần tới."
     )
 
-    completion = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+    completion = genai.chat.create(
+        model="gemini-1.5-t",
         messages=[
             {"role": "system", "content": "Bạn là chuyên gia nông nghiệp."},
             {"role": "user", "content": prompt},
         ],
     )
-    advice = completion.choices[0].message.content
+
+    advice = completion.last["content"][0]["text"]
 
     return JSONResponse(
         content={
