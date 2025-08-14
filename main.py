@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Query
 import requests
 import os
-import openai
+from openai import OpenAI
+from fastapi.responses import PlainTextResponse
 
 app = FastAPI()
 
@@ -15,11 +16,16 @@ if not OPENAI_API_KEY:
 if not WEATHER_API_KEY:
     raise ValueError("Thiếu WEATHER_API_KEY. Hãy đặt key trong Render → Environment.")
 
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 @app.get("/")
 def home():
     return {"message": "AI Bot Nông nghiệp đang chạy!"}
+
+# Healthcheck cho UptimeRobot
+@app.head("/")
+async def healthcheck():
+    return PlainTextResponse("OK")
 
 @app.get("/advise")
 def advise(crop: str = Query(...), location: str = Query(...)):
@@ -44,7 +50,7 @@ def advise(crop: str = Query(...), location: str = Query(...)):
         "hãy đưa ra gợi ý dinh dưỡng và chăm sóc phù hợp trong tuần tới."
     )
 
-    completion = openai.ChatCompletion.create(
+    completion = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Bạn là chuyên gia nông nghiệp."},
@@ -52,7 +58,7 @@ def advise(crop: str = Query(...), location: str = Query(...)):
         ],
     )
 
-    advice = completion.choices[0].message["content"]
+    advice = completion.choices[0].message.content
 
     return {
         "crop": crop,
