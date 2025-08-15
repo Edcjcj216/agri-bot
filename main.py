@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 import requests
 import os
-import google.generativeai as genai  # Dùng Gemini API
+import google.generativeai as genai
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 app = FastAPI()
@@ -26,14 +26,25 @@ def home():
         media_type="application/json; charset=utf-8"
     )
 
-# Healthcheck cho UptimeRobot
 @app.head("/")
 async def healthcheck():
     return PlainTextResponse("OK", media_type="text/plain; charset=utf-8")
 
 @app.get("/advise")
 def advise(crop: str = Query(...), location: str = Query(...)):
-    # 1. Lấy dữ liệu thời tiết
+    return get_advice(crop, location)
+
+# API cho ThingsBoard POST dữ liệu
+@app.post("/predict")
+def predict(payload: dict = Body(...)):
+    crop = payload.get("crop")
+    location = payload.get("location")
+    if not crop or not location:
+        return JSONResponse(content={"error": "Thiếu crop hoặc location"}, status_code=400)
+    return get_advice(crop, location)
+
+# Hàm chung để lấy thời tiết + gọi AI
+def get_advice(crop, location):
     weather_url = (
         f"https://api.openweathermap.org/data/2.5/forecast"
         f"?q={location}&appid={WEATHER_API_KEY}&units=metric&lang=vi"
@@ -49,7 +60,6 @@ def advise(crop: str = Query(...), location: str = Query(...)):
     temp = forecast["main"]["temp"]
     desc = forecast["weather"][0]["description"]
 
-    # 2. Gọi AI để phân tích với Gemini
     prompt = (
         f"Tôi là chuyên gia nông nghiệp. Với cây {crop} ở {location}, "
         f"nhiệt độ {temp}°C và thời tiết {desc}, "
