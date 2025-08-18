@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Query, Body
+from fastapi.responses import PlainTextResponse, JSONResponse
+from pydantic import BaseModel
 import requests
 import os
 import google.generativeai as genai
-from fastapi.responses import PlainTextResponse, JSONResponse
 
 app = FastAPI()
 
@@ -19,6 +20,8 @@ if not WEATHER_API_KEY:
 # Khởi tạo Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
+
+# ===== API kiểm tra server =====
 @app.get("/")
 def home():
     return JSONResponse(
@@ -30,6 +33,8 @@ def home():
 async def healthcheck():
     return PlainTextResponse("OK", media_type="text/plain; charset=utf-8")
 
+
+# ===== API tư vấn nông nghiệp =====
 @app.get("/advise")
 def advise(crop: str = Query(...), location: str = Query(...)):
     return get_advice(crop, location)
@@ -70,7 +75,7 @@ def get_advice(crop, location):
         )
         print("DEBUG Prompt:", prompt)
 
-        # Gọi Gemini API (đúng cú pháp)
+        # Gọi Gemini API
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(prompt)
         print("DEBUG AI Response:", response)
@@ -97,6 +102,24 @@ def get_advice(crop, location):
             status_code=500
         )
 
+
+# ===== API nhận dữ liệu telemetry từ thiết bị IoT =====
+class TelemetryPayload(BaseModel):
+    temperature: float
+    humidity: float
+    battery: float
+
+@app.post("/api/v1/{device_token}/telemetry")
+def telemetry(device_token: str, payload: TelemetryPayload):
+    print(f"Received telemetry from {device_token}: {payload.dict()}")
+    return {
+        "status": "ok",
+        "device_token": device_token,
+        "data": payload.dict()
+    }
+
+
+# ===== Chạy local =====
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
