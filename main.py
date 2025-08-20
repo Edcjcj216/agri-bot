@@ -5,8 +5,8 @@ import requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
-AI_API_URL = "https://api.openai.com/v1/gemini/predict"
-AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # Hardcode trực tiếp
+AI_API_URL = "https://api.openai.com/v1/responses"
+AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # Trực tiếp trong file
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -37,11 +37,9 @@ async def receive_esp32(data: ESP32Data):
     """
     Nhận dữ liệu ESP32 → gọi AI → push ThingsBoard
     """
-    # Lưu dữ liệu mới nhất
     latest_data["temperature"] = data.temperature
     latest_data["humidity"] = data.humidity
 
-    # Gọi AI
     prediction, advice = call_ai(data.temperature, data.humidity)
 
     payload = {"prediction": prediction, "advice": advice}
@@ -55,20 +53,25 @@ def call_ai(temp: float, humi: float):
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
     }
+
+    data = {
+        "model": "gemini-1.5",
+        "input": f"Nhiệt độ {temp}°C, độ ẩm {humi}%. Dự đoán cây trồng và đưa ra lời khuyên."
+    }
+
     try:
-        resp = requests.post(
-            AI_API_URL,
-            headers=headers,
-            json={"temperature": temp, "humidity": humi},
-            timeout=10
-        )
+        resp = requests.post(AI_API_URL, headers=headers, json=data, timeout=10)
         resp.raise_for_status()
         ai_json = resp.json()
-        prediction = ai_json.get("prediction", f"Nhiệt độ {temp}°C, độ ẩm {humi}%")
-        advice     = ai_json.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
+        output_text = ""
+        if "output" in ai_json and isinstance(ai_json["output"], list):
+            output_text = " ".join([o.get("content", "") for o in ai_json["output"]])
+        prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        advice = output_text if output_text else "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
     except Exception as e:
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        advice     = f"(Fallback) Không gọi được AI API: {str(e)}"
+        advice = f"(Fallback) Không gọi được AI API: {str(e)}"
+
     return prediction, advice
 
 # ================== THINGSBOARD HELPER ==================
