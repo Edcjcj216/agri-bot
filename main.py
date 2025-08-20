@@ -1,12 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests, asyncio, uvicorn
+import os, requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_API_KEY = "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"
+
+# Lấy API key từ biến môi trường Render
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise ValueError("⚠️ OPENROUTER_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -68,7 +72,6 @@ def call_openrouter(temp: float, humi: float):
         ai_json = resp.json()
         # Lấy output text đầu tiên
         text_output = ai_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-        # Tách prediction/advice nếu muốn, ở đây demo đơn giản
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         advice = text_output or "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
     except Exception as e:
