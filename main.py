@@ -1,14 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests, asyncio, uvicorn
+import requests, asyncio, uvicorn, os
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 
-# AI Gemini
+# AI Gemini từ biến môi trường
 AI_API_URL = "https://api.openai.com/v1/gemini/predict"
-AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"
+AI_API_KEY = os.getenv("AI_API_KEY")
+if not AI_API_KEY:
+    raise ValueError("⚠️ AI_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -22,7 +24,7 @@ app.add_middleware(
 )
 
 # ================== GLOBAL ==================
-latest_data = {"temperature": None, "humidity": None}
+latest_data = {"temperature": 30, "humidity": 70}  # default để background task không push None
 
 # ================== MODEL ==================
 class ESP32Data(BaseModel):
