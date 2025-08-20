@@ -1,16 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests, asyncio, uvicorn
+import os, requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
-GEMINI_API_URL = "https://api.openai.com/v1/gemini/predict"
-GEMINI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # Key trực tiếp
+GEMINI_API_URL = "https://gemini.googleapis.com/v1/models/gemma-3-27b-it:predict"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Lấy từ biến môi trường
+
+if not GEMINI_API_KEY:
+    raise ValueError("⚠️ GEMINI_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,20 +53,20 @@ def call_gemini(temp: float, humi: float):
         "Content-Type": "application/json"
     }
     prompt = f"Dự báo nông nghiệp: nhiệt độ {temp}°C, độ ẩm {humi}%. Đưa ra advice ngắn gọn."
+
+    payload = {"input": [{"role": "user", "content": prompt}]}
+
     try:
-        resp = requests.post(
-            GEMINI_API_URL,
-            headers=headers,
-            json={"temperature": temp, "humidity": humi, "prompt": prompt},
-            timeout=10
-        )
+        resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
         ai_json = resp.json()
+        text_output = ai_json.get("output", [{}])[0].get("content", "")
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        advice = ai_json.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
+        advice = text_output or "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
     except Exception as e:
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         advice = f"(Fallback) Không gọi được AI Gemini: {str(e)}"
+
     return prediction, advice
 
 # ================== THINGSBOARD HELPER ==================
