@@ -1,125 +1,126 @@
-from fastapi import FastAPI, Query, Body
-from fastapi.responses import PlainTextResponse, JSONResponse
-from pydantic import BaseModel
-import requests
-import os
-import google.generativeai as genai
+# ================== main.py ==================
+from fastapi import FastAPI, Request
+import requests, json, os, asyncio
+import time
+import threading
 
 app = FastAPI()
 
-# Lấy API key từ biến môi trường Render
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+# ================== CONFIG ==================
+DEMO_DEVICE_TOKEN = "66dd31thvta4gx1l781q"
+THINGSBOARD_URL = "https://thingsboard.cloud/api/v1"
 
-if not GEMINI_API_KEY:
-    raise ValueError("Thiếu GEMINI_API_KEY. Hãy đặt key trong Render → Environment.")
+AI_API_URL = "https://api.example.com/predict"  # Thay bằng API thật
+AI_API_KEY = os.getenv("AI_API_KEY")            # hoặc đặt trực tiếp
 
-if not WEATHER_API_KEY:
-    raise ValueError("Thiếu WEATHER_API_KEY. Hãy đặt key trong Render → Environment.")
+# ================== AI cache 5 phút ==================
+last_ai_update = 0
+ai_cache = {"prediction": "", "advice": ""}
 
-# Khởi tạo Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-
-
-# ===== API kiểm tra server =====
-@app.get("/")
-def home():
-    return JSONResponse(
-        content={"message": "AI Bot Nông nghiệp đang chạy!"},
-        media_type="application/json; charset=utf-8"
-    )
-
-@app.head("/")
-async def healthcheck():
-    return PlainTextResponse("OK", media_type="text/plain; charset=utf-8")
-
-
-# ===== API tư vấn nông nghiệp =====
-@app.get("/advise")
-def advise(crop: str = Query(...), location: str = Query(...)):
-    return get_advice(crop, location)
-
-@app.post("/predict")
-def predict(payload: dict = Body(...)):
-    crop = payload.get("crop")
-    location = payload.get("location")
-    if not crop or not location:
-        return JSONResponse(content={"error": "Thiếu crop hoặc location"}, status_code=400)
-    return get_advice(crop, location)
-
-def get_advice(crop, location):
-    try:
-        # Lấy dữ liệu thời tiết
-        weather_url = (
-            f"https://api.openweathermap.org/data/2.5/forecast"
-            f"?q={location}&appid={WEATHER_API_KEY}&units=metric&lang=vi"
-        )
-        weather_data = requests.get(weather_url, timeout=10).json()
-        print("DEBUG Weather API:", weather_data)
-
-        if "list" not in weather_data:
-            return JSONResponse(
-                content={"error": f"Không lấy được dữ liệu thời tiết: {weather_data}"},
-                status_code=500
+def get_ai_prediction(payload):
+    global last_ai_update, ai_cache
+    current_time = time.time()
+    # chỉ gọi AI API nếu đã quá 5 phút
+    if current_time - last_ai_update > 300 or not ai_cache["prediction"]:
+        try:
+            ai_resp = requests.post(
+                AI_API_URL,
+                headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                json=payload,
+                timeout=10
             )
+            ai_resp.raise_for_status()
+            ai_result = ai_resp.json()
+            ai_cache["prediction"] = ai_result.get("prediction", f"Nhiệt độ {payload['temperature']}°C, độ ẩm {payload['humidity']}%")
+            ai_cache["advice"] = ai_result.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
+        except Exception:
+            ai_cache["prediction"] = f"Nhiệt độ {payload['temperature']}°C, độ ẩm {payload['humidity']}%"
+            ai_cache["advice"] = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
+        last_ai_update = current_time
+    return ai_cache
 
-        forecast = weather_data["list"][0]
-        temp = forecast["main"]["temp"]
-        desc = forecast["weather"][0]["description"]
+# ================== REST endpoint nhận dữ liệu ESP32 thật ==================
+@app.post("/esp32-data")
+async def receive_esp32(request: Request):
+    data = await request.json()
 
-        # Prompt cho AI
-        prompt = (
-            f"Tôi là chuyên gia nông nghiệp. Với cây {crop} ở {location}, "
-            f"nhiệt độ {temp}°C và thời tiết {desc}, "
-            "hãy đưa ra gợi ý dinh dưỡng và chăm sóc phù hợp trong tuần tới."
-        )
-        print("DEBUG Prompt:", prompt)
+    temperature = data.get("temperature")
+    humidity    = data.get("humidity")
+    battery     = data.get("battery")
+    crop        = data.get("crop", "Rau muống")
+    location    = data.get("location", "Ho Chi Minh,VN")
 
-        # Gọi Gemini API
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        print("DEBUG AI Response:", response)
-
-        advice = getattr(response, "text", None) or str(response)
-
-        return JSONResponse(
-            content={
-                "crop": crop,
-                "location": location,
-                "temperature": temp,
-                "weather": desc,
-                "advice": advice
-            },
-            media_type="application/json; charset=utf-8"
-        )
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print("DEBUG ERROR:", error_details)
-        return JSONResponse(
-            content={"error": str(e), "trace": error_details},
-            status_code=500
-        )
-
-
-# ===== API nhận dữ liệu telemetry từ thiết bị IoT =====
-class TelemetryPayload(BaseModel):
-    temperature: float
-    humidity: float
-    battery: float
-
-@app.post("/api/v1/{device_token}/telemetry")
-def telemetry(device_token: str, payload: TelemetryPayload):
-    print(f"Received telemetry from {device_token}: {payload.dict()}")
-    return {
-        "status": "ok",
-        "device_token": device_token,
-        "data": payload.dict()
+    ai_payload = {
+        "temperature": temperature,
+        "humidity": humidity,
+        "battery": battery,
+        "crop": crop,
+        "location": location
     }
 
+    # Lấy prediction/advice từ cache
+    ai_result = get_ai_prediction(ai_payload)
 
-# ===== Chạy local =====
+    telemetry = {
+        "prediction": ai_result["prediction"],
+        "advice": ai_result["advice"]
+    }
+
+    # Gửi lên DEMO device
+    try:
+        resp = requests.post(
+            f"{THINGSBOARD_URL}/{DEMO_DEVICE_TOKEN}/telemetry",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(telemetry),
+            timeout=5
+        )
+        resp.raise_for_status()
+        print(f"[{time.strftime('%H:%M:%S')}] ✅ Telemetry DEMO sent from ESP32")
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] ❌ Error sending telemetry: {e}")
+        return {"status": "fail", "error": str(e), "telemetry": telemetry}
+
+    return {"status": "ok", "telemetry": telemetry}
+
+# ================== Demo loop gửi dữ liệu random 5 phút ==================
+async def send_demo_loop():
+    import random
+    while True:
+        temperature = round(random.uniform(25, 32),1)
+        humidity    = round(random.uniform(50, 80),1)
+        ai_payload = {
+            "temperature": temperature,
+            "humidity": humidity,
+            "battery": 3.7,
+            "crop": "Rau muống",
+            "location": "Ho Chi Minh,VN"
+        }
+        ai_result = get_ai_prediction(ai_payload)
+
+        telemetry = {
+            "prediction": ai_result["prediction"],
+            "advice": ai_result["advice"]
+        }
+
+        try:
+            requests.post(
+                f"{THINGSBOARD_URL}/{DEMO_DEVICE_TOKEN}/telemetry",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(telemetry),
+                timeout=5
+            )
+            print(f"[{time.strftime('%H:%M:%S')}] ✅ Demo telemetry sent")
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] ❌ Error: {e}")
+        await asyncio.sleep(300)
+
+# ================== Khởi chạy server + demo loop ==================
 if __name__ == "__main__":
+    # Start loop demo telemetry trong background
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=lambda: loop.run_until_complete(send_demo_loop()), daemon=True).start()
+
+    # Start FastAPI server trên Render
+    port = int(os.environ.get("PORT", 8000))
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
