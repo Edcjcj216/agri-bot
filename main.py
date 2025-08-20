@@ -6,16 +6,14 @@ import os, requests, asyncio, uvicorn
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # biến môi trường
 
-# Lấy API key từ biến môi trường Render
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("⚠️ OPENROUTER_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,6 +23,8 @@ app.add_middleware(
 
 # ================== GLOBAL ==================
 latest_data = {"temperature": None, "humidity": None}
+DEFAULT_TEMP = 30
+DEFAULT_HUMI = 70
 
 # ================== MODEL ==================
 class ESP32Data(BaseModel):
@@ -70,7 +70,6 @@ def call_openrouter(temp: float, humi: float):
         )
         resp.raise_for_status()
         ai_json = resp.json()
-        # Lấy output text đầu tiên
         text_output = ai_json.get("choices", [{}])[0].get("message", {}).get("content", "")
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         advice = text_output or "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
@@ -94,12 +93,9 @@ def push_thingsboard(payload: dict):
 
 # ================== BACKGROUND TASK ==================
 async def periodic_ai_loop():
-    """
-    Mỗi 5 phút gọi AI với dữ liệu ESP32 mới nhất → push ThingsBoard
-    """
     while True:
-        temp = latest_data.get("temperature", 30)
-        humi = latest_data.get("humidity", 70)
+        temp = latest_data.get("temperature") or DEFAULT_TEMP
+        humi = latest_data.get("humidity") or DEFAULT_HUMI
 
         prediction, advice = call_openrouter(temp, humi)
         payload = {"prediction": prediction, "advice": advice}
