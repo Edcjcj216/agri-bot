@@ -11,19 +11,32 @@ THINGSBOARD_URL = "https://thingsboard.cloud/api/v1"
 AI_API_URL = "https://api.example.com/predict"  # Thay bằng API thật
 AI_API_KEY = os.getenv("AI_API_KEY")            # hoặc đặt trực tiếp
 
+# ================== Bộ nhớ tạm lưu dữ liệu ESP32 mới nhất ==================
+latest_data = {"temperature": None, "humidity": None}
+
+
 # ================== REST endpoint nhận dữ liệu ESP32 thật ==================
 @app.post("/esp32-data")
 async def receive_esp32(request: Request):
     data = await request.json()
 
-    temperature = data.get("temperature")
-    humidity    = data.get("humidity")
+    # Lưu lại dữ liệu mới nhất để AI xử lý theo lịch
+    latest_data["temperature"] = data.get("temperature")
+    latest_data["humidity"]    = data.get("humidity")
 
-    # ================== Gọi AI API ==================
-    ai_payload = {
-        "temperature": temperature,
-        "humidity": humidity
-    }
+    return {"status": "ok", "latest_data": latest_data}
+
+
+# ================== Hàm gọi AI API và gửi kết quả lên ThingsBoard ==================
+def process_and_send_ai():
+    temperature = latest_data.get("temperature")
+    humidity    = latest_data.get("humidity")
+
+    if temperature is None or humidity is None:
+        return  # Chưa có dữ liệu ESP32 thì bỏ qua
+
+    # ---- Gọi AI API ----
+    ai_payload = {"temperature": temperature, "humidity": humidity}
     try:
         ai_resp = requests.post(
             AI_API_URL,
@@ -39,12 +52,8 @@ async def receive_esp32(request: Request):
         prediction = f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
         advice     = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
 
-    # ================== Telemetry chỉ gửi prediction + advice ==================
-    telemetry = {
-        "prediction": prediction,
-        "advice": advice
-    }
-
+    # ---- Gửi Telemetry lên DEMO device ----
+    telemetry = {"prediction": prediction, "advice": advice}
     try:
         resp = requests.post(
             f"{THINGSBOARD_URL}/{DEMO_DEVICE_TOKEN}/telemetry",
@@ -53,42 +62,31 @@ async def receive_esp32(request: Request):
             timeout=5
         )
         resp.raise_for_status()
+        print(f"✅ AI telemetry sent: {telemetry}")
     except Exception as e:
-        return {"status": "fail", "error": str(e), "telemetry": telemetry}
+        print(f"❌ Error sending telemetry: {e}")
 
-    return {"status": "ok", "telemetry": telemetry}
 
-# ================== Demo loop gửi dữ liệu AI giả mỗi 5 phút ==================
-async def send_demo_loop():
-    import random, time
+# ================== Background loop mỗi 5 phút ==================
+async def ai_loop():
     while True:
-        temperature = round(random.uniform(25, 32),1)
-        humidity    = round(random.uniform(50, 80),1)
-        prediction  = f"Dữ liệu demo: nhiệt độ {temperature}°C, độ ẩm {humidity}%"
-        advice      = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
-        telemetry = {
-            "prediction": prediction,
-            "advice": advice
-        }
-        try:
-            requests.post(
-                f"{THINGSBOARD_URL}/{DEMO_DEVICE_TOKEN}/telemetry",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(telemetry),
-                timeout=5
-            )
-            print(f"[{time.strftime('%H:%M:%S')}] ✅ Demo telemetry sent")
-        except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] ❌ Error: {e}")
+        process_and_send_ai()
         await asyncio.sleep(300)  # 5 phút
 
-# ================== Khởi chạy server + demo loop ==================
+
+# ================== Health check endpoint ==================
+@app.get("/")
+async def root():
+    return {"status": "running", "message": "Render server ready"}
+
+
+# ================== Khởi chạy server + AI loop ==================
 if __name__ == "__main__":
     import threading
     import uvicorn
 
     loop = asyncio.get_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(send_demo_loop()), daemon=True).start()
+    threading.Thread(target=lambda: loop.run_until_complete(ai_loop()), daemon=True).start()
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
