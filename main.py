@@ -85,13 +85,7 @@ async def root():
     return {"status": "running", "message": "Render server ready"}
 
 
-# ================== Khởi chạy server + AI loop ==================
-if __name__ == "__main__":
-    import threading
-    import uvicorn
-
-    loop = asyncio.get_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(ai_loop()), daemon=True).start()
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# ================== Chạy background task khi app startup ==================
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(ai_loop())
