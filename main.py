@@ -12,7 +12,8 @@ from pydantic import BaseModel
 # =========================
 # CONFIG
 # =========================
-THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
+DEMO_TOKEN = "kfj6183wtsdijxu3z4yx"  # ThingsBoard DEMO device token
+THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{DEMO_TOKEN}/telemetry"
 HF_API_KEY = os.getenv("HF_API_KEY")                  # Hugging Face token
 HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")
 DEFAULT_TEMP = 30
@@ -44,7 +45,7 @@ class ESP32Data(BaseModel):
     humidity: float
 
 # =========================
-# HF CALL
+# HUGGING FACE CALL
 # =========================
 def call_huggingface(prompt: str, timeout: int = 30) -> str:
     if not HF_API_KEY:
@@ -126,14 +127,21 @@ async def receive_esp32(data: ESP32Data):
     return {"status": "ok", "latest_data": data.dict(), "prediction": prediction, "advice": advice}
 
 # =========================
-# BACKGROUND LOOP (HF AI → TB)
+# BACKGROUND TASK (ESP32 ảo + HF AI → ThingsBoard)
 # =========================
 async def periodic_ai_loop():
+    i = 1
     while True:
-        temp = latest_data.get("temperature") or DEFAULT_TEMP
-        humi = latest_data.get("humidity") or DEFAULT_HUMI
-        prediction, advice = get_advice(temp, humi)
-        push_thingsboard({"prediction": prediction, "advice": advice})
+        sensor_data = fake_esp32_data()
+        print(f"📥 ESP32 ảo gửi #{i}: {sensor_data}")
+        prediction, advice = get_advice(sensor_data["temperature"], sensor_data["humidity"])
+        push_thingsboard({
+            "temperature": sensor_data["temperature"],
+            "humidity": sensor_data["humidity"],
+            "prediction": prediction,
+            "advice": advice
+        })
+        i += 1
         await asyncio.sleep(300)  # 5 phút
 
 @app.on_event("startup")
