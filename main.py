@@ -5,11 +5,11 @@ import os, requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
-GEMINI_API_URL = "https://gemini.googleapis.com/v1/models/gemma-3-27b-it:predict"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Lấy từ biến môi trường
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # từ biến môi trường
 
-if not GEMINI_API_KEY:
-    raise ValueError("⚠️ GEMINI_API_KEY chưa được cấu hình trong biến môi trường")
+if not OPENROUTER_API_KEY:
+    raise ValueError("⚠️ OPENROUTER_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -40,32 +40,39 @@ async def receive_esp32(data: ESP32Data):
     latest_data["temperature"] = data.temperature
     latest_data["humidity"] = data.humidity
 
-    prediction, advice = call_gemini(data.temperature, data.humidity)
+    prediction, advice = call_openrouter(data.temperature, data.humidity)
     payload = {"prediction": prediction, "advice": advice}
     push_thingsboard(payload)
 
     return {"status": "ok", "latest_data": data.dict(), "prediction": prediction, "advice": advice}
 
 # ================== AI HELPER ==================
-def call_gemini(temp: float, humi: float):
+def call_openrouter(temp: float, humi: float):
     headers = {
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    prompt = f"Dự báo nông nghiệp: nhiệt độ {temp}°C, độ ẩm {humi}%. Đưa ra advice ngắn gọn."
-
-    payload = {"input": [{"role": "user", "content": prompt}]}
+    prompt = f"Dự báo nông nghiệp: nhiệt độ {temp}°C, độ ẩm {humi}%. Advice ngắn gọn."
 
     try:
-        resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=10)
+        resp = requests.post(
+            OPENROUTER_API_URL,
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7
+            },
+            timeout=10
+        )
         resp.raise_for_status()
         ai_json = resp.json()
-        text_output = ai_json.get("output", [{}])[0].get("content", "")
+        text_output = ai_json.get("choices", [{}])[0].get("message", {}).get("content", "")
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         advice = text_output or "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
     except Exception as e:
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        advice = f"(Fallback) Không gọi được AI Gemini: {str(e)}"
+        advice = f"(Fallback) Không gọi được AI OpenRouter: {str(e)}"
 
     return prediction, advice
 
@@ -88,7 +95,7 @@ async def periodic_ai_loop():
         temp = latest_data.get("temperature") or DEFAULT_TEMP
         humi = latest_data.get("humidity") or DEFAULT_HUMI
 
-        prediction, advice = call_gemini(temp, humi)
+        prediction, advice = call_openrouter(temp, humi)
         payload = {"prediction": prediction, "advice": advice}
         push_thingsboard(payload)
 
