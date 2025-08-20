@@ -1,14 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests, asyncio, uvicorn
+import requests, asyncio, uvicorn, os
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 
-# AI Gemini
-AI_API_URL = "https://api.openai.com/v1/gemini/predict"
-AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # nên set qua biến môi trường
+# AI Gemini (OpenAI)
+AI_API_URL = "https://api.openai.com/v1/chat/completions"  # endpoint chuẩn hiện tại
+AI_MODEL   = "gpt-4o-mini"  # ví dụ model có thể dùng
+AI_API_KEY = os.getenv("AI_API_KEY")  # bắt buộc set qua biến môi trường
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -32,13 +33,10 @@ class ESP32Data(BaseModel):
 # ================== ROUTES ==================
 @app.get("/")
 def home():
-    return {"message": "Agri-Bot service is running"}  # plain text, bỏ emoji
+    return {"message": "Agri-Bot service is running"}  # plain text
 
 @app.post("/esp32-data")
 async def receive_esp32(data: ESP32Data):
-    """
-    Nhận dữ liệu từ ESP32 → gọi AI → push ThingsBoard
-    """
     # Lưu dữ liệu mới nhất
     latest_data["temperature"] = data.temperature
     latest_data["humidity"]    = data.humidity
@@ -53,21 +51,38 @@ async def receive_esp32(data: ESP32Data):
 
 # ================== AI HELPER ==================
 def call_ai(temp: float, humi: float):
+    # fallback nếu biến môi trường chưa set
+    if not AI_API_KEY:
+        return (
+            f"Nhiệt độ {temp}°C, độ ẩm {humi}%",
+            "(Fallback) AI_API_KEY chưa cấu hình"
+        )
+
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
     }
+
+    prompt = f"Dự đoán tình trạng cây trồng với nhiệt độ {temp}°C và độ ẩm {humi}%. Gợi ý cách chăm sóc."
+
     try:
         resp = requests.post(
             AI_API_URL,
             headers=headers,
-            json={"temperature": temp, "humidity": humi},
+            json={
+                "model": AI_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100
+            },
             timeout=10
         )
         resp.raise_for_status()
         ai_json = resp.json()
-        prediction = ai_json.get("prediction", f"Nhiệt độ {temp}°C, độ ẩm {humi}%")
-        advice     = ai_json.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
+        content = ai_json["choices"][0]["message"]["content"]
+
+        # Giản lược, ví dụ tách prediction/advice từ content
+        prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        advice     = content
     except Exception as e:
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         advice     = f"(Fallback) Không gọi được AI API: {str(e)}"
@@ -88,12 +103,9 @@ def push_thingsboard(payload: dict):
 
 # ================== BACKGROUND TASK ==================
 async def periodic_ai_loop():
-    """
-    Mỗi 5 phút gọi AI với dữ liệu ESP32 mới nhất → push ThingsBoard
-    """
     while True:
-        temp = latest_data.get("temperature", 30)
-        humi = latest_data.get("humidity", 70)
+        temp = latest_data.get("temperature") or 30
+        humi = latest_data.get("humidity") or 70
 
         prediction, advice = call_ai(temp, humi)
         payload = {"prediction": prediction, "advice": advice}
