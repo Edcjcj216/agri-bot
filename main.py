@@ -1,91 +1,41 @@
-# ================== main.py ==================
 from fastapi import FastAPI, Request
-import requests, json, os, asyncio
+import requests
 
 app = FastAPI()
 
-# ================== CONFIG ==================
-DEMO_DEVICE_TOKEN = "66dd31thvta4gx1l781q"
-THINGSBOARD_URL = "https://thingsboard.cloud/api/v1"
+# Config
+THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 
-AI_API_URL = "https://api.example.com/predict"  # Thay bằng API thật
-AI_API_KEY = os.getenv("AI_API_KEY")            # hoặc đặt trực tiếp
-
-# ================== Bộ nhớ tạm lưu dữ liệu ESP32 mới nhất ==================
-latest_data = {"temperature": None, "humidity": None}
-
-
-# ================== Hàm gọi AI API và gửi kết quả lên ThingsBoard ==================
-def process_and_send_ai():
-    temperature = latest_data.get("temperature")
-    humidity    = latest_data.get("humidity")
-
-    if temperature is None or humidity is None:
-        print("⚠️ Chưa có dữ liệu ESP32 → bỏ qua push")
-        return
-
-    # ---- Gọi AI API ----
-    ai_payload = {"temperature": temperature, "humidity": humidity}
-    try:
-        ai_resp = requests.post(
-            AI_API_URL,
-            headers={"Authorization": f"Bearer {AI_API_KEY}"},
-            json=ai_payload,
-            timeout=10
-        )
-        ai_resp.raise_for_status()
-        ai_result = ai_resp.json()
-        prediction = ai_result.get("prediction", f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%")
-        advice     = ai_result.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
-    except Exception as e:
-        print(f"❌ AI API error: {e}")
-        prediction = f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
-        advice     = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
-
-    # ---- Gửi Telemetry lên DEMO device ----
-    telemetry = {"prediction": prediction, "advice": advice}
-    try:
-        resp = requests.post(
-            f"{THINGSBOARD_URL}/{DEMO_DEVICE_TOKEN}/telemetry",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(telemetry),
-            timeout=5
-        )
-        resp.raise_for_status()
-        print(f"✅ AI telemetry sent: {telemetry}")
-    except Exception as e:
-        print(f"❌ Error sending telemetry: {e}")
-
-
-# ================== REST endpoint nhận dữ liệu ESP32 thật ==================
 @app.post("/esp32-data")
-async def receive_esp32(request: Request):
+async def receive_data(request: Request):
     data = await request.json()
+    temperature = data.get("temperature")
+    humidity    = data.get("humidity")
 
-    # Lưu lại dữ liệu mới nhất
-    latest_data["temperature"] = data.get("temperature")
-    latest_data["humidity"]    = data.get("humidity")
+    # Fake AI prediction & advice (có thể thay bằng API khác)
+    prediction = f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
+    advice     = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
 
-    # Push prediction ngay lập tức
-    process_and_send_ai()
+    telemetry = {
+        "prediction": prediction,
+        "advice": advice
+    }
 
-    return {"status": "ok", "latest_data": latest_data}
+    try:
+        # Push lên ThingsBoard
+        r = requests.post(
+            THINGSBOARD_URL,
+            json=telemetry,
+            headers={"Content-Type": "application/json; charset=utf-8"}
+        )
+        tb_status = r.status_code
+    except Exception as e:
+        tb_status = str(e)
 
-
-# ================== Background loop mỗi 5 phút ==================
-async def ai_loop():
-    while True:
-        process_and_send_ai()
-        await asyncio.sleep(300)  # 5 phút
-
-
-# ================== Health check endpoint ==================
-@app.get("/")
-async def root():
-    return {"status": "running", "message": "Render server ready"}
-
-
-# ================== Chạy background task khi app startup ==================
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(ai_loop())
+    return {
+        "status": "ok",
+        "received": data,
+        "prediction": prediction,
+        "advice": advice,
+        "thingsboard_status": tb_status
+    }
