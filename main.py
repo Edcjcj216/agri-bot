@@ -15,25 +15,14 @@ AI_API_KEY = os.getenv("AI_API_KEY")            # hoặc đặt trực tiếp
 latest_data = {"temperature": None, "humidity": None}
 
 
-# ================== REST endpoint nhận dữ liệu ESP32 thật ==================
-@app.post("/esp32-data")
-async def receive_esp32(request: Request):
-    data = await request.json()
-
-    # Lưu lại dữ liệu mới nhất để AI xử lý theo lịch
-    latest_data["temperature"] = data.get("temperature")
-    latest_data["humidity"]    = data.get("humidity")
-
-    return {"status": "ok", "latest_data": latest_data}
-
-
 # ================== Hàm gọi AI API và gửi kết quả lên ThingsBoard ==================
 def process_and_send_ai():
     temperature = latest_data.get("temperature")
     humidity    = latest_data.get("humidity")
 
     if temperature is None or humidity is None:
-        return  # Chưa có dữ liệu ESP32 thì bỏ qua
+        print("⚠️ Chưa có dữ liệu ESP32 → bỏ qua push")
+        return
 
     # ---- Gọi AI API ----
     ai_payload = {"temperature": temperature, "humidity": humidity}
@@ -48,7 +37,8 @@ def process_and_send_ai():
         ai_result = ai_resp.json()
         prediction = ai_result.get("prediction", f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%")
         advice     = ai_result.get("advice", "Theo dõi cây trồng, tưới nước đều, bón phân cân đối")
-    except Exception:
+    except Exception as e:
+        print(f"❌ AI API error: {e}")
         prediction = f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
         advice     = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
 
@@ -65,6 +55,21 @@ def process_and_send_ai():
         print(f"✅ AI telemetry sent: {telemetry}")
     except Exception as e:
         print(f"❌ Error sending telemetry: {e}")
+
+
+# ================== REST endpoint nhận dữ liệu ESP32 thật ==================
+@app.post("/esp32-data")
+async def receive_esp32(request: Request):
+    data = await request.json()
+
+    # Lưu lại dữ liệu mới nhất
+    latest_data["temperature"] = data.get("temperature")
+    latest_data["humidity"]    = data.get("humidity")
+
+    # Push prediction ngay lập tức
+    process_and_send_ai()
+
+    return {"status": "ok", "latest_data": latest_data}
 
 
 # ================== Background loop mỗi 5 phút ==================
