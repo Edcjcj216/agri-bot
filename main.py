@@ -5,13 +5,11 @@ import requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
-AI_API_URL = "https://api.openai.com/v1/responses"
-AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # Trực tiếp trong file
+OPENROUTER_API_KEY = "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"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# ================== FASTAPI APP ==================
+# ================== APP ==================
 app = FastAPI()
-
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,14 +32,10 @@ def root():
 
 @app.post("/esp32-data")
 async def receive_esp32(data: ESP32Data):
-    """
-    Nhận dữ liệu ESP32 → gọi AI → push ThingsBoard
-    """
     latest_data["temperature"] = data.temperature
     latest_data["humidity"] = data.humidity
 
     prediction, advice = call_ai(data.temperature, data.humidity)
-
     payload = {"prediction": prediction, "advice": advice}
     push_thingsboard(payload)
 
@@ -50,28 +44,30 @@ async def receive_esp32(data: ESP32Data):
 # ================== AI HELPER ==================
 def call_ai(temp: float, humi: float):
     headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-
-    data = {
-        "model": "gemini-1.5",
-        "input": f"Nhiệt độ {temp}°C, độ ẩm {humi}%. Dự đoán cây trồng và đưa ra lời khuyên."
-    }
-
+    prompt = f"Dự báo nông nghiệp: Nhiệt độ {temp}°C, độ ẩm {humi}%. Hãy trả về prediction và advice ngắn gọn."
     try:
-        resp = requests.post(AI_API_URL, headers=headers, json=data, timeout=10)
+        resp = requests.post(
+            OPENROUTER_API_URL,
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=10
+        )
         resp.raise_for_status()
         ai_json = resp.json()
-        output_text = ""
-        if "output" in ai_json and isinstance(ai_json["output"], list):
-            output_text = " ".join([o.get("content", "") for o in ai_json["output"]])
-        prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        advice = output_text if output_text else "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
+        content = ai_json["choices"][0]["message"]["content"]
+        # Giả sử response dạng: "prediction: ... ; advice: ..."
+        parts = content.split(";")
+        prediction = parts[0].replace("prediction:", "").strip() if len(parts) > 0 else f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        advice = parts[1].replace("advice:", "").strip() if len(parts) > 1 else "Theo dõi cây trồng, tưới nước đều, bón phân cân đối"
     except Exception as e:
         prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        advice = f"(Fallback) Không gọi được AI API: {str(e)}"
-
+        advice = f"(Fallback) Không gọi được AI OpenRouter: {str(e)}"
     return prediction, advice
 
 # ================== THINGSBOARD HELPER ==================
@@ -89,9 +85,6 @@ def push_thingsboard(payload: dict):
 
 # ================== BACKGROUND TASK ==================
 async def periodic_ai_loop():
-    """
-    Mỗi 5 phút gọi AI với dữ liệu ESP32 mới nhất → push ThingsBoard
-    """
     while True:
         temp = latest_data.get("temperature", 30)
         humi = latest_data.get("humidity", 70)
@@ -106,7 +99,7 @@ async def periodic_ai_loop():
 async def startup_event():
     asyncio.create_task(periodic_ai_loop())
 
-# ================== RUN LOCAL / Render ==================
+# ================== RUN ==================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
