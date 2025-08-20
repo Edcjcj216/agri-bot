@@ -1,10 +1,16 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os, requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
+AI_API_URL = "https://api.openai.com/v1/gemini/predict"
+
+# Lấy AI_API_KEY từ biến môi trường Render
+AI_API_KEY = os.getenv("AI_API_KEY")
+if not AI_API_KEY:
+    raise ValueError("⚠️ AI_API_KEY chưa được cấu hình trong biến môi trường")
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
@@ -25,24 +31,23 @@ class ESP32Data(BaseModel):
     temperature: float
     humidity: float
 
-# ================== CHECK ENV ==================
-AI_API_KEY = os.getenv("AI_API_KEY")
-if not AI_API_KEY:
-    raise ValueError("⚠️ AI_API_KEY chưa được cấu hình trong biến môi trường")
-
-AI_API_URL = "https://api.openai.com/v1/gemini/predict"
-
 # ================== ROUTES ==================
 @app.get("/")
-def home():
+def root():
     return {"message": "Agri-Bot service is running 🚀"}
 
 @app.post("/esp32-data")
 async def receive_esp32(data: ESP32Data):
+    """
+    Nhận dữ liệu ESP32 → gọi AI → push ThingsBoard
+    """
+    # Lưu dữ liệu mới nhất
     latest_data["temperature"] = data.temperature
-    latest_data["humidity"]    = data.humidity
+    latest_data["humidity"] = data.humidity
 
+    # Gọi AI
     prediction, advice = call_ai(data.temperature, data.humidity)
+
     payload = {"prediction": prediction, "advice": advice}
     push_thingsboard(payload)
 
@@ -85,17 +90,24 @@ def push_thingsboard(payload: dict):
 
 # ================== BACKGROUND TASK ==================
 async def periodic_ai_loop():
+    """
+    Mỗi 5 phút gọi AI với dữ liệu ESP32 mới nhất → push ThingsBoard
+    """
     while True:
         temp = latest_data.get("temperature", 30)
         humi = latest_data.get("humidity", 70)
+
         prediction, advice = call_ai(temp, humi)
-        push_thingsboard({"prediction": prediction, "advice": advice})
+        payload = {"prediction": prediction, "advice": advice}
+        push_thingsboard(payload)
+
         await asyncio.sleep(300)  # 5 phút
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(periodic_ai_loop())
 
-# ================== RUN LOCAL ==================
+# ================== RUN LOCAL / Render ==================
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
