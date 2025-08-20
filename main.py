@@ -1,16 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os, requests, asyncio, uvicorn
+import requests, asyncio, uvicorn
 
 # ================== CONFIG ==================
 THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/66dd31thvta4gx1l781q/telemetry"
 AI_API_URL = "https://api.openai.com/v1/gemini/predict"
-
-# Lấy AI_API_KEY từ biến môi trường Render
-AI_API_KEY = os.getenv("AI_API_KEY")
-if not AI_API_KEY:
-    raise ValueError("⚠️ AI_API_KEY chưa được cấu hình trong biến môi trường")
+AI_API_KEY = "AIzaSyDvHhwey-dlCtCGrUCGsrDoYVl3XlBQ8I8"  # Hardcode trực tiếp
 
 # ================== FASTAPI APP ==================
 app = FastAPI()
