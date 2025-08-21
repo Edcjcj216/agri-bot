@@ -12,9 +12,6 @@ from datetime import datetime, timedelta
 TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "sgkxcrqntuki8gu1oj8u")
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
-AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-
 LAT = float(os.getenv("LAT", "10.79"))
 LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # giây
@@ -44,7 +41,6 @@ WEATHER_CODE_MAP = {
 weather_cache = {"ts": 0, "data": {}}
 
 def get_weather_forecast():
-    """Lấy weather hôm qua, hôm nay, ngày mai + 7 mốc giờ (hour_0 → hour_6)"""
     now = datetime.now()
     if time.time() - weather_cache["ts"] < 900:  # cache 15 phút
         return weather_cache["data"]
@@ -91,21 +87,16 @@ def get_weather_forecast():
             "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
         }
 
-        # 7 mốc giờ: hour_0 → hour_6
+        # 7 mốc giờ: hour_0 → hour_6, tách ra 3 key riêng
         times = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
         hums = hourly.get("relativehumidity_2m", [])
         codes = hourly.get("weathercode", [])
         hours_data = {}
         for i in range(7):
-            if i < len(times):
-                hours_data[f"hour_{i}"] = {
-                    "temperature": round(temps[i],1),
-                    "humidity": round(hums[i],1),
-                    "weather_desc": WEATHER_CODE_MAP.get(codes[i], "?")
-                }
-            else:
-                hours_data[f"hour_{i}"] = {"temperature":0,"humidity":0,"weather_desc":"?"}
+            hours_data[f"hour_{i}_temperature"] = round(temps[i],1) if i < len(temps) else 0
+            hours_data[f"hour_{i}_humidity"] = round(hums[i],1) if i < len(hums) else 0
+            hours_data[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(codes[i], "?") if i < len(codes) else "?"
 
         result = {**weather_yesterday, **weather_today, **weather_tomorrow, **hours_data}
         weather_cache["data"] = result
@@ -117,7 +108,9 @@ def get_weather_forecast():
                     "weather_today_desc":"?","weather_today_max":0,"weather_today_min":0,"humidity_today":0,
                     "weather_tomorrow_desc":"?","weather_tomorrow_max":0,"weather_tomorrow_min":0,"humidity_tomorrow":0}
         for i in range(7):
-            fallback[f"hour_{i}"] = {"temperature":0,"humidity":0,"weather_desc":"?"}
+            fallback[f"hour_{i}_temperature"] = 0
+            fallback[f"hour_{i}_humidity"] = 0
+            fallback[f"hour_{i}_weather_desc"] = "?"
         return fallback
 
 # ================== AI HELPER ==================
