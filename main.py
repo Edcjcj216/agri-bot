@@ -17,7 +17,7 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
 LON = os.getenv("LON", "106.70")
-CROP = os.getenv("CROP", "Rau muống")
+CROP = "Rau muống"
 LOCATION_NAME = "An Phú, Hồ Chí Minh"
 
 # ================== LOGGING ==================
@@ -34,31 +34,15 @@ class SensorData(BaseModel):
 
 # ================== WEATHER ==================
 WEATHER_CODE_MAP = {
-    0: "Trời quang",
-    1: "Trời quang nhẹ",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù đóng băng",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    71: "Tuyết nhẹ",
-    73: "Tuyết vừa",
-    75: "Tuyết dày",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá mạnh"
+    0: "Trời quang", 1: "Trời quang nhẹ", 2: "Có mây", 3: "Nhiều mây", 45: "Sương mù",
+    48: "Sương mù đóng băng", 51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
+    61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to", 71: "Tuyết nhẹ", 73: "Tuyết vừa",
+    75: "Tuyết dày", 80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
+    95: "Giông nhẹ hoặc vừa", 96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá mạnh"
 }
 
 def get_weather_forecast() -> dict:
-    """Lấy dự báo hôm nay và ngày mai, tách riêng từng key"""
+    """Lấy dự báo thời tiết hôm nay và ngày mai từ Open-Meteo"""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -74,30 +58,37 @@ def get_weather_forecast() -> dict:
         if not daily:
             return {}
         return {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không xác định"),
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?"),
             "weather_today_max": daily["temperature_2m_max"][0],
             "weather_today_min": daily["temperature_2m_min"][0],
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không xác định"),
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?"),
             "weather_tomorrow_max": daily["temperature_2m_max"][1],
             "weather_tomorrow_min": daily["temperature_2m_min"][1],
         }
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        return {}
+        # fallback dummy
+        return {
+            "weather_today_desc": "Không xác định",
+            "weather_today_max": 0,
+            "weather_today_min": 0,
+            "weather_tomorrow_desc": "Không xác định",
+            "weather_tomorrow_max": 0,
+            "weather_tomorrow_min": 0,
+        }
 
 # ================== AI HELPER ==================
 def call_ai_api(data: dict) -> dict:
+    """Gọi AI và/hoặc local rule"""
     model_url = AI_API_URL
     hf_token = HF_TOKEN
     headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
     weather_info = get_weather_forecast()
-    weather_text = ""
-    if weather_info:
-        weather_text = (
-            f" Hôm nay: {weather_info.get('weather_today_desc','?')}, "
-            f"{weather_info.get('weather_today_min','?')}–{weather_info.get('weather_today_max','?')}°C."
-        )
+    weather_text = f" Dự báo hôm nay: {weather_info['weather_today_desc']}, " \
+                   f"{weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C." \
+                   f" Ngày mai: {weather_info['weather_tomorrow_desc']}, " \
+                   f"{weather_info['weather_tomorrow_min']}–{weather_info['weather_tomorrow_max']}°C."
 
     prompt = (
         f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, pin {data.get('battery','?')}%. "
@@ -154,13 +145,8 @@ def call_ai_api(data: dict) -> dict:
                 text = str(out)
 
             sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
-            return {
-                "prediction": sections['prediction'],
-                "advice": text.strip(),
-                "advice_nutrition": sections['advice_nutrition'],
-                "advice_care": sections['advice_care'],
-                "advice_note": sections['advice_note'],
-            }
+            sections['advice'] = text.strip()
+            return sections
     except Exception as e:
         logger.warning(f"AI API call failed: {e}, fallback local")
 
@@ -219,6 +205,6 @@ def auto_loop():
             send_to_thingsboard(merged)
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
-        time.sleep(300)
+        time.sleep(300)  # 5 phút
 
 threading.Thread(target=auto_loop, daemon=True).start()
