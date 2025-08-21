@@ -24,7 +24,7 @@ LAT = os.getenv("LAT", "10.80609")
 LON = os.getenv("LON", "106.75222")
 CROP = os.getenv("CROP", "Rau muống")
 OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-LOCATION_NAME = os.getenv("LOCATION_NAME")  # override thủ công
+LOCATION_NAME = os.getenv("LOCATION_NAME")  # override thủ công nếu muốn
 
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -88,7 +88,7 @@ def generate_sample_data():
         "humidity": humidity,
         "battery": battery,
         "plant_type": CROP,
-        "location_name": get_location_name(LAT, LON),  # <-- Tự động resolve tên vị trí
+        "location_name": get_location_name(LAT, LON),
         "weather_now_desc": "Nhiều mây",
         "weather_now_temp": temperature,
         "weather_now_humidity": humidity,
@@ -108,13 +108,12 @@ def fetch_weather():
             return {
                 "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "crop": CROP,
-                "vi_tri": get_location_name(LAT, LON),  # <-- Dùng tên vị trí
+                "vi_tri": get_location_name(LAT, LON),
                 "weather_temp": d["main"]["temp"],
                 "weather_humidity": d["main"]["humidity"],
                 "weather_desc": d["weather"][0]["description"]
             }
         else:
-            # fallback dummy
             return {
                 "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "crop": CROP,
@@ -147,7 +146,7 @@ def root():
 async def receive_telemetry(req: Request):
     data = await req.json()
     data["time_sent"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data["location_name"] = get_location_name(LAT, LON)  # thêm tên vị trí
+    data["location_name"] = get_location_name(LAT, LON)
     logger.info(f"[ESP32 ▶] {data}")
     send_to_thingsboard(data)
     return {"status": "OK"}
