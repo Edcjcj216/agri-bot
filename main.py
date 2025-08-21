@@ -31,20 +31,79 @@ class SensorData(BaseModel):
 
 # ================== HELPERS ==================
 def call_ai_api(data: dict) -> dict:
+    """Gọi AI (Hugging Face nếu có). Nếu AI không khả dụng thì dùng quy tắc cục bộ để sinh prediction + advice
+
+    Luôn trả về dict có keys: prediction (chuỗi) và advice (chuỗi).
+    """
+    model_url = AI_API_URL
+    hf_token = HF_TOKEN
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    prompt = (
+        f"Dự báo: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}% tại Hồ Chí Minh, cây Rau muống. "
+        "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
+    )
+    body = {"inputs": prompt, "options": {"wait_for_model": True}}
+
+    # Helper local rule-based fallback generator
+    def local_advice(temp: float, humi: float, battery: float | None = None) -> dict:
+        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        tips: list[str] = []
+        # Temperature rules
+        if temp >= 35:
+            tips.append("Nhiệt độ cao — tránh phơi nắng gắt, che nắng và tưới sớm/chiều.")
+        elif temp >= 30:
+            tips.append("Nhiệt độ khá cao — tưới đủ nước và theo dõi cây thường xuyên.")
+        elif temp <= 15:
+            tips.append("Nhiệt độ thấp — giữ ấm, tránh sương muối.")
+        else:
+            tips.append("Nhiệt độ trong ngưỡng bình thường.")
+        # Humidity rules
+        if humi <= 40:
+            tips.append("Độ ẩm thấp — cần tăng tưới, đặc biệt cho rau đang xanh non.")
+        elif humi <= 60:
+            tips.append("Độ ẩm hơi thấp — theo dõi, tưới khi cần.")
+        elif humi >= 85:
+            tips.append("Độ ẩm cao — chú ý thoát nước, tránh úng và nấm bệnh.")
+        else:
+            tips.append("Độ ẩm ổn định cho rau muống.")
+        # Battery
+        if battery is not None and battery <= 20:
+            tips.append("Pin thấp — kiểm tra nguồn/ắc quy của ESP32.")
+        advice_text = " ".join(tips)
+        return {"prediction": pred, "advice": advice_text}
+
+    # Try AI call first
     try:
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-        payload = {"inputs": f"Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%"}
-        logger.info(f"AI ▶ {payload}")
-        r = requests.post(AI_API_URL, headers=headers, json=payload, timeout=20)
-        logger.info(f"AI ◀ status={r.status_code} text={r.text[:200]}")
+        logger.info(f"AI ▶ POST {model_url} body={prompt[:200]}")
+        r = requests.post(model_url, headers=headers, json=body, timeout=30)
+        logger.info(f"AI ◀ status={r.status_code} text={(r.text or '')[:400]}")
         if r.status_code == 200:
-            return {
-                "prediction": payload["inputs"],
-                "advice": "Theo dõi cây trồng, tưới nước đều, bón phân cân đối."
-            }
+            out = r.json()
+            text = ""
+            if isinstance(out, list) and out:
+                first = out[0]
+                if isinstance(first, dict):
+                    text = first.get("generated_text") or first.get("text") or str(first)
+                else:
+                    text = str(first)
+            elif isinstance(out, dict):
+                text = out.get("generated_text") or out.get("text") or json.dumps(out, ensure_ascii=False)
+            else:
+                text = str(out)
+
+            if text:
+                # Return AI result but ensure prediction present
+                return {
+                    "prediction": f"Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%",
+                    "advice": text.strip()
+                }
+            else:
+                logger.warning("AI returned empty text, falling back to local rules")
     except Exception as e:
-        logger.error(f"AI API error: {e}")
-    return {"prediction": "N/A", "advice": "N/A"}
+        logger.warning(f"AI API call failed: {e}, using local fallback")
+
+    # Fallback local rules (always returns non-empty prediction & advice)
+    return local_advice(data['temperature'], data['humidity'], data.get('battery'))
 
 
 def send_to_thingsboard(data: dict):
