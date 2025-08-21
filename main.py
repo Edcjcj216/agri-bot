@@ -1,89 +1,69 @@
 import os
-import requests
 import asyncio
+import requests
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from datetime import datetime
-import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================== CONFIG ==================
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "YOUR_OPENWEATHER_API_KEY")
-THINGSBOARD_TOKEN   = os.getenv("THINGSBOARD_TOKEN", "YOUR_THINGSBOARD_DEVICE_TOKEN")
-LAT = os.getenv("LAT", "10.7769")   # An Phú HCM
-LON = os.getenv("LON", "106.7009")
+app = FastAPI()
 
-OPENWEATHER_URL = f"https://api.openweathermap.org/data/2.5/onecall?lat={LAT}&lon={LON}&exclude=minutely,current,alerts&appid={OPENWEATHER_API_KEY}&units=metric&lang=vi"
-THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
+# Lấy từ Environment Variables trên Render
+OWM_API_KEY = os.getenv("OWM_API_KEY")
+LAT = os.getenv("LAT", "21.0278")   # Default: Hà Nội
+LON = os.getenv("LON", "105.8342")
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")
+THINGSBOARD_URL = os.getenv("THINGSBOARD_URL", "https://thingsboard.cloud")
 
-# ================== FASTAPI APP ==================
-app = FastAPI(title="Weather → ThingsBoard")
+# URL gửi telemetry
+TB_TELEMETRY_URL = f"{THINGSBOARD_URL}/api/v1/{THINGSBOARD_TOKEN}/telemetry"
 
-# ================== CORE FUNCTION ==================
 def fetch_weather():
-    """Lấy dữ liệu từ OpenWeather"""
-    resp = requests.get(OPENWEATHER_URL)
+    url = f"http://api.openweathermap.org/data/2.5/forecast?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&units=metric&lang=vi"
+    resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 def build_payload(data):
-    """Xử lý JSON trả về thành telemetry cho ThingsBoard"""
-    tz = pytz.timezone("Asia/Ho_Chi_Minh")
-    payload = {}
+    telemetry = {}
 
-    # 24h forecast
-    for h in data["hourly"][:24]:
-        hour = datetime.fromtimestamp(h["dt"], tz).strftime("%H")
-        payload[f"hour_{hour}"] = {
-            "temp": h["temp"],
-            "humidity": h["humidity"],
-            "weather": h["weather"][0]["description"]
-        }
+    # Lấy 24h forecast (mỗi 3h từ OWM → group thành 8 cột)
+    hours = {}
+    for i, entry in enumerate(data["list"][:8]):  # 24h tới
+        hours[f"hour{i*3}_temp"] = entry["main"]["temp"]
+        hours[f"hour{i*3}_hum"] = entry["main"]["humidity"]
 
-    # forecast ngày mai
-    tomorrow = data["daily"][1]
-    payload["tomorrow"] = {
-        "temp_min": tomorrow["temp"]["min"],
-        "temp_max": tomorrow["temp"]["max"],
-        "humidity": tomorrow["humidity"],
-        "weather": tomorrow["weather"][0]["description"]
-    }
+    # Lấy ngày mai (cột 8~15)
+    tomorrow = data["list"][8:16]
+    if tomorrow:
+        temps = [e["main"]["temp"] for e in tomorrow]
+        hums = [e["main"]["humidity"] for e in tomorrow]
+        telemetry["tomorrow_temp_min"] = min(temps)
+        telemetry["tomorrow_temp_max"] = max(temps)
+        telemetry["tomorrow_humidity_avg"] = sum(hums) / len(hums)
 
-    return payload
+    telemetry.update(hours)
+    return telemetry
 
-def push_thingsboard(payload):
-    """Gửi telemetry lên ThingsBoard"""
-    r = requests.post(THINGSBOARD_URL, json=payload)
-    r.raise_for_status()
-    return r.json() if r.text else {"status": "ok"}
+def push_to_thingsboard(payload):
+    try:
+        resp = requests.post(TB_TELEMETRY_URL, json=payload, timeout=5)
+        print("Push TB:", resp.status_code, payload)
+    except Exception as e:
+        print("Error push:", e)
 
-# ================== BACKGROUND JOB ==================
-async def worker():
-    while True:
-        try:
-            data = fetch_weather()
-            payload = build_payload(data)
-            push_thingsboard(payload)
-            print("✅ Telemetry pushed:", datetime.now())
-        except Exception as e:
-            print("❌ Error:", e)
-        await asyncio.sleep(300)  # 5 phút
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(worker())
-
-# ================== API ROUTES ==================
-@app.get("/")
-def root():
-    return {"status": "Weather → ThingsBoard service running"}
-
-@app.get("/trigger")
-def trigger():
-    """Gọi tay để test push"""
+def job():
     try:
         data = fetch_weather()
         payload = build_payload(data)
-        result = push_thingsboard(payload)
-        return JSONResponse(content={"sent": payload, "result": result})
+        push_to_thingsboard(payload)
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        print("Job error:", e)
+
+@app.on_event("startup")
+async def startup_event():
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(job, "interval", minutes=5)
+    scheduler.start()
+
+@app.get("/")
+def root():
+    return {"status": "Weather service running 🎉"}
