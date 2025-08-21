@@ -1,216 +1,178 @@
 import os
-import time
-import json
 import logging
+import random
 import requests
-from fastapi import FastAPI
-from pydantic import BaseModel
-import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+from zoneinfo import ZoneInfo
 
-# ================== CONFIG ==================
-TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
-TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("agri-bot")
 
-TB_TENANT_USER = os.getenv("TB_TENANT_USER", "")
-TB_TENANT_PASS = os.getenv("TB_TENANT_PASS", "")
+# --- Config ---
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN", "sgkxcrqntuki8gu1oj8u")  # token mới
+TB_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
+TB_ATTR_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/attributes"
+LAT = os.getenv("LAT", "10.80609")
+LON = os.getenv("LON", "106.75222")
+CROP = os.getenv("CROP", "Rau muống")
+OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+LOCATION_NAME = os.getenv("LOCATION_NAME")  # override thủ công
 
-AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
+LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
-LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
-LON = os.getenv("LON", "106.70")
-
-# ================== LOGGING ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# ================== FASTAPI ==================
-app = FastAPI()
-
-class SensorData(BaseModel):
-    temperature: float
-    humidity: float
-    battery: float | None = None
-
-# ================== WEATHER ==================
-WEATHER_CODE_MAP = {
-    0: "Trời quang",
-    1: "Trời quang nhẹ",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù đóng băng",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    71: "Tuyết nhẹ",
-    73: "Tuyết vừa",
-    75: "Tuyết dày",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá mạnh"
-}
-
-def get_weather_forecast() -> dict:
-    """Lấy dự báo thời tiết hôm nay và ngày mai từ Open-Meteo"""
+# --- Hàm lấy tên vị trí từ LAT/LON ---
+_LOCATION_CACHE = None  # cache tên vị trí
+def get_location_name(lat: str, lon: str) -> str:
+    global _LOCATION_CACHE
+    if LOCATION_NAME:
+        _LOCATION_CACHE = LOCATION_NAME
+        return _LOCATION_CACHE
+    if _LOCATION_CACHE:
+        return _LOCATION_CACHE
     try:
-        url = "https://api.open-meteo.com/v1/forecast"
+        url = f"https://nominatim.openstreetmap.org/reverse"
         params = {
-            "latitude": LAT,
-            "longitude": LON,
-            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-            "timezone": "Asia/Ho_Chi_Minh"
+            "lat": lat,
+            "lon": lon,
+            "format": "json",
+            "zoom": 16,
+            "addressdetails": 1,
         }
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        # index 0 = hôm nay, index 1 = ngày mai
-        daily = data.get("daily", {})
-        if not daily:
-            return {}
-        today = {
-            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không xác định"),
-            "temp_max": daily["temperature_2m_max"][0],
-            "temp_min": daily["temperature_2m_min"][0]
-        }
-        tomorrow = {
-            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không xác định"),
-            "temp_max": daily["temperature_2m_max"][1],
-            "temp_min": daily["temperature_2m_min"][1]
-        }
-        return {"hom_nay": today, "ngay_mai": tomorrow}
-    except Exception as e:
-        logger.warning(f"Weather API error: {e}")
-        return {}
-
-# ================== AI HELPER ==================
-def call_ai_api(data: dict) -> dict:
-    """Gọi AI và/hoặc local rule"""
-    model_url = AI_API_URL
-    hf_token = HF_TOKEN
-    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-
-    weather_info = get_weather_forecast()
-    weather_text = ""
-    if weather_info:
-        hn = weather_info.get("hom_nay", {})
-        weather_text = f" Dự báo hôm nay: {hn.get('weather_desc','?')}, {hn.get('temp_min','?')}–{hn.get('temp_max','?')}°C."
-
-    prompt = (
-        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, pin {data.get('battery','?')}%. "
-        f"Cây: Rau muống tại An Phú, Hồ Chí Minh.{weather_text} "
-        "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
-    )
-    body = {"inputs": prompt, "options": {"wait_for_model": True}}
-
-    def local_sections(temp: float, humi: float, battery: float | None = None) -> dict:
-        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
-        care = []
-        if temp >= 35:
-            care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
-        elif temp >= 30:
-            care.append("Tưới đủ nước, theo dõi thường xuyên")
-        elif temp <= 15:
-            care.append("Giữ ấm, tránh sương muối")
-        else:
-            care.append("Nhiệt độ bình thường")
-        if humi <= 40:
-            care.append("Độ ẩm thấp: tăng tưới")
-        elif humi <= 60:
-            care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-        elif humi >= 85:
-            care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
-        else:
-            care.append("Độ ẩm ổn định cho rau muống")
-        if battery is not None and battery <= 20:
-            care.append("Pin thấp: kiểm tra nguồn")
-        return {
-            "prediction": pred,
-            "advice_nutrition": " | ".join(nutrition),
-            "advice_care": " | ".join(care),
-            "advice_note": "Quan sát cây trồng và điều chỉnh thực tế"
-        }
-
-    try:
-        logger.info(f"AI ▶ {prompt[:150]}...")
-        r = requests.post(model_url, headers=headers, json=body, timeout=30)
-        logger.info(f"AI ◀ status={r.status_code}")
+        headers = {"User-Agent": "agri-bot/1.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
         if r.status_code == 200:
-            out = r.json()
-            text = ""
-            if isinstance(out, list) and out:
-                first = out[0]
-                if isinstance(first, dict):
-                    text = first.get("generated_text") or first.get("text") or str(first)
-                else:
-                    text = str(first)
-            elif isinstance(out, dict):
-                text = out.get("generated_text") or out.get("text") or json.dumps(out, ensure_ascii=False)
-            else:
-                text = str(out)
+            data = r.json()
+            _LOCATION_CACHE = data.get("display_name", f"{lat},{lon}")
+            return _LOCATION_CACHE
+        else:
+            logger.warning(f"Lỗi geocode {r.status_code}: {r.text}")
+            _LOCATION_CACHE = f"{lat},{lon}"
+            return _LOCATION_CACHE
+    except Exception as e:
+        logger.error(f"EXCEPTION get_location_name: {e}")
+        _LOCATION_CACHE = f"{lat},{lon}"
+        return _LOCATION_CACHE
 
-            sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+# --- FastAPI ---
+app = FastAPI()
+scheduler = BackgroundScheduler()
+
+# --- Hàm push lên ThingsBoard ---
+def send_to_thingsboard(payload: dict):
+    try:
+        logger.info(f"[TB ▶] {payload}")
+        resp = requests.post(TB_URL, json=payload, timeout=10)
+        if resp.status_code in (200, 201, 204):
+            logger.info(f"[TB ◀] OK {resp.status_code}")
+        else:
+            logger.warning(f"[TB ◀] LỖI {resp.status_code}: {resp.text}")
+    except Exception as e:
+        logger.error(f"[TB] EXCEPTION: {e}")
+
+# --- Telemetry mẫu (sensor) ---
+def generate_sample_data():
+    temperature = round(random.uniform(25, 35), 1)
+    humidity = round(random.uniform(60, 80), 1)
+    battery = random.randint(50, 100)
+    return {
+        "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "temperature": temperature,
+        "humidity": humidity,
+        "battery": battery,
+        "plant_type": CROP,
+        "location_name": get_location_name(LAT, LON),  # <-- Tự động resolve tên vị trí
+        "weather_now_desc": "Nhiều mây",
+        "weather_now_temp": temperature,
+        "weather_now_humidity": humidity,
+        "advice": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ | Tưới đủ nước",
+        "prediction": f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
+    }
+
+# --- Weather fetch ---
+def fetch_weather():
+    try:
+        if OWM_API_KEY:
+            url = (f"https://api.openweathermap.org/data/2.5/weather"
+                   f"?lat={LAT}&lon={LON}&units=metric&lang=vi&appid={OWM_API_KEY}")
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            d = r.json()
             return {
-                "prediction": sections['prediction'],
-                "advice": text.strip(),
-                "advice_nutrition": sections['advice_nutrition'],
-                "advice_care": sections['advice_care'],
-                "advice_note": sections['advice_note'],
+                "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "crop": CROP,
+                "vi_tri": get_location_name(LAT, LON),  # <-- Dùng tên vị trí
+                "weather_temp": d["main"]["temp"],
+                "weather_humidity": d["main"]["humidity"],
+                "weather_desc": d["weather"][0]["description"]
+            }
+        else:
+            # fallback dummy
+            return {
+                "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "crop": CROP,
+                "vi_tri": get_location_name(LAT, LON),
+                "weather_temp": round(random.uniform(26, 34), 1),
+                "weather_humidity": random.randint(50, 80),
+                "weather_desc": "Trời quang (demo)"
             }
     except Exception as e:
-        logger.warning(f"AI API call failed: {e}, fallback local")
+        logger.error(f"Lỗi fetch weather: {e}")
+        return None
 
-    sec = local_sections(data['temperature'], data['humidity'], data.get('battery'))
-    sec['advice'] = f"{sec['advice_nutrition']} | {sec['advice_care']} | {sec['advice_note']}"
-    return sec
+# --- Jobs định kỳ ---
+def job_send_all():
+    logger.info("[JOB] Push dữ liệu cảm biến + weather")
+    send_to_thingsboard(generate_sample_data())
+    w = fetch_weather()
+    if w:
+        send_to_thingsboard(w)
 
-# ================== THINGSBOARD ==================
-def send_to_thingsboard(data: dict):
-    try:
-        logger.info(f"TB ▶ {data}")
-        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
-        logger.info(f"TB ◀ {r.status_code}")
-    except Exception as e:
-        logger.error(f"ThingsBoard push error: {e}")
+scheduler.add_job(job_send_all, "interval", minutes=5)
+scheduler.start()
 
-# ================== ROUTES ==================
+# --- API ---
 @app.get("/")
 def root():
-    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4] + "***"}
+    return {"status": "ok", "message": "AgriBot server running (sensor + weather push every 5min)"}
 
-@app.post("/esp32-data")
-def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ {data.dict()}")
-    ai_result = call_ai_api(data.dict())
-    weather_info = get_weather_forecast()
-    merged = data.dict() | ai_result | weather_info
-    send_to_thingsboard(merged)
-    return {"received": data.dict(), "pushed": merged}
+@app.post("/telemetry")
+async def receive_telemetry(req: Request):
+    data = await req.json()
+    data["time_sent"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["location_name"] = get_location_name(LAT, LON)  # thêm tên vị trí
+    logger.info(f"[ESP32 ▶] {data}")
+    send_to_thingsboard(data)
+    return {"status": "OK"}
 
-@app.get("/weather")
-def get_weather_api():
-    return get_weather_forecast()
+@app.post("/push")
+def push_now():
+    job_send_all()
+    return {"status": "OK", "message": "Pushed telemetry + weather"}
 
-# ================== AUTO LOOP ==================
-def auto_loop():
-    while True:
-        try:
-            sample = {"temperature": 30.1, "humidity": 69.2, "battery": 90}
-            logger.info(f"[AUTO] ESP32 ▶ {sample}")
-            ai_result = call_ai_api(sample)
-            weather_info = get_weather_forecast()
-            merged = sample | ai_result | weather_info
-            send_to_thingsboard(merged)
-        except Exception as e:
-            logger.error(f"AUTO loop error: {e}")
-        time.sleep(300)
+@app.get("/last")
+def last_telemetry():
+    """Lấy last telemetry từ ThingsBoard (qua REST API)"""
+    try:
+        url = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/attributes?sharedKeys=none"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return JSONResponse(content={"ok": True, "last": r.json()})
+        else:
+            return JSONResponse(content={"ok": False, "status": r.status_code, "body": r.text}, status_code=500)
+    except Exception as e:
+        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
 
-threading.Thread(target=auto_loop, daemon=True).start()
+# --- Run ---
+if __name__ == "__main__":
+    logger.info("[INIT] Gửi dữ liệu lần đầu...")
+    job_send_all()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=False)
