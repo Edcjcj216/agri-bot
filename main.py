@@ -1,150 +1,203 @@
-import requests
+import os
 import time
+import json
 import logging
-import asyncio
-from fastapi import FastAPI, Request
+import requests
+from fastapi import FastAPI
 from pydantic import BaseModel
-from threading import Thread
+import threading
+from datetime import datetime, timedelta
 
-# ================= CONFIG =================
-THINGSBOARD_URL = "http://demo.thingsboard.io/api/v1"
-THINGSBOARD_TOKEN = "I1s5bI2FQCZw6umLvwLG"
+# ================== CONFIG ==================
+TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
+TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
-LAT, LON = 10.8019, 106.7463
-OPENWEATHER_KEY = "a53f443795604c41b72305c1806784db"
+AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-# ================= LOGGING =================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+LAT = float(os.getenv("LAT", "10.79"))    # An Phú / Hồ Chí Minh
+LON = float(os.getenv("LON", "106.70"))
 
-# ================= FASTAPI APP =================
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ================== FASTAPI ==================
 app = FastAPI()
 
 class SensorData(BaseModel):
     temperature: float
     humidity: float
     battery: float | None = None
-    crop: str | None = "Rau muống"
 
-# ================= WEATHER =================
+# ================== WEATHER ==================
+WEATHER_CODE_MAP = {
+    0: "Trời quang",
+    1: "Trời quang nhẹ",
+    2: "Có mây",
+    3: "Nhiều mây",
+    45: "Sương mù",
+    48: "Sương mù đóng băng",
+    51: "Mưa phùn nhẹ",
+    53: "Mưa phùn vừa",
+    55: "Mưa phùn dày",
+    61: "Mưa nhẹ",
+    63: "Mưa vừa",
+    65: "Mưa to",
+    71: "Tuyết nhẹ",
+    73: "Tuyết vừa",
+    75: "Tuyết dày",
+    80: "Mưa rào nhẹ",
+    81: "Mưa rào vừa",
+    82: "Mưa rào mạnh",
+    95: "Giông nhẹ hoặc vừa",
+    96: "Giông kèm mưa đá nhẹ",
+    99: "Giông kèm mưa đá mạnh"
+}
+
 def get_weather_forecast():
+    """Lấy dự báo hôm nay và ngày mai + hôm qua (từ archive API giả lập bằng lịch sử)"""
     try:
-        url = "https://api.openweathermap.org/data/2.5/onecall"  # One Call 2.5
+        today_dt = datetime.now()
+        tomorrow_dt = today_dt + timedelta(days=1)
+        yesterday_dt = today_dt - timedelta(days=1)
+
+        # ================== FORECAST API ==================
+        url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "lat": LAT,
-            "lon": LON,
-            "exclude": "current,minutely,hourly,alerts",
-            "appid": OPENWEATHER_KEY,
-            "units": "metric",
-            "lang": "vi"
+            "latitude": LAT,
+            "longitude": LON,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+            "hourly": "relativehumidity_2m",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "start_date": yesterday_dt.strftime("%Y-%m-%d"),
+            "end_date": tomorrow_dt.strftime("%Y-%m-%d")
         }
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        daily = data.get("daily", [])
 
-        def pick_day(idx, prefix):
-            if idx < len(daily):
-                d = daily[idx]
-                return {
-                    f"weather_{prefix}_desc": d["weather"][0]["description"] if d.get("weather") else "?",
-                    f"weather_{prefix}_max": round(d["temp"]["max"], 1) if "temp" in d else 0,
-                    f"weather_{prefix}_min": round(d["temp"]["min"], 1) if "temp" in d else 0,
-                    f"humidity_{prefix}": d.get("humidity", 0)
-                }
-            return {
-                f"weather_{prefix}_desc": "?",
-                f"weather_{prefix}_max": 0,
-                f"weather_{prefix}_min": 0,
-                f"humidity_{prefix}": 0
-            }
+        # ================== DAILY ==================
+        daily = data.get("daily", {})
+        hourly = data.get("hourly", {})
 
-        return {**pick_day(0, "today"), **pick_day(1, "tomorrow")}
-    except Exception as e:
-        logger.warning(f"OpenWeather API error: {e}")
-        return {
-            "weather_today_desc": "?",
-            "weather_today_max": 0,
-            "weather_today_min": 0,
-            "humidity_today": 0,
-            "weather_tomorrow_desc": "?",
-            "weather_tomorrow_max": 0,
-            "weather_tomorrow_min": 0,
-            "humidity_tomorrow": 0
+        def mean(lst):
+            return round(sum(lst)/len(lst), 1) if lst else 0
+
+        # Hôm qua
+        weather_yesterday = {
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
+            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
+            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "humidity_yesterday": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if i < 24])
         }
 
-# ================= AI ADVICE =================
-def get_ai_advice(temp, hum, crop):
-    return {
-        "advice": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ | Tưới đủ nước, theo dõi thường xuyên | Độ ẩm ổn định cho rau muống | Quan sát cây trồng và điều chỉnh thực tế",
-        "advice_nutrition": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ",
-        "advice_care": "Tưới đủ nước, theo dõi thường xuyên | Độ ẩm ổn định cho rau muống",
-        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế"
-    }
+        # Hôm nay
+        weather_today = {
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
+            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
+            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "humidity_today": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 24 <= i < 48])
+        }
 
-# ================= THINGSBOARD =================
-def upload_to_thingsboard(data):
-    url = f"{THINGSBOARD_URL}/{THINGSBOARD_TOKEN}/telemetry"
-    try:
-        r = requests.post(url, json=data, timeout=10)
-        r.raise_for_status()
-        logger.info("Telemetry pushed to ThingsBoard.")
+        # Ngày mai
+        weather_tomorrow = {
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
+            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
+            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "humidity_tomorrow": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 48 <= i < 72])
+        }
+
+        return {**weather_yesterday, **weather_today, **weather_tomorrow}
     except Exception as e:
-        logger.error(f"Failed to upload telemetry: {e}")
+        logger.warning(f"Weather API error: {e}")
+        return {
+            "weather_yesterday_desc":"?", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0,
+            "weather_today_desc":"?", "weather_today_max":0, "weather_today_min":0, "humidity_today":0,
+            "weather_tomorrow_desc":"?", "weather_tomorrow_max":0, "weather_tomorrow_min":0, "humidity_tomorrow":0
+        }
 
-# ================= ROUTE ESP32 =================
+# ================== AI HELPER ==================
+def call_ai_api(data: dict):
+    model_url = AI_API_URL
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
+    prompt = (
+        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, "
+        f"Cây: Rau muống tại An Phú, Hồ Chí Minh. "
+        "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
+    )
+    body = {"inputs": prompt, "options": {"wait_for_model": True}}
+
+    def local_sections(temp, humi):
+        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
+        care = []
+        if temp >= 35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+        elif temp >= 30: care.append("Tưới đủ nước, theo dõi thường xuyên")
+        elif temp <= 15: care.append("Giữ ấm, tránh sương muối")
+        else: care.append("Nhiệt độ bình thường")
+        if humi <= 40: care.append("Độ ẩm thấp: tăng tưới")
+        elif humi <= 60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+        elif humi >= 85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+        else: care.append("Độ ẩm ổn định cho rau muống")
+        return {
+            "prediction": pred,
+            "advice_nutrition": " | ".join(nutrition),
+            "advice_care": " | ".join(care),
+            "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
+            "advice": " | ".join(nutrition + care + ["Quan sát cây trồng và điều chỉnh thực tế"])
+        }
+
+    try:
+        logger.info(f"AI ▶ {prompt[:150]}...")
+        r = requests.post(model_url, headers=headers, json=body, timeout=30)
+        if r.status_code == 200:
+            out = r.json()
+            text = ""
+            if isinstance(out, list) and out: text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
+            sec = local_sections(data['temperature'], data['humidity'])
+            sec['advice'] = text.strip() or sec['advice']
+            return sec
+    except Exception as e:
+        logger.warning(f"AI API call failed: {e}, fallback local")
+
+    return local_sections(data['temperature'], data['humidity'])
+
+# ================== THINGSBOARD ==================
+def send_to_thingsboard(data: dict):
+    try:
+        logger.info(f"TB ▶ {data}")
+        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
+        logger.info(f"TB ◀ {r.status_code}")
+    except Exception as e:
+        logger.error(f"ThingsBoard push error: {e}")
+
+# ================== ROUTES ==================
+@app.get("/")
+def root():
+    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4]+"***"}
+
 @app.post("/esp32-data")
-async def esp32_data(sensor: SensorData):
-    content = sensor.dict()
-    logger.info(f"ESP32 data: {content}")
+def receive_data(data: SensorData):
+    logger.info(f"ESP32 ▶ {data.dict()}")
+    ai_result = call_ai_api(data.dict())
+    weather_info = get_weather_forecast()
+    merged = data.dict() | ai_result | weather_info | {"location":"An Phú, Hồ Chí Minh","crop":"Rau muống"}
+    send_to_thingsboard(merged)
+    return {"received": data.dict(), "pushed": merged}
 
-    advice = get_ai_advice(content["temperature"], content["humidity"], content.get("crop", "Rau muống"))
-    weather = get_weather_forecast()
-
-    payload = {
-        "temperature": content["temperature"],
-        "humidity": content["humidity"],
-        "crop": content.get("crop", "Rau muống"),
-        "prediction": f"Nhiệt độ {content['temperature']}°C, độ ẩm {content['humidity']}%",
-        **advice,
-        **weather,
-        "location": "An Phú, Hồ Chí Minh"
-    }
-
-    upload_to_thingsboard(payload)
-    return {"status": "ok", "uploaded": payload}
-
-# ================= BACKGROUND LOOP =================
-def background_loop():
+# ================== AUTO LOOP ==================
+def auto_loop():
     while True:
         try:
-            temperature = 30.1
-            humidity = 69.2
-            crop = "Rau muống"
-
-            advice = get_ai_advice(temperature, humidity, crop)
-            weather = get_weather_forecast()
-
-            payload = {
-                "temperature": temperature,
-                "humidity": humidity,
-                "crop": crop,
-                "prediction": f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%",
-                **advice,
-                **weather,
-                "location": "An Phú, Hồ Chí Minh"
-            }
-
-            upload_to_thingsboard(payload)
+            sample = {"temperature": 30.1, "humidity": 69.2}
+            ai_result = call_ai_api(sample)
+            weather_info = get_weather_forecast()
+            merged = sample | ai_result | weather_info | {"location":"An Phú, Hồ Chí Minh","crop":"Rau muống"}
+            send_to_thingsboard(merged)
         except Exception as e:
-            logger.error(f"Background loop error: {e}")
+            logger.error(f"AUTO loop error: {e}")
         time.sleep(300)  # 5 phút
 
-# ================= MAIN =================
-if __name__ == "__main__":
-    # Chạy background loop trong thread
-    t = Thread(target=background_loop, daemon=True)
-    t.start()
-
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
+threading.Thread(target=auto_loop, daemon=True).start()
