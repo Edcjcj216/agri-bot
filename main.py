@@ -1,10 +1,8 @@
-# main.py
 import os
 import time
 import requests
-import asyncio
-import random
 import traceback
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,14 +10,16 @@ from pydantic import BaseModel
 # =========================
 # CONFIG
 # =========================
-DEMO_TOKEN = "kfj6183wtsdijxu3z4yx"  # ThingsBoard DEMO device token
+# Token DEMO device (rau muống Hồ Chí Minh)
+DEMO_TOKEN = os.getenv("DEMO_TOKEN", "kfj6183wtsdijxu3z4yx")
 THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{DEMO_TOKEN}/telemetry"
-HF_API_KEY = os.getenv("HF_API_KEY")                  # Hugging Face token
+
+# Hugging Face AI API
+HF_API_KEY = os.getenv("HF_API_KEY")                  # cần set trong Render
 HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")
-DEFAULT_TEMP = 30
-DEFAULT_HUMI = 70
+
 CROP = "Rau muống"
-LOCATION = "Ho Chi Minh,VN"
+LOCATION = "Hồ Chí Minh, VN"
 
 # =========================
 # FASTAPI
@@ -33,16 +33,17 @@ app.add_middleware(
 )
 
 # =========================
-# GLOBAL STATE
-# =========================
-latest_data = {"temperature": None, "humidity": None}
-
-# =========================
-# MODELS
+# MODEL DỮ LIỆU ESP32
 # =========================
 class ESP32Data(BaseModel):
     temperature: float
     humidity: float
+    battery: float | None = None
+
+# =========================
+# GLOBAL STATE
+# =========================
+latest_data: ESP32Data | None = None
 
 # =========================
 # HUGGING FACE CALL
@@ -69,24 +70,24 @@ def call_huggingface(prompt: str, timeout: int = 30) -> str:
 # AI LOGIC
 # =========================
 def get_advice(temp: float, humi: float):
-    prompt = f"Dự báo nông nghiệp: nhiệt độ {temp}°C, độ ẩm {humi}% tại {LOCATION}, cây {CROP}. Viết 1 prediction ngắn và 1 advice ngắn gọn."
     prediction = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+    prompt = f"Dự báo nông nghiệp: Nhiệt độ {temp}°C, độ ẩm {humi}% tại {LOCATION}, cây {CROP}. Viết ngắn gọn dự báo và gợi ý chăm sóc."
     if HF_API_KEY:
         try:
             start = time.time()
             text = call_huggingface(prompt)
-            print(f"✅ HF OK (took {time.time()-start:.2f}s)")
+            print(f"✅ HuggingFace trả về sau {time.time()-start:.2f}s")
             if text:
                 return prediction, text.strip()
         except Exception as e:
-            print("⚠️ Hugging Face failed:", e)
+            print("⚠️ Hugging Face lỗi:", e)
             traceback.print_exc()
     # fallback cứng
     advice = "Theo dõi cây trồng, tưới nước đều, bón phân cân đối."
     return prediction, advice
 
 # =========================
-# THINGSBOARD PUSH
+# PUSH TELEMETRY LÊN DEMO DEVICE
 # =========================
 def push_thingsboard(payload: dict):
     try:
@@ -96,53 +97,55 @@ def push_thingsboard(payload: dict):
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=10
         )
-        print(f"✅ Pushed telemetry: {payload}")
+        print(f"✅ Đã gửi lên ThingsBoard DEMO device: {payload}")
     except Exception as e:
-        print("❌ Error pushing telemetry:", e)
+        print("❌ Lỗi khi gửi lên ThingsBoard:", e)
         traceback.print_exc()
-
-# =========================
-# ESP32 ẢO
-# =========================
-def fake_esp32_data():
-    return {
-        "temperature": round(random.uniform(24, 32), 1),
-        "humidity": round(random.uniform(50, 80), 1)
-    }
 
 # =========================
 # ROUTES
 # =========================
 @app.get("/")
 def root():
-    return {"message": "Agri-Bot running 🚀", "huggingface": bool(HF_API_KEY)}
+    return {"message": "Agri-Bot DEMO running 🚀", "huggingface": bool(HF_API_KEY)}
 
 @app.post("/esp32-data")
-async def receive_esp32(data: ESP32Data):
-    latest_data["temperature"] = data.temperature
-    latest_data["humidity"] = data.humidity
+def receive_esp32(data: ESP32Data):
+    global latest_data
+    latest_data = data
     prediction, advice = get_advice(data.temperature, data.humidity)
-    payload = {"prediction": prediction, "advice": advice}
+
+    payload = {
+        "temperature": data.temperature,
+        "humidity": data.humidity,
+        "battery": data.battery,
+        "prediction": prediction,
+        "advice": advice
+    }
+
+    # Gửi kết quả lên DEMO device ngay lập tức
     push_thingsboard(payload)
-    return {"status": "ok", "latest_data": data.dict(), "prediction": prediction, "advice": advice}
+
+    return {"status": "ok", "received": data.dict(),
+            "prediction": prediction, "advice": advice}
 
 # =========================
-# BACKGROUND TASK (ESP32 ảo + HF AI → ThingsBoard)
+# BACKGROUND TASK: mỗi 5 phút gửi lại dự báo dựa trên dữ liệu ESP32 thật
 # =========================
 async def periodic_ai_loop():
-    i = 1
     while True:
-        sensor_data = fake_esp32_data()
-        print(f"📥 ESP32 ảo gửi #{i}: {sensor_data}")
-        prediction, advice = get_advice(sensor_data["temperature"], sensor_data["humidity"])
-        push_thingsboard({
-            "temperature": sensor_data["temperature"],
-            "humidity": sensor_data["humidity"],
-            "prediction": prediction,
-            "advice": advice
-        })
-        i += 1
         await asyncio.sleep(300)  # 5 phút
+        if latest_data:
+            print("⏳ Tạo dự báo định kỳ từ dữ liệu ESP32 thật...")
+            prediction, advice = get_advice(latest_data.temperature, latest_data.humidity)
+            payload = {
+                "temperature": latest_data.temperature,
+                "humidity": latest_data.humidity,
+                "battery": latest_data.battery,
+                "prediction": prediction,
+                "advice": advice
+            }
+            push_thingsboard(payload)
 
 @app.on_event("startup")
 async def startup_event():
