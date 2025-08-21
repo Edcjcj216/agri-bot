@@ -6,7 +6,7 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ================== CONFIG ==================
 TB_DEMO_TOKEN = "pk94asonfacs6mbeuutg"  # Device DEMO token
@@ -18,12 +18,17 @@ TB_TENANT_PASS = os.getenv("TB_TENANT_PASS", "")
 AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
+LAT = os.getenv("LAT", "10.79")
 LON = os.getenv("LON", "106.70")
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+logger.info(f"=== STARTING APP ===")
+logger.info(f"AI_TOKEN={HF_TOKEN[:6] + '***' if HF_TOKEN else '(empty)'}")
+logger.info(f"TB_TENANT_USER={TB_TENANT_USER if TB_TENANT_USER else '(empty)'}")
+logger.info(f"TB_TENANT_PASS={'***' if TB_TENANT_PASS else '(empty)'}")
 
 # ================== FASTAPI ==================
 app = FastAPI()
@@ -35,31 +40,16 @@ class SensorData(BaseModel):
 
 # ================== WEATHER ==================
 WEATHER_CODE_MAP = {
-    0: "Trời quang",
-    1: "Trời quang nhẹ",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù đóng băng",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    71: "Tuyết nhẹ",
-    73: "Tuyết vừa",
-    75: "Tuyết dày",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá mạnh"
+    0: "Trời quang", 1: "Trời quang nhẹ", 2: "Có mây", 3: "Nhiều mây",
+    45: "Sương mù", 48: "Sương mù đóng băng",
+    51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
+    61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
+    71: "Tuyết nhẹ", 73: "Tuyết vừa", 75: "Tuyết dày",
+    80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
+    95: "Giông nhẹ hoặc vừa", 96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá mạnh"
 }
 
 def get_weather_forecast() -> dict:
-    """Lấy dự báo thời tiết hôm nay và ngày mai từ Open-Meteo"""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -71,7 +61,6 @@ def get_weather_forecast() -> dict:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # index 0 = hôm nay, index 1 = ngày mai
         daily = data.get("daily", {})
         if not daily:
             return {}
@@ -92,7 +81,6 @@ def get_weather_forecast() -> dict:
 
 # ================== AI HELPER ==================
 def call_ai_api(data: dict) -> dict:
-    """Gọi AI và/hoặc local rule"""
     model_url = AI_API_URL
     hf_token = HF_TOKEN
     headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
@@ -114,22 +102,14 @@ def call_ai_api(data: dict) -> dict:
         pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
         care = []
-        if temp >= 35:
-            care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
-        elif temp >= 30:
-            care.append("Tưới đủ nước, theo dõi thường xuyên")
-        elif temp <= 15:
-            care.append("Giữ ấm, tránh sương muối")
-        else:
-            care.append("Nhiệt độ bình thường")
-        if humi <= 40:
-            care.append("Độ ẩm thấp: tăng tưới")
-        elif humi <= 60:
-            care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-        elif humi >= 85:
-            care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
-        else:
-            care.append("Độ ẩm ổn định cho rau muống")
+        if temp >= 35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+        elif temp >= 30: care.append("Tưới đủ nước, theo dõi thường xuyên")
+        elif temp <= 15: care.append("Giữ ấm, tránh sương muối")
+        else: care.append("Nhiệt độ bình thường")
+        if humi <= 40: care.append("Độ ẩm thấp: tăng tưới")
+        elif humi <= 60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+        elif humi >= 85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+        else: care.append("Độ ẩm ổn định cho rau muống")
         if battery is not None and battery <= 20:
             care.append("Pin thấp: kiểm tra nguồn")
         return {
@@ -156,7 +136,6 @@ def call_ai_api(data: dict) -> dict:
                 text = out.get("generated_text") or out.get("text") or json.dumps(out, ensure_ascii=False)
             else:
                 text = str(out)
-
             sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
             return {
                 "prediction": sections['prediction'],
@@ -165,6 +144,8 @@ def call_ai_api(data: dict) -> dict:
                 "advice_care": sections['advice_care'],
                 "advice_note": sections['advice_note'],
             }
+        else:
+            logger.warning(f"AI API returned {r.status_code}: {r.text[:200]}")
     except Exception as e:
         logger.warning(f"AI API call failed: {e}, fallback local")
 
@@ -177,7 +158,10 @@ def send_to_thingsboard(data: dict):
     try:
         logger.info(f"TB ▶ {data}")
         r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
-        logger.info(f"TB ◀ {r.status_code}")
+        if r.status_code != 200:
+            logger.error(f"TB ◀ status={r.status_code}, body={r.text[:200]}")
+        else:
+            logger.info(f"TB ◀ OK {r.status_code}")
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
@@ -214,3 +198,9 @@ def auto_loop():
         time.sleep(300)
 
 threading.Thread(target=auto_loop, daemon=True).start()
+
+# ================== MAIN (Render compatible) ==================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
