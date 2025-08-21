@@ -20,8 +20,39 @@ scheduler = BackgroundScheduler()
 def _log(msg):
     print(f"[{datetime.now().isoformat()}] {msg}")
 
+def _om_weathercode_to_desc(code: int) -> str:
+    # Bản dịch đơn giản các WMO weather codes phổ biến
+    mapping = {
+        0: "Clear sky",
+        1: "Mainly clear",
+        2: "Partly cloudy",
+        3: "Overcast",
+        45: "Fog",
+        48: "Depositing rime fog",
+        51: "Light drizzle",
+        53: "Moderate drizzle",
+        55: "Dense drizzle",
+        61: "Slight rain",
+        63: "Moderate rain",
+        65: "Heavy rain",
+        71: "Slight snow",
+        73: "Moderate snow",
+        75: "Heavy snow",
+        80: "Rain showers",
+        81: "Moderate rain showers",
+        82: "Violent rain showers",
+        95: "Thunderstorm",
+        96: "Thunderstorm with slight hail",
+        99: "Thunderstorm with heavy hail",
+    }
+    try:
+        return mapping.get(int(code), "n/a")
+    except Exception:
+        return "n/a"
+
 def fetch_weather():
     try:
+        # ==== OpenWeather (nếu có key) ====
         if OWM_API_KEY:
             url = (
                 f"https://api.openweathermap.org/data/2.5/onecall"
@@ -84,48 +115,88 @@ def fetch_weather():
             }
             return payload
 
-        # Fallback Open-Meteo
+        # ==== Fallback Open-Meteo (nếu không có OpenWeather key) ====
         _log("OPENWEATHER_API_KEY không tồn tại — chuyển sang Open-Meteo (fallback).")
         om_url = (
             f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={LAT}&longitude={LON}&hourly=temperature_2m,relativehumidity_2m,weathercode"
+            f"latitude={LAT}&longitude={LON}"
+            f"&hourly=temperature_2m,relativehumidity_2m,weathercode"
+            f"&daily=temperature_2m_min,temperature_2m_max,weathercode"
             f"&timezone=auto"
         )
         r2 = requests.get(om_url, timeout=10)
         r2.raise_for_status()
         d2 = r2.json()
 
-        now = datetime.now()
+        # Now in local timezone (best-effort)
+        now = datetime.now().astimezone()
+
         times = d2.get("hourly", {}).get("time", [])
         temps = d2.get("hourly", {}).get("temperature_2m", [])
         hums = d2.get("hourly", {}).get("relativehumidity_2m", [])
+        wcodes = d2.get("hourly", {}).get("weathercode", [])
+
         today_forecast = []
-        for t_i, tstr in enumerate(times):
+        included = set()  # set of (date_iso, hour) to avoid duplicates
+
+        for i, tstr in enumerate(times):
             try:
-                hour = datetime.fromisoformat(tstr).hour
+                t_dt = datetime.fromisoformat(tstr)
             except Exception:
+                # skip unparsable time strings
                 continue
-            if hour >= now.hour:
+
+            # If t_dt has no tzinfo, assume same tz as now
+            if t_dt.tzinfo is None:
+                t_dt = t_dt.replace(tzinfo=now.tzinfo)
+
+            if t_dt >= now:
+                key = (t_dt.date().isoformat(), t_dt.hour)
+                if key in included:
+                    continue
+                included.add(key)
+
                 today_forecast.append({
-                    "hour": hour,
-                    "temp": temps[t_i] if t_i < len(temps) else None,
-                    "humidity": hums[t_i] if t_i < len(hums) else None,
-                    "weather": "n/a"
+                    "iso": t_dt.isoformat(),
+                    "hour": t_dt.hour,
+                    "temp": temps[i] if i < len(temps) else None,
+                    "humidity": hums[i] if i < len(hums) else None,
+                    "weather": _om_weathercode_to_desc(wcodes[i]) if i < len(wcodes) else "n/a"
                 })
-                if len(today_forecast) >= 24:
-                    break
+
+            # safety cap
+            if len(today_forecast) >= 24:
+                break
+
+        # Tomorrow: use daily arrays (index 1 -> tomorrow, if exists)
+        tomorrow = {}
+        daily = d2.get("daily", {})
+        try:
+            if daily:
+                tmins = daily.get("temperature_2m_min", [])
+                tmaxs = daily.get("temperature_2m_max", [])
+                dwcodes = daily.get("weathercode", [])
+                if len(tmins) > 1 and len(tmaxs) > 1:
+                    tomorrow = {
+                        "min": tmins[1],
+                        "max": tmaxs[1],
+                        "weather": _om_weathercode_to_desc(dwcodes[1]) if len(dwcodes) > 1 else "n/a"
+                    }
+        except Exception:
+            tomorrow = {}
 
         payload = {
             "location": f"{LAT},{LON}",
             "crop": CROP,
             "current": {
                 "hour": now.hour,
-                "temp": temps[0] if temps else None,
-                "humidity": hums[0] if hums else None,
-                "weather": "n/a",
+                "temp": today_forecast[0]["temp"] if today_forecast else None,
+                "humidity": today_forecast[0]["humidity"] if today_forecast else None,
+                "weather": today_forecast[0]["weather"] if today_forecast else "n/a",
+                "iso": now.isoformat()
             },
             "today": today_forecast,
-            "tomorrow": {},
+            "tomorrow": tomorrow,
             "source": "open-meteo",
             "last_update_utc": datetime.now(timezone.utc).isoformat()
         }
