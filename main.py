@@ -9,13 +9,13 @@ import threading
 from datetime import datetime
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
+TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
+LAT = os.getenv("LAT", "10.79")
 LON = os.getenv("LON", "106.70")
 CROP = "Rau muống"
 LOCATION_NAME = "An Phú, Hồ Chí Minh"
@@ -30,7 +30,6 @@ app = FastAPI()
 class SensorData(BaseModel):
     temperature: float
     humidity: float
-    battery: float | None = None
 
 # ================== WEATHER ==================
 WEATHER_CODE_MAP = {
@@ -42,7 +41,7 @@ WEATHER_CODE_MAP = {
 }
 
 def get_weather_forecast() -> dict:
-    """Lấy dự báo thời tiết hôm nay và ngày mai từ Open-Meteo"""
+    """Lấy dự báo hôm qua, hôm nay và ngày mai"""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -57,47 +56,53 @@ def get_weather_forecast() -> dict:
         daily = data.get("daily", {})
         if not daily:
             return {}
+
         return {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?"),
-            "weather_today_max": daily["temperature_2m_max"][0],
-            "weather_today_min": daily["temperature_2m_min"][0],
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?"),
-            "weather_tomorrow_max": daily["temperature_2m_max"][1],
-            "weather_tomorrow_min": daily["temperature_2m_min"][1],
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?"),
+            "weather_yesterday_max": daily["temperature_2m_max"][0],
+            "weather_yesterday_min": daily["temperature_2m_min"][0],
+
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?"),
+            "weather_today_max": daily["temperature_2m_max"][1],
+            "weather_today_min": daily["temperature_2m_min"][1],
+
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?"),
+            "weather_tomorrow_max": daily["temperature_2m_max"][2],
+            "weather_tomorrow_min": daily["temperature_2m_min"][2],
         }
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        # fallback dummy
         return {
-            "weather_today_desc": "Không xác định",
+            "weather_yesterday_desc": "?",
+            "weather_yesterday_max": 0,
+            "weather_yesterday_min": 0,
+            "weather_today_desc": "?",
             "weather_today_max": 0,
             "weather_today_min": 0,
-            "weather_tomorrow_desc": "Không xác định",
+            "weather_tomorrow_desc": "?",
             "weather_tomorrow_max": 0,
             "weather_tomorrow_min": 0,
         }
 
 # ================== AI HELPER ==================
 def call_ai_api(data: dict) -> dict:
-    """Gọi AI và/hoặc local rule"""
+    """Gọi AI và fallback local"""
     model_url = AI_API_URL
     hf_token = HF_TOKEN
     headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
     weather_info = get_weather_forecast()
-    weather_text = f" Dự báo hôm nay: {weather_info['weather_today_desc']}, " \
-                   f"{weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C." \
-                   f" Ngày mai: {weather_info['weather_tomorrow_desc']}, " \
-                   f"{weather_info['weather_tomorrow_min']}–{weather_info['weather_tomorrow_max']}°C."
+    weather_text = f" Dự báo hôm nay: {weather_info['weather_today_desc']}, {weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C." \
+                   f" Ngày mai: {weather_info['weather_tomorrow_desc']}, {weather_info['weather_tomorrow_min']}–{weather_info['weather_tomorrow_max']}°C."
 
     prompt = (
-        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, pin {data.get('battery','?')}%. "
+        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%. "
         f"Cây: {CROP} tại {LOCATION_NAME}.{weather_text} "
         "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
     )
     body = {"inputs": prompt, "options": {"wait_for_model": True}}
 
-    def local_sections(temp: float, humi: float, battery: float | None = None) -> dict:
+    def local_sections(temp: float, humi: float) -> dict:
         pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
         care = []
@@ -117,8 +122,6 @@ def call_ai_api(data: dict) -> dict:
             care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
         else:
             care.append("Độ ẩm ổn định cho rau muống")
-        if battery is not None and battery <= 20:
-            care.append("Pin thấp: kiểm tra nguồn")
         return {
             "prediction": pred,
             "advice_nutrition": " | ".join(nutrition),
@@ -143,14 +146,13 @@ def call_ai_api(data: dict) -> dict:
                 text = out.get("generated_text") or out.get("text") or json.dumps(out, ensure_ascii=False)
             else:
                 text = str(out)
-
-            sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+            sections = local_sections(data['temperature'], data['humidity'])
             sections['advice'] = text.strip()
             return sections
     except Exception as e:
         logger.warning(f"AI API call failed: {e}, fallback local")
 
-    sec = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+    sec = local_sections(data['temperature'], data['humidity'])
     sec['advice'] = f"{sec['advice_nutrition']} | {sec['advice_care']} | {sec['advice_note']}"
     return sec
 
@@ -191,7 +193,7 @@ def get_weather_api():
 def auto_loop():
     while True:
         try:
-            sample = {"temperature": 30.1, "humidity": 69.2, "battery": 90}
+            sample = {"temperature": 30.1, "humidity": 69.2}
             logger.info(f"[AUTO] ESP32 ▶ {sample}")
             ai_result = call_ai_api(sample)
             weather_info = get_weather_forecast()
