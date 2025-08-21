@@ -4,11 +4,12 @@ import logging
 import requests
 import threading
 from fastapi import FastAPI
+from pydantic import BaseModel
 from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
 TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "sgkxcrqntuki8gu1oj8u")
-TB_DEVICE_ID = os.getenv("TB_DEVICE_ID", "")  # Device ID trên ThingsBoard
+TB_DEVICE_ID = os.getenv("TB_DEVICE_ID", "023a1b70-7e63-11f0-a413-b38ec94d1465")  # Device ID thật
 TB_API_URL = f"https://thingsboard.cloud/api/plugins/telemetry/DEVICE/{TB_DEVICE_ID}/values/timeseries?keys=temperature,humidity,battery"
 TB_DEVICE_PUSH_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 # ================== FASTAPI ==================
 app = FastAPI()
 _last_payload = None
+
+class SensorData(BaseModel):
+    temperature: float
+    humidity: float
+    battery: float | None = None
 
 # ================== WEATHER ==================
 WEATHER_CODE_MAP = {
@@ -132,7 +138,6 @@ def get_last_telemetry():
         r = requests.get(TB_API_URL, timeout=10)
         r.raise_for_status()
         resp = r.json()
-        # Format last values
         last = {k: v[-1]['value'] for k,v in resp.items() if v}
         return last
     except Exception as e:
@@ -146,6 +151,26 @@ def send_to_thingsboard(data):
         logger.info(f"TB response: {r.status_code}")
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
+
+# ================== ROUTES ==================
+@app.get("/")
+def root():
+    return {"status":"running","device":TB_DEMO_TOKEN[:4]+"***"}
+
+@app.post("/esp32-data")
+def receive_data(data: SensorData):
+    global _last_payload
+    payload = data.dict()
+    weather = get_weather_forecast()
+    ai_result = call_ai_api(payload)
+    merged = {**payload, **weather, **ai_result, "location":"An Phú, Hồ Chí Minh", "crop":"Rau muống"}
+    send_to_thingsboard(merged)
+    _last_payload = merged
+    return {"received": payload, "pushed": merged}
+
+@app.get("/last")
+def last_telemetry_endpoint():
+    return _last_payload or {"message":"Chưa có dữ liệu"}
 
 # ================== BACKGROUND LOOP ==================
 def background_loop():
@@ -168,7 +193,3 @@ def background_loop():
 @app.on_event("startup")
 def start_background_loop():
     threading.Thread(target=background_loop, daemon=True).start()
-
-@app.get("/last")
-def last_telemetry_endpoint():
-    return _last_payload or {"message":"Chưa có dữ liệu"}
