@@ -1,92 +1,143 @@
+import os
 import logging
 import random
-from datetime import datetime
-from fastapi import FastAPI, Request
-from apscheduler.schedulers.background import BackgroundScheduler
 import requests
-import uvicorn
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+from zoneinfo import ZoneInfo
 
-# --- Cấu hình Log ---
+# --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("agri-bot")
 
-# --- ThingsBoard ---
-TB_TOKEN = "pk94asonfacs6mbeuutg"  # Token cố định
-TB_URL = f"http://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
+# --- Config chung từ ENV ---
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN", "pk94asonfacs6mbeuutg")
+TB_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
+TB_ATTR_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/attributes"
+LAT = os.getenv("LAT", "10.80609")
+LON = os.getenv("LON", "106.75222")
+CROP = os.getenv("CROP", "Rau muống")
+OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+# --- FastAPI ---
 app = FastAPI()
+scheduler = BackgroundScheduler()
 
-# --- Hàm gửi dữ liệu ---
+# --- Hàm push lên ThingsBoard ---
 def send_to_thingsboard(payload: dict):
     try:
-        logger.info(f"[TB ▶] Payload: {payload}")
-        resp = requests.post(TB_URL, json=payload, timeout=5)
-        if resp.status_code == 200:
-            logger.info(f"[TB ◀] OK {resp.status_code} - {resp.text}")
+        logger.info(f"[TB ▶] {payload}")
+        resp = requests.post(TB_URL, json=payload, timeout=10)
+        if resp.status_code in (200, 201, 204):
+            logger.info(f"[TB ◀] OK {resp.status_code}")
         else:
-            logger.warning(f"[TB ◀] LỖI {resp.status_code} - {resp.text}")
+            logger.warning(f"[TB ◀] LỖI {resp.status_code}: {resp.text}")
     except Exception as e:
         logger.error(f"[TB] EXCEPTION: {e}")
 
-# --- Tạo dữ liệu mẫu ---
+# --- Telemetry mẫu (sensor) ---
 def generate_sample_data():
     temperature = round(random.uniform(25, 35), 1)
     humidity = round(random.uniform(60, 80), 1)
     battery = random.randint(50, 100)
     return {
         "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "Server-Sim",
-        "plant_type": "Rau muống",
-        "location_name": "10.80609,106.75222",
-        "weather_now_desc": "Nhiều mây",
-        "weather_now_temp": temperature,
-        "weather_now_humidity": humidity,
         "temperature": temperature,
         "humidity": humidity,
         "battery": battery,
-        "advice_nutrition": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ",
-        "advice_care": "Tưới đủ nước, theo dõi thường xuyên | Độ ẩm ổn định",
-        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
-        "advice": " | ".join([
-            "Ưu tiên Kali (K)",
-            "Cân bằng NPK",
-            "Bón phân hữu cơ",
-            "Tưới đủ nước",
-            "Độ ẩm ổn định",
-            "Quan sát thực tế"
-        ]),
+        "plant_type": CROP,
+        "location_name": f"{LAT},{LON}",
+        "weather_now_desc": "Nhiều mây",
+        "weather_now_temp": temperature,
+        "weather_now_humidity": humidity,
+        "advice": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ | Tưới đủ nước",
         "prediction": f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
     }
 
-# --- Job gửi mẫu định kỳ ---
-def job_send_sample():
-    logger.info("[JOB] Gửi dữ liệu mẫu định kỳ...")
-    send_to_thingsboard(generate_sample_data())
+# --- Weather fetch ---
+def fetch_weather():
+    try:
+        if OWM_API_KEY:
+            url = (f"https://api.openweathermap.org/data/2.5/weather"
+                   f"?lat={LAT}&lon={LON}&units=metric&lang=vi&appid={OWM_API_KEY}")
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            return {
+                "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "crop": CROP,
+                "vi_tri": f"{LAT},{LON}",
+                "weather_temp": d["main"]["temp"],
+                "weather_humidity": d["main"]["humidity"],
+                "weather_desc": d["weather"][0]["description"]
+            }
+        else:
+            # fallback dummy
+            return {
+                "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "crop": CROP,
+                "vi_tri": f"{LAT},{LON}",
+                "weather_temp": round(random.uniform(26, 34), 1),
+                "weather_humidity": random.randint(50, 80),
+                "weather_desc": "Trời quang (demo)"
+            }
+    except Exception as e:
+        logger.error(f"Lỗi fetch weather: {e}")
+        return None
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(job_send_sample, 'interval', minutes=5)
+# --- Jobs định kỳ ---
+def job_send_all():
+    logger.info("[JOB] Push dữ liệu cảm biến + weather")
+    send_to_thingsboard(generate_sample_data())
+    w = fetch_weather()
+    if w:
+        send_to_thingsboard(w)
+
+scheduler.add_job(job_send_all, "interval", minutes=5)
 scheduler.start()
 
-# --- API nhận từ ESP32 ---
+# --- API ---
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "AgriBot server running (sensor + weather push every 5min)"}
+
 @app.post("/telemetry")
 async def receive_telemetry(req: Request):
     data = await req.json()
     data["time_sent"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data["source"] = "ESP32"
     logger.info(f"[ESP32 ▶] {data}")
     send_to_thingsboard(data)
     return {"status": "OK"}
 
-@app.get("/")
-async def root():
-    return {"message": "AgriBot server OK. Telemetry gửi mỗi 5 phút."}
+@app.post("/push")
+def push_now():
+    job_send_all()
+    return {"status": "OK", "message": "Pushed telemetry + weather"}
 
-# --- Khởi động server ---
+@app.get("/last")
+def last_telemetry():
+    """Lấy last telemetry từ ThingsBoard (qua REST API)"""
+    try:
+        url = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/attributes?sharedKeys=none"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return JSONResponse(content={"ok": True, "last": r.json()})
+        else:
+            return JSONResponse(content={"ok": False, "status": r.status_code, "body": r.text}, status_code=500)
+    except Exception as e:
+        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
+
+# --- Run ---
 if __name__ == "__main__":
-    logger.info("[INIT] Gửi dữ liệu mẫu ngay khi start...")
-    send_to_thingsboard(generate_sample_data())  # Đảm bảo có dữ liệu ngay lập tức
+    logger.info("[INIT] Gửi dữ liệu lần đầu...")
+    job_send_all()
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=False)
