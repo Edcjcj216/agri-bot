@@ -16,49 +16,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agri-bot")
 
-# --- Config chung từ ENV ---
-THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN", "pk94asonfacs6mbeuutg")
+# --- Config ---
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN", "sgkxcrqntuki8gu1oj8u")  # token mới
 TB_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
 TB_ATTR_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/attributes"
 LAT = os.getenv("LAT", "10.80609")
 LON = os.getenv("LON", "106.75222")
 CROP = os.getenv("CROP", "Rau muống")
 OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-LOCATION_NAME_OVERRIDE = os.getenv("LOCATION_NAME")
+LOCATION_NAME = os.getenv("LOCATION_NAME")  # override thủ công
 
 LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-_location_cache = None
+
+# --- Hàm lấy tên vị trí từ LAT/LON ---
+_LOCATION_CACHE = None  # cache tên vị trí
+def get_location_name(lat: str, lon: str) -> str:
+    global _LOCATION_CACHE
+    if LOCATION_NAME:
+        _LOCATION_CACHE = LOCATION_NAME
+        return _LOCATION_CACHE
+    if _LOCATION_CACHE:
+        return _LOCATION_CACHE
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse"
+        params = {
+            "lat": lat,
+            "lon": lon,
+            "format": "json",
+            "zoom": 16,
+            "addressdetails": 1,
+        }
+        headers = {"User-Agent": "agri-bot/1.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            _LOCATION_CACHE = data.get("display_name", f"{lat},{lon}")
+            return _LOCATION_CACHE
+        else:
+            logger.warning(f"Lỗi geocode {r.status_code}: {r.text}")
+            _LOCATION_CACHE = f"{lat},{lon}"
+            return _LOCATION_CACHE
+    except Exception as e:
+        logger.error(f"EXCEPTION get_location_name: {e}")
+        _LOCATION_CACHE = f"{lat},{lon}"
+        return _LOCATION_CACHE
 
 # --- FastAPI ---
 app = FastAPI()
 scheduler = BackgroundScheduler()
-
-# --- Hàm lấy địa chỉ từ lat/lon ---
-def get_location_name():
-    global _location_cache
-    if LOCATION_NAME_OVERRIDE:
-        return LOCATION_NAME_OVERRIDE
-    if _location_cache:
-        return _location_cache
-    try:
-        url = (
-            f"https://nominatim.openstreetmap.org/reverse?"
-            f"format=jsonv2&lat={LAT}&lon={LON}&accept-language=vi"
-        )
-        headers = {"User-Agent": "agri-bot/1.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            display = j.get("display_name")
-            if display:
-                # Rút gọn địa chỉ, lấy 3 phần đầu tiên
-                parts = [p.strip() for p in display.split(",")]
-                short = ", ".join(parts[:3]) if len(parts) >= 3 else display
-                _location_cache = short
-                return short
-    except Exception as e:
-        logger.warning(f"Lỗi reverse geocode: {e}")
-    return f"{LAT},{LON}"
 
 # --- Hàm push lên ThingsBoard ---
 def send_to_thingsboard(payload: dict):
@@ -83,7 +88,7 @@ def generate_sample_data():
         "humidity": humidity,
         "battery": battery,
         "plant_type": CROP,
-        "location_name": get_location_name(),
+        "location_name": get_location_name(LAT, LON),  # <-- Tự động resolve tên vị trí
         "weather_now_desc": "Nhiều mây",
         "weather_now_temp": temperature,
         "weather_now_humidity": humidity,
@@ -103,7 +108,7 @@ def fetch_weather():
             return {
                 "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "crop": CROP,
-                "vi_tri": get_location_name(),
+                "vi_tri": get_location_name(LAT, LON),  # <-- Dùng tên vị trí
                 "weather_temp": d["main"]["temp"],
                 "weather_humidity": d["main"]["humidity"],
                 "weather_desc": d["weather"][0]["description"]
@@ -113,7 +118,7 @@ def fetch_weather():
             return {
                 "time_sent": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "crop": CROP,
-                "vi_tri": get_location_name(),
+                "vi_tri": get_location_name(LAT, LON),
                 "weather_temp": round(random.uniform(26, 34), 1),
                 "weather_humidity": random.randint(50, 80),
                 "weather_desc": "Trời quang (demo)"
@@ -142,6 +147,7 @@ def root():
 async def receive_telemetry(req: Request):
     data = await req.json()
     data["time_sent"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["location_name"] = get_location_name(LAT, LON)  # thêm tên vị trí
     logger.info(f"[ESP32 ▶] {data}")
     send_to_thingsboard(data)
     return {"status": "OK"}
