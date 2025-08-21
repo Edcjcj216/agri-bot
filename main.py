@@ -17,9 +17,8 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
 LON = os.getenv("LON", "106.70")
-
+CROP = os.getenv("CROP", "Rau muống")
 LOCATION_NAME = "An Phú, Hồ Chí Minh"
-CROP = "Rau muống"
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -59,7 +58,7 @@ WEATHER_CODE_MAP = {
 }
 
 def get_weather_forecast() -> dict:
-    """Lấy dự báo hôm nay và ngày mai từ Open-Meteo"""
+    """Lấy dự báo hôm nay và ngày mai, tách riêng từng key"""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -74,24 +73,20 @@ def get_weather_forecast() -> dict:
         daily = data.get("daily", {})
         if not daily:
             return {}
-        weather_today = {
-            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không xác định"),
-            "temp_max": daily["temperature_2m_max"][0],
-            "temp_min": daily["temperature_2m_min"][0]
+        return {
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không xác định"),
+            "weather_today_max": daily["temperature_2m_max"][0],
+            "weather_today_min": daily["temperature_2m_min"][0],
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không xác định"),
+            "weather_tomorrow_max": daily["temperature_2m_max"][1],
+            "weather_tomorrow_min": daily["temperature_2m_min"][1],
         }
-        weather_tomorrow = {
-            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không xác định"),
-            "temp_max": daily["temperature_2m_max"][1],
-            "temp_min": daily["temperature_2m_min"][1]
-        }
-        return {"weather_today": weather_today, "weather_tomorrow": weather_tomorrow}
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
         return {}
 
 # ================== AI HELPER ==================
 def call_ai_api(data: dict) -> dict:
-    """Gọi AI và/hoặc local rule"""
     model_url = AI_API_URL
     hf_token = HF_TOKEN
     headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
@@ -99,8 +94,10 @@ def call_ai_api(data: dict) -> dict:
     weather_info = get_weather_forecast()
     weather_text = ""
     if weather_info:
-        wt = weather_info.get("weather_today", {})
-        weather_text = f" Dự báo hôm nay: {wt.get('weather_desc','?')}, {wt.get('temp_min','?')}–{wt.get('temp_max','?')}°C."
+        weather_text = (
+            f" Hôm nay: {weather_info.get('weather_today_desc','?')}, "
+            f"{weather_info.get('weather_today_min','?')}–{weather_info.get('weather_today_max','?')}°C."
+        )
 
     prompt = (
         f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, pin {data.get('battery','?')}%. "
@@ -190,11 +187,12 @@ def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ {data.dict()}")
     ai_result = call_ai_api(data.dict())
     weather_info = get_weather_forecast()
-    merged = data.dict() | ai_result | {
-        "weather_today": weather_info.get("weather_today", {}),
-        "weather_tomorrow": weather_info.get("weather_tomorrow", {}),
+    merged = {
+        **data.dict(),
         "location": LOCATION_NAME,
-        "crop": CROP
+        "crop": CROP,
+        **ai_result,
+        **weather_info
     }
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
@@ -211,15 +209,16 @@ def auto_loop():
             logger.info(f"[AUTO] ESP32 ▶ {sample}")
             ai_result = call_ai_api(sample)
             weather_info = get_weather_forecast()
-            merged = sample | ai_result | {
-                "weather_today": weather_info.get("weather_today", {}),
-                "weather_tomorrow": weather_info.get("weather_tomorrow", {}),
+            merged = {
+                **sample,
                 "location": LOCATION_NAME,
-                "crop": CROP
+                "crop": CROP,
+                **ai_result,
+                **weather_info
             }
             send_to_thingsboard(merged)
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
-        time.sleep(300)  # 5 phút
+        time.sleep(300)
 
 threading.Thread(target=auto_loop, daemon=True).start()
