@@ -12,7 +12,7 @@ THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Device token ThingsBoard (
 LAT = os.getenv("LAT", "10.806094263669602")
 LON = os.getenv("LON", "106.75222004270555")
 CROP = os.getenv("CROP", "Rau muống")
-# Nếu muốn override tên location thủ công, set env LOCATION_NAME="An Phu, Ho Chi Minh"
+# Nếu muốn override tên location thủ công, set env LOCATION_NAME="An Phú, Thành phố Hồ Chí Minh"
 LOCATION_NAME_OVERRIDE = os.getenv("LOCATION_NAME")
 
 THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
@@ -29,63 +29,6 @@ _LOCATION_NAME_CACHE = None
 def _log(msg):
     print(f"[{datetime.now().isoformat()}] {msg}")
 
-def get_location_name():
-    """
-    Trả về chuỗi mô tả vị trí như "An Phu, Ho Chi Minh".
-    Thứ tự ưu tiên:
-      1) LOCATION_NAME env override
-      2) Cache nếu đã lấy
-      3) Gọi Open-Meteo reverse-geocoding
-      4) Fallback: "LAT,LON"
-    """
-    global _LOCATION_NAME_CACHE
-    if LOCATION_NAME_OVERRIDE:
-        return LOCATION_NAME_OVERRIDE
-
-    if _LOCATION_NAME_CACHE:
-        return _LOCATION_NAME_CACHE
-
-    try:
-        lat_f = float(LAT)
-        lon_f = float(LON)
-    except Exception:
-        return f"{LAT},{LON}"
-
-    try:
-        url = (
-            f"https://geocoding-api.open-meteo.com/v1/reverse?"
-            f"latitude={lat_f}&longitude={lon_f}&language=vi&count=1"
-        )
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        j = r.json()
-        results = j.get("results") or []
-        if results:
-            r0 = results[0]
-            # Các trường có thể: name, admin1, admin2, country
-            parts = []
-            name = r0.get("name")
-            admin1 = r0.get("admin1")
-            admin2 = r0.get("admin2")
-            country = r0.get("country")
-            if name:
-                parts.append(name)
-            if admin2 and admin2 != name:
-                parts.append(admin2)
-            if admin1 and admin1 not in parts:
-                parts.append(admin1)
-            # Nếu admin1 chứa "Ho Chi Minh", bạn có thể map/format nếu cần.
-            if country and country.lower() not in "vietnam":
-                parts.append(country)
-            pretty = ", ".join(parts) if parts else f"{LAT},{LON}"
-            _LOCATION_NAME_CACHE = pretty
-            return pretty
-    except Exception as e:
-        _log(f"Lỗi reverse-geocode: {e}")
-
-    # fallback
-    return f"{LAT},{LON}"
-
 # Open-Meteo -> mô tả tiếng Việt
 OM_VN = {
     0: "Trời quang", 1: "Hầu như quang", 2: "Mây phân bố", 3: "Nhiều mây",
@@ -101,6 +44,83 @@ def _om_vn(code):
     except Exception:
         return "N/A"
 
+# ================= get_location_name (Thay thế, im lặng khi 404, fallback Nominatim, cache) ================
+def get_location_name():
+    """
+    Trả về tên vị trí có dấu tiếng Việt, ưu tiên:
+      1) LOCATION_NAME env override
+      2) Cache
+      3) Open-Meteo reverse geocoding (language=vi) — if status 200 and contains non-ascii
+      4) Nominatim reverse geocoding (accept-language=vi) — fallback nếu Open-Meteo thiếu hoặc trả non-ascii
+      5) Fallback: "LAT,LON"
+    """
+    global _LOCATION_NAME_CACHE
+    if LOCATION_NAME_OVERRIDE:
+        _LOCATION_NAME_CACHE = LOCATION_NAME_OVERRIDE
+        return _LOCATION_NAME_CACHE
+
+    if _LOCATION_NAME_CACHE:
+        return _LOCATION_NAME_CACHE
+
+    try:
+        lat_f = float(LAT)
+        lon_f = float(LON)
+    except Exception:
+        return f"{LAT},{LON}"
+
+    # 1) Thử Open-Meteo reverse (không raise error trên 404)
+    try:
+        om_url = (
+            f"https://geocoding-api.open-meteo.com/v1/reverse?"
+            f"latitude={lat_f}&longitude={lon_f}&language=vi&count=1"
+        )
+        r = requests.get(om_url, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            results = j.get("results") or []
+            if results:
+                r0 = results[0]
+                parts = []
+                for v in (r0.get("name"), r0.get("admin2"), r0.get("admin1"), r0.get("country")):
+                    if v and v not in parts:
+                        parts.append(v)
+                pretty = ", ".join(parts) if parts else None
+                # nếu có dấu (non-ascii) thì chấp nhận
+                if pretty and any(ord(ch) > 127 for ch in pretty):
+                    _LOCATION_NAME_CACHE = pretty
+                    return _LOCATION_NAME_CACHE
+                # nếu trả ASCII-only hoặc empty -> tiếp fallback
+        else:
+            _log(f"Open-Meteo geocode trả status {r.status_code} — chuyển sang fallback.")
+    except Exception as e:
+        _log(f"Open-Meteo geocode lỗi (bỏ qua): {e}")
+
+    # 2) Fallback: Nominatim (OpenStreetMap) với accept-language=vi
+    try:
+        nom_url = (
+            f"https://nominatim.openstreetmap.org/reverse?"
+            f"format=jsonv2&lat={lat_f}&lon={lon_f}&accept-language=vi"
+        )
+        headers = {"User-Agent": "agri-bot/1.0 (contact: your-email@example.com)"}
+        r2 = requests.get(nom_url, headers=headers, timeout=8)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            display = j2.get("display_name")
+            if display:
+                parts = [p.strip() for p in display.split(",")]
+                short = ", ".join(parts[0:3]) if len(parts) >= 3 else display
+                _LOCATION_NAME_CACHE = short
+                return _LOCATION_NAME_CACHE
+        else:
+            _log(f"Nominatim trả status {r2.status_code}")
+    except Exception as e:
+        _log(f"Nominatim reverse-geocode lỗi (bỏ qua): {e}")
+
+    # 3) fallback cuối cùng: lat,lon
+    _LOCATION_NAME_CACHE = f"{LAT},{LON}"
+    return _LOCATION_NAME_CACHE
+
+# ================= fetch_weather (tiếng Việt keys, timezone VN, OpenWeather + Open-Meteo fallback) ================
 def fetch_weather():
     try:
         # ==== Lấy tên vị trí chi tiết (1 lần) ====
@@ -258,6 +278,7 @@ def fetch_weather():
         _log(f"❌ Error fetching weather: {e}")
         return None
 
+# ================= push_to_thingsboard & scheduler ====================
 def push_to_thingsboard():
     if not THINGSBOARD_TOKEN:
         _log("THINGSBOARD_TOKEN không được cấu hình. Bỏ qua việc push telemetry.")
