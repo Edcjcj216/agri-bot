@@ -63,7 +63,7 @@ def get_weather(lat: float, lon: float):
     resp.raise_for_status()
     data = resp.json()
 
-    # Dữ liệu hôm nay và ngày mai
+    # --- Thời tiết hôm nay và ngày mai ---
     daily = data["daily"]
     hom_nay = {
         "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không rõ"),
@@ -76,9 +76,14 @@ def get_weather(lat: float, lon: float):
         "temp_min": daily["temperature_2m_min"][1],
     }
 
-    # Lấy 6 giờ tiếp theo từ hourly
+    # --- Thời tiết hiện tại (lấy từ giờ gần nhất) ---
     hourly = data["hourly"]
     now = datetime.now().hour
+    current_temp = hourly["temperature_2m"][now]
+    current_code = hourly["weathercode"][now]
+    current_desc = WEATHER_CODE_MAP.get(current_code, "Không rõ")
+
+    # --- Dự báo 6 giờ tiếp theo ---
     next6 = {}
     for i in range(6):
         idx = now + i if now + i < len(hourly["temperature_2m"]) else -1
@@ -87,7 +92,7 @@ def get_weather(lat: float, lon: float):
         desc = WEATHER_CODE_MAP.get(code, "Không rõ")
         next6[f"hour_{i+1}"] = {"temp": temp, "weather_desc": desc}
 
-    return hom_nay, ngay_mai, next6
+    return current_temp, current_desc, hom_nay, ngay_mai, next6
 
 # ==============================
 # Hàm gọi AI API
@@ -131,17 +136,17 @@ def send_to_tb(payload: dict):
 @app.post("/esp32-data")
 async def esp32_data(req: Request):
     body = await req.json()
-    temp = body.get("temperature")
-    hum = body.get("humidity")
-    bat = body.get("battery")
-    crop = body.get("crop", "Không rõ")
+    temp = body.get("temperature")       # Nhiệt độ từ cảm biến
+    hum = body.get("humidity")           # Độ ẩm từ cảm biến
+    bat = body.get("battery")            # Pin
+    crop = "rau muống"                   # Cố định loại cây trồng
     lat = body.get("lat")
     lon = body.get("lon")
 
-    # Lấy thời tiết
-    hom_nay, ngay_mai, next6 = get_weather(lat, lon)
+    # --- Lấy thời tiết ---
+    current_temp, current_desc, hom_nay, ngay_mai, next6 = get_weather(lat, lon)
 
-    # Gọi AI API để sinh gợi ý
+    # --- Gọi AI API để sinh gợi ý ---
     ai_input = {
         "temperature": temp,
         "humidity": hum,
@@ -153,10 +158,16 @@ async def esp32_data(req: Request):
     }
     ai_result = await call_ai_api(ai_input)
 
+    # --- Payload gửi lên ThingsBoard ---
     payload = {
         "temperature": temp,
         "humidity": hum,
         "battery": bat,
+        "crop_type": crop,                          # loại cây trồng
+        "location": f"{lat},{lon}",                 # tọa độ hiện tại
+        "current_temp": current_temp,               # nhiệt độ hiện tại (theo vị trí)
+        "current_humidity": hum,                    # độ ẩm hiện tại (cảm biến)
+        "current_weather_desc": current_desc,       # mô tả thời tiết hiện tại
         **ai_result,
         "hom_nay": hom_nay,
         "ngay_mai": ngay_mai,
