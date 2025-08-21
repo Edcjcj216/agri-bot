@@ -1,18 +1,23 @@
 import os
 import time
-import json
 import logging
-import threading
 import requests
+import threading
 from fastapi import FastAPI
+from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "I1s5bI2FQCZw6umLvwLG")
-TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
-OWM_API_KEY = os.getenv("OWM_API_KEY", "")
+TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "sgkxcrqntuki8gu1oj8u")
+TB_DEVICE_ID = os.getenv("TB_DEVICE_ID", "")  # Device ID trên ThingsBoard
+TB_API_URL = f"https://thingsboard.cloud/api/plugins/telemetry/DEVICE/{TB_DEVICE_ID}/values/timeseries?keys=temperature,humidity,battery"
+TB_DEVICE_PUSH_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
+
 LAT = float(os.getenv("LAT", "10.79"))
 LON = float(os.getenv("LON", "106.70"))
 LOOP_INTERVAL = 300  # 5 phút
+
+AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
@@ -23,152 +28,147 @@ app = FastAPI()
 _last_payload = None
 
 # ================== WEATHER ==================
-OWM_DESC_VI = {
-    "clear sky": "Trời quang",
-    "few clouds": "Trời quang nhẹ",
-    "scattered clouds": "Có mây",
-    "broken clouds": "Nhiều mây",
-    "shower rain": "Mưa rào",
-    "rain": "Mưa",
-    "light rain": "Mưa nhẹ",
-    "moderate rain": "Mưa vừa",
-    "heavy intensity rain": "Mưa to",
-    "thunderstorm": "Giông",
-    "snow": "Tuyết",
-    "mist": "Sương mù"
+WEATHER_CODE_MAP = {
+    0: "Trời quang", 1: "Trời quang nhẹ", 2: "Có mây", 3: "Nhiều mây",
+    45: "Sương mù", 48: "Sương mù đóng băng",
+    51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
+    61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
+    71: "Tuyết nhẹ", 73: "Tuyết vừa", 75: "Tuyết dày",
+    80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
+    95: "Giông nhẹ hoặc vừa", 96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá mạnh"
 }
 
-def _empty_weather():
-    keys = ["weather_yesterday_desc","weather_yesterday_max","weather_yesterday_min","humidity_yesterday",
-            "weather_today_desc","weather_today_max","weather_today_min","humidity_today",
-            "weather_tomorrow_desc","weather_tomorrow_max","weather_tomorrow_min","humidity_tomorrow"]
-    return {k: 0 if "max" in k or "min" in k or "humidity" in k else "?" for k in keys}
-
 def get_weather_forecast():
-    if not OWM_API_KEY:
-        logger.warning("OWM_API_KEY chưa cấu hình, dùng giá trị mẫu")
-        return _empty_weather()
     try:
-        now = int(time.time())
-        yesterday = now - 86400
-
-        # Forecast
-        r = requests.get("https://api.openweathermap.org/data/2.5/onecall", params={
-            "lat": LAT, "lon": LON, "exclude": "minutely,hourly,alerts", "units": "metric", "appid": OWM_API_KEY
-        }, timeout=10)
+        today_dt = datetime.now()
+        tomorrow_dt = today_dt + timedelta(days=1)
+        yesterday_dt = today_dt - timedelta(days=1)
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": LAT,
+            "longitude": LON,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+            "hourly": "relativehumidity_2m",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "start_date": yesterday_dt.strftime("%Y-%m-%d"),
+            "end_date": tomorrow_dt.strftime("%Y-%m-%d")
+        }
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        daily = data.get("daily", [])
+        daily = data.get("daily", {})
+        hourly = data.get("hourly", {})
 
-        def extract_day_info(day):
-            temp = day.get("temp", {})
-            weather = day.get("weather",[{}])[0].get("description","?")
-            humidity = day.get("humidity",0)
-            return {
-                "desc": OWM_DESC_VI.get(weather, weather),
-                "max": temp.get("max",0),
-                "min": temp.get("min",0),
-                "humidity": humidity
-            }
+        def mean(lst):
+            return round(sum(lst)/len(lst), 1) if lst else 0
 
-        # Yesterday
-        r_hist = requests.get("https://api.openweathermap.org/data/2.5/onecall/timemachine", params={
-            "lat": LAT, "lon": LON, "dt": yesterday, "units": "metric", "appid": OWM_API_KEY
-        }, timeout=10)
-        r_hist.raise_for_status()
-        hist_data = r_hist.json()
-        hist_temp_list = [h["temp"] for h in hist_data.get("hourly",[])]
-        hist_humi_list = [h["humidity"] for h in hist_data.get("hourly",[])]
-        weather_result = {
-            "weather_yesterday_desc": OWM_DESC_VI.get(hist_data.get("current",{}).get("weather",[{}])[0].get("description","?"),"?"),
-            "weather_yesterday_max": max(hist_temp_list) if hist_temp_list else 0,
-            "weather_yesterday_min": min(hist_temp_list) if hist_temp_list else 0,
-            "humidity_yesterday": round(sum(hist_humi_list)/len(hist_humi_list),1) if hist_humi_list else 0
+        weather_yesterday = {
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[0], "?"),
+            "weather_yesterday_max": daily.get("temperature_2m_max",[0])[0],
+            "weather_yesterday_min": daily.get("temperature_2m_min",[0])[0],
+            "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
         }
-
-        today_info = extract_day_info(daily[0]) if len(daily)>0 else {"desc":"?","max":0,"min":0,"humidity":0}
-        tomorrow_info = extract_day_info(daily[1]) if len(daily)>1 else {"desc":"?","max":0,"min":0,"humidity":0}
-
-        weather_result.update({
-            "weather_today_desc": today_info["desc"],
-            "weather_today_max": today_info["max"],
-            "weather_today_min": today_info["min"],
-            "humidity_today": today_info["humidity"],
-            "weather_tomorrow_desc": tomorrow_info["desc"],
-            "weather_tomorrow_max": tomorrow_info["max"],
-            "weather_tomorrow_min": tomorrow_info["min"],
-            "humidity_tomorrow": tomorrow_info["humidity"]
-        })
-        return weather_result
+        weather_today = {
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[1], "?"),
+            "weather_today_max": daily.get("temperature_2m_max",[0])[1],
+            "weather_today_min": daily.get("temperature_2m_min",[0])[1],
+            "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
+        }
+        weather_tomorrow = {
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[2], "?"),
+            "weather_tomorrow_max": daily.get("temperature_2m_max",[0])[2],
+            "weather_tomorrow_min": daily.get("temperature_2m_min",[0])[2],
+            "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
+        }
+        return {**weather_yesterday, **weather_today, **weather_tomorrow}
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        return _empty_weather()
+        return {k: 0 if "max" in k or "min" in k or "humidity" in k else "?" 
+                for k in ["weather_yesterday_desc","weather_yesterday_max","weather_yesterday_min","humidity_yesterday",
+                          "weather_today_desc","weather_today_max","weather_today_min","humidity_today",
+                          "weather_tomorrow_desc","weather_tomorrow_max","weather_tomorrow_min","humidity_tomorrow"]}
 
-# ================== AI ADVICE ==================
-def call_ai_advice(temperature, humidity, weather_desc):
-    # Local logic linh hoạt
-    care_options = []
-    if temperature > 35:
-        care_options.append("Tránh nắng gắt")
-    elif temperature >= 30:
-        care_options.append("Tưới đủ nước")
-    elif temperature <= 15:
-        care_options.append("Giữ ấm")
-    else:
-        care_options.append("Nhiệt độ bình thường")
+# ================== AI HELPER ==================
+def call_ai_api(data):
+    def local_sections(temp, humi):
+        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
+        care = []
+        if temp >= 35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+        elif temp >= 30: care.append("Tưới đủ nước, theo dõi thường xuyên")
+        elif temp <= 15: care.append("Giữ ấm, tránh sương muối")
+        else: care.append("Nhiệt độ bình thường")
+        if humi <= 40: care.append("Độ ẩm thấp: tăng tưới")
+        elif humi <= 60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+        elif humi >= 85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+        else: care.append("Độ ẩm ổn định cho rau muống")
+        return {
+            "prediction": pred,
+            "advice_nutrition": " | ".join(nutrition),
+            "advice_care": " | ".join(care),
+            "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
+            "advice": " | ".join(nutrition + care + ["Quan sát cây trồng và điều chỉnh thực tế"])
+        }
 
-    if humidity <= 40:
-        care_options.append("Độ ẩm thấp: tăng tưới")
-    elif humidity <= 60:
-        care_options.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-    elif humidity >= 85:
-        care_options.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
-    else:
-        care_options.append("Độ ẩm ổn định cho rau muống")
-
-    nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
-
-    return {
-        "prediction": f"Nhiệt độ {temperature:.1f}°C, độ ẩm {humidity:.1f}%",
-        "advice_nutrition": " | ".join(nutrition),
-        "advice_care": " | ".join(care_options),
-        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
-        "advice": " | ".join(nutrition + care_options + ["Quan sát cây trồng và điều chỉnh thực tế"])
-    }
-
-# ================== TELEMETRY ==================
-def send_telemetry(sensor_data):
-    global _last_payload
-    weather = get_weather_forecast()
-    ai_advice = call_ai_advice(sensor_data['temperature'], sensor_data['humidity'], weather['weather_today_desc'])
-    payload = {**sensor_data, **weather, **ai_advice}
     try:
-        r = requests.post(TB_DEVICE_URL, json=payload, timeout=10)
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+        prompt = f"Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}% tại An Phú, HCM. Viết dự báo + gợi ý chăm sóc."
+        r = requests.post(AI_API_URL, headers=headers, json={"inputs": prompt, "options":{"wait_for_model":True}}, timeout=20)
         r.raise_for_status()
-        logger.info(f"Telemetry sent: {payload}")
-        _last_payload = payload
+        out = r.json()
+        text = ""
+        if isinstance(out, list) and out:
+            text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
+        sec = local_sections(data['temperature'], data['humidity'])
+        sec['advice'] = text.strip() or sec['advice']
+        return sec
     except Exception as e:
-        logger.error(f"Send telemetry failed: {e}")
+        logger.warning(f"AI API failed: {e}")
+        return local_sections(data['temperature'], data['humidity'])
+
+# ================== THINGSBOARD ==================
+def get_last_telemetry():
+    try:
+        r = requests.get(TB_API_URL, timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+        # Format last values
+        last = {k: v[-1]['value'] for k,v in resp.items() if v}
+        return last
+    except Exception as e:
+        logger.warning(f"Failed to get last telemetry: {e}")
+        return None
+
+def send_to_thingsboard(data):
+    try:
+        logger.info(f"Sending to TB: {data}")
+        r = requests.post(TB_DEVICE_PUSH_URL, json=data, timeout=10)
+        logger.info(f"TB response: {r.status_code}")
+    except Exception as e:
+        logger.error(f"ThingsBoard push error: {e}")
 
 # ================== BACKGROUND LOOP ==================
-def telemetry_loop():
+def background_loop():
+    global _last_payload
     while True:
-        # Nếu ESP32 đã gửi lên TB, lấy dữ liệu từ TB hoặc giả lập tạm sensor
-        sensor_data = {
-            "temperature": round(random.uniform(20,35),1),  # Thay bằng dữ liệu ESP32 nếu cần
-            "humidity": round(random.uniform(40,85),1),
-            "battery_voltage": round(random.uniform(3.5,4.2),2),
-            "battery_percent": round(random.uniform(60,100),0),
-            "crop": "Rau muống",
-            "location": "An Phú, Hồ Chí Minh"
-        }
-        send_telemetry(sensor_data)
+        try:
+            last_data = get_last_telemetry()
+            if last_data:
+                weather = get_weather_forecast()
+                ai_result = call_ai_api(last_data)
+                merged = {**last_data, **weather, **ai_result, "location":"An Phú, Hồ Chí Minh", "crop":"Rau muống"}
+                send_to_thingsboard(merged)
+                _last_payload = merged
+            else:
+                logger.info("No last telemetry available yet.")
+        except Exception as e:
+            logger.error(f"Background loop error: {e}")
         time.sleep(LOOP_INTERVAL)
 
 @app.on_event("startup")
 def start_background_loop():
-    threading.Thread(target=telemetry_loop, daemon=True).start()
+    threading.Thread(target=background_loop, daemon=True).start()
 
 @app.get("/last")
-def last_telemetry():
-    return _last_payload or {"message": "Chưa có dữ liệu"}
+def last_telemetry_endpoint():
+    return _last_payload or {"message":"Chưa có dữ liệu"}
