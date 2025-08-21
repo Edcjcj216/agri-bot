@@ -31,9 +31,14 @@ class SensorData(BaseModel):
 
 # ================== HELPERS ==================
 def call_ai_api(data: dict) -> dict:
-    """Gọi AI (Hugging Face nếu có). Nếu AI không khả dụng thì dùng quy tắc cục bộ để sinh prediction + advice
+    """Gọi AI (nếu có) rồi trả về luôn các trường:
+    - prediction: tóm tắt số
+    - advice: văn bản lời khuyên (AI nếu có, else local)
+    - advice_nutrition: phần dinh dưỡng ngắn
+    - advice_care: phần chăm sóc ngắn
+    - advice_note: lưu ý/ngắn gọn
 
-    Luôn trả về dict có keys: prediction (chuỗi) và advice (chuỗi).
+    Luôn đảm bảo các trường trên không rỗng (dùng quy tắc local nếu AI không trả).
     """
     model_url = AI_API_URL
     hf_token = HF_TOKEN
@@ -44,35 +49,48 @@ def call_ai_api(data: dict) -> dict:
     )
     body = {"inputs": prompt, "options": {"wait_for_model": True}}
 
-    # Helper local rule-based fallback generator
-    def local_advice(temp: float, humi: float, battery: float | None = None) -> dict:
+    def local_sections(temp: float, humi: float, battery: float | None = None) -> dict:
         pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-        tips: list[str] = []
-        # Temperature rules
+        # Nutrition section
+        nutrition = []
+        nutrition.append("**Dinh dưỡng:** - Ưu tiên Kali (K)")
+        nutrition.append("- Cân bằng NPK")
+        nutrition.append("- Bón phân hữu cơ")
+        nutrition.append("- Phân bón lá nếu cần")
+        # Care section
+        care = []
+        # temperature-based
         if temp >= 35:
-            tips.append("Nhiệt độ cao — tránh phơi nắng gắt, che nắng và tưới sớm/chiều.")
+            care.append("- Tránh phơi nắng gắt; che chắn, tưới sáng sớm/chiều mát")
         elif temp >= 30:
-            tips.append("Nhiệt độ khá cao — tưới đủ nước và theo dõi cây thường xuyên.")
+            care.append("- Tưới đủ nước và theo dõi thường xuyên")
         elif temp <= 15:
-            tips.append("Nhiệt độ thấp — giữ ấm, tránh sương muối.")
+            care.append("- Giữ ấm, tránh sương muối")
         else:
-            tips.append("Nhiệt độ trong ngưỡng bình thường.")
-        # Humidity rules
+            care.append("- Nhiệt độ trong ngưỡng bình thường")
+        # humidity-based
         if humi <= 40:
-            tips.append("Độ ẩm thấp — cần tăng tưới, đặc biệt cho rau đang xanh non.")
+            care.append("- Độ ẩm thấp: tăng tưới")
         elif humi <= 60:
-            tips.append("Độ ẩm hơi thấp — theo dõi, tưới khi cần.")
+            care.append("- Độ ẩm hơi thấp: theo dõi, tưới khi cần")
         elif humi >= 85:
-            tips.append("Độ ẩm cao — chú ý thoát nước, tránh úng và nấm bệnh.")
+            care.append("- Độ ẩm cao: kiểm tra thoát nước, tránh úng")
         else:
-            tips.append("Độ ẩm ổn định cho rau muống.")
-        # Battery
+            care.append("- Độ ẩm ổn định cho rau muống")
+        # other
         if battery is not None and battery <= 20:
-            tips.append("Pin thấp — kiểm tra nguồn/ắc quy của ESP32.")
-        advice_text = " ".join(tips)
-        return {"prediction": pred, "advice": advice_text}
+            care.append("- Pin thiết bị thấp: kiểm tra nguồn/ắc quy")
 
-    # Try AI call first
+        note = "**Lưu ý:** Quan sát cây trồng và điều chỉnh theo thực tế"
+
+        return {
+            "prediction": pred,
+            "advice_nutrition": " ".join(nutrition),
+            "advice_care": " ".join(care),
+            "advice_note": note,
+        }
+
+    # Try AI call first; if success, use AI text as 'advice' but still build structured sections from local rules
     try:
         logger.info(f"AI ▶ POST {model_url} body={prompt[:200]}")
         r = requests.post(model_url, headers=headers, json=body, timeout=30)
@@ -91,19 +109,25 @@ def call_ai_api(data: dict) -> dict:
             else:
                 text = str(out)
 
+            sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
             if text:
-                # Return AI result but ensure prediction present
                 return {
-                    "prediction": f"Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%",
-                    "advice": text.strip()
+                    "prediction": sections['prediction'],
+                    "advice": text.strip(),
+                    "advice_nutrition": sections['advice_nutrition'],
+                    "advice_care": sections['advice_care'],
+                    "advice_note": sections['advice_note'],
                 }
             else:
-                logger.warning("AI returned empty text, falling back to local rules")
+                logger.warning("AI returned empty text, falling back to local sections")
     except Exception as e:
         logger.warning(f"AI API call failed: {e}, using local fallback")
 
-    # Fallback local rules (always returns non-empty prediction & advice)
-    return local_advice(data['temperature'], data['humidity'], data.get('battery'))
+    # Fallback: always return local structured sections + combined advice
+    sec = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+    combined_advice = f"{sec['advice_nutrition']} {sec['advice_care']} {sec['advice_note']}"
+    sec['advice'] = combined_advice
+    return sec
 
 
 def send_to_thingsboard(data: dict):
