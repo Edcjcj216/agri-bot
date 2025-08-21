@@ -67,19 +67,21 @@ def get_weather_forecast():
         def mean(lst):
             return round(sum(lst)/len(lst),1) if lst else 0
 
-        # Hôm qua, hôm nay, ngày mai
+        # Hôm qua
         weather_yesterday = {
             "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
             "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
             "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
             "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
         }
+        # Hôm nay
         weather_today = {
             "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
             "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
             "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
             "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
         }
+        # Ngày mai
         weather_tomorrow = {
             "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
             "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
