@@ -3,15 +3,15 @@ import requests
 from fastapi import FastAPI
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timezone
+from fastapi.responses import JSONResponse
 
 # === Config từ Environment Render ===
 OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")   # API key OpenWeather (có thể None)
-THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Device token ThingsBoard (bắt buộc)
-LAT = os.getenv("LAT", "10.806094263669602")  # Vĩ độ mặc định HCM
-LON = os.getenv("LON", "106.75222004270555")  # Kinh độ mặc định HCM
-CROP = os.getenv("CROP", "Rau muống")         # Loại cây trồng
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Device token ThingsBoard (bắt buộc để push)
+LAT = os.getenv("LAT", "10.806094263669602")
+LON = os.getenv("LON", "106.75222004270555")
+CROP = os.getenv("CROP", "Rau muống")
 
-# URL ThingsBoard telemetry (THINGSBOARD_TOKEN có thể là None)
 THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
 
 app = FastAPI()
@@ -20,10 +20,8 @@ scheduler = BackgroundScheduler()
 def _log(msg):
     print(f"[{datetime.now().isoformat()}] {msg}")
 
-# ================== Hàm lấy dự báo thời tiết (OpenWeather hoặc fallback Open-Meteo) ==================
 def fetch_weather():
     try:
-        # Nếu có OpenWeather API key -> ưu tiên dùng OpenWeather OneCall (https)
         if OWM_API_KEY:
             url = (
                 f"https://api.openweathermap.org/data/2.5/onecall"
@@ -36,11 +34,10 @@ def fetch_weather():
             r.raise_for_status()
             data = r.json()
 
-            # Lấy tên địa điểm (weather endpoint)
             city_url = f"https://api.openweathermap.org/data/2.5/weather?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&lang=vi"
-            city_resp = requests.get(city_url, timeout=8)
             city_name = "Unknown"
             try:
+                city_resp = requests.get(city_url, timeout=8)
                 city_resp.raise_for_status()
                 city_name = city_resp.json().get("name", "Unknown")
             except Exception:
@@ -87,7 +84,7 @@ def fetch_weather():
             }
             return payload
 
-        # === Fallback: Open-Meteo (miễn phí, không cần API key) ===
+        # Fallback Open-Meteo
         _log("OPENWEATHER_API_KEY không tồn tại — chuyển sang Open-Meteo (fallback).")
         om_url = (
             f"https://api.open-meteo.com/v1/forecast?"
@@ -98,9 +95,7 @@ def fetch_weather():
         r2.raise_for_status()
         d2 = r2.json()
 
-        # Lấy thời gian hiện tại và giờ hiện tại theo timezone của kết quả
         now = datetime.now()
-        # Lấy index giờ hiện tại (đơn giản: lấy phần tử đầu của hourly time >= now)
         times = d2.get("hourly", {}).get("time", [])
         temps = d2.get("hourly", {}).get("temperature_2m", [])
         hums = d2.get("hourly", {}).get("relativehumidity_2m", [])
@@ -143,39 +138,53 @@ def fetch_weather():
         _log(f"❌ Error fetching weather: {e}")
         return None
 
-# ================== Hàm push lên ThingsBoard ==================
 def push_to_thingsboard():
     if not THINGSBOARD_TOKEN:
         _log("THINGSBOARD_TOKEN không được cấu hình. Bỏ qua việc push telemetry.")
-        return
+        return {"ok": False, "reason": "missing_token"}
 
     weather = fetch_weather()
     if not weather:
         _log("Không có payload thời tiết, bỏ qua push.")
-        return
+        return {"ok": False, "reason": "no_payload"}
 
     try:
         resp = requests.post(THINGSBOARD_URL, json=weather, timeout=10)
-        if resp.status_code in (200, 201):
+        if resp.status_code in (200, 201, 204):
             _log(f"✅ Pushed telemetry at {datetime.now().isoformat()}")
-            _log(f"Payload size: {len(str(weather))} bytes")
+            return {"ok": True, "status_code": resp.status_code}
         else:
             _log(f"❌ ThingsBoard trả status {resp.status_code}: {resp.text}")
+            return {"ok": False, "status_code": resp.status_code, "body": resp.text}
     except Exception as e:
         _log(f"❌ Error pushing to ThingsBoard: {e}")
+        return {"ok": False, "reason": str(e)}
 
-# ================== Scheduler chạy 5 phút/lần ==================
+# Scheduler
 scheduler.add_job(push_to_thingsboard, "interval", minutes=5)
 scheduler.start()
 
-# Gọi ngay lần đầu khi service khởi động (chỉ khi token tồn tại)
 if THINGSBOARD_TOKEN:
     push_to_thingsboard()
 else:
     _log("Không tự gửi lần đầu vì thiếu THINGSBOARD_TOKEN.")
 
-# ================== Endpoint kiểm tra ==================
 @app.get("/")
 def root():
-    ok = {"status": "ok", "message": "Weather bot running", "owm_key_set": bool(OWM_API_KEY), "thingsboard_token_set": bool(THINGSBOARD_TOKEN)}
-    return ok
+    return {"status": "ok", "message": "Weather bot running", "owm_key_set": bool(OWM_API_KEY), "thingsboard_token_set": bool(THINGSBOARD_TOKEN)}
+
+@app.get("/debug")
+def debug_payload():
+    """Trả về payload weather hiện tại (không push). Dùng để debug."""
+    payload = fetch_weather()
+    if payload:
+        return JSONResponse(content={"ok": True, "payload": payload})
+    return JSONResponse(content={"ok": False, "error": "Không lấy được payload"} , status_code=500)
+
+@app.post("/push")
+def push_now():
+    """Trigger push 1 lần và trả kết quả (useful để test token)."""
+    result = push_to_thingsboard()
+    if result.get("ok"):
+        return JSONResponse(content={"ok": True, "result": result})
+    return JSONResponse(content={"ok": False, "result": result}, status_code=500)
