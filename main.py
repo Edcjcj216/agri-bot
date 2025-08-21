@@ -1,141 +1,216 @@
 import os
+import time
 import json
-import asyncio
 import logging
-from datetime import datetime
-from fastapi import FastAPI, Request
-import httpx
+import requests
+from fastapi import FastAPI
+from pydantic import BaseModel
+import threading
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# ================== CONFIG ==================
+TB_DEMO_TOKEN = "pk94asonfacs6mbeuutg"  # Device DEMO token
+TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
+TB_TENANT_USER = os.getenv("TB_TENANT_USER", "")
+TB_TENANT_PASS = os.getenv("TB_TENANT_PASS", "")
+
+AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+LAT = os.getenv("LAT", "10.79")    # An Phú / Hồ Chí Minh
+LON = os.getenv("LON", "106.70")
+
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ================== FASTAPI ==================
 app = FastAPI()
 
-AI_TOKEN = os.getenv("AI_TOKEN", "")
-TB_TOKEN = os.getenv("TB_TOKEN", "")
-PORT = int(os.getenv("PORT", "10000"))
+class SensorData(BaseModel):
+    temperature: float
+    humidity: float
+    battery: float | None = None
 
-logging.info(f"=== SERVICE START ===")
-logging.info(f"AI_TOKEN: {AI_TOKEN if AI_TOKEN else '<<EMPTY>>'}")
-logging.info(f"TB_TOKEN: {TB_TOKEN if TB_TOKEN else '<<EMPTY>>'}")
-logging.info(f"PORT: {PORT}")
+# ================== WEATHER ==================
+WEATHER_CODE_MAP = {
+    0: "Trời quang",
+    1: "Trời quang nhẹ",
+    2: "Có mây",
+    3: "Nhiều mây",
+    45: "Sương mù",
+    48: "Sương mù đóng băng",
+    51: "Mưa phùn nhẹ",
+    53: "Mưa phùn vừa",
+    55: "Mưa phùn dày",
+    61: "Mưa nhẹ",
+    63: "Mưa vừa",
+    65: "Mưa to",
+    71: "Tuyết nhẹ",
+    73: "Tuyết vừa",
+    75: "Tuyết dày",
+    80: "Mưa rào nhẹ",
+    81: "Mưa rào vừa",
+    82: "Mưa rào mạnh",
+    95: "Giông nhẹ hoặc vừa",
+    96: "Giông kèm mưa đá nhẹ",
+    99: "Giông kèm mưa đá mạnh"
+}
 
-THINGSBOARD_URL = f"https://demo.thingsboard.io/api/v1/{TB_TOKEN}/telemetry" if TB_TOKEN else None
-AI_URL = "https://api.openai.com/v1/chat/completions"  # giả định bạn gọi AI từ OpenAI
+def get_weather_forecast() -> dict:
+    """Lấy dự báo thời tiết hôm nay và ngày mai từ Open-Meteo"""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": LAT,
+            "longitude": LON,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+            "timezone": "Asia/Ho_Chi_Minh"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # index 0 = hôm nay, index 1 = ngày mai
+        daily = data.get("daily", {})
+        if not daily:
+            return {}
+        today = {
+            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không xác định"),
+            "temp_max": daily["temperature_2m_max"][0],
+            "temp_min": daily["temperature_2m_min"][0]
+        }
+        tomorrow = {
+            "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không xác định"),
+            "temp_max": daily["temperature_2m_max"][1],
+            "temp_min": daily["temperature_2m_min"][1]
+        }
+        return {"hom_nay": today, "ngay_mai": tomorrow}
+    except Exception as e:
+        logger.warning(f"Weather API error: {e}")
+        return {}
 
-# ===================== AI CALL =====================
-async def call_ai_api(sensor_data, weather_data):
-    if not AI_TOKEN:
-        logging.warning("AI_TOKEN KHÔNG CÓ — bỏ qua gọi AI")
-        return None
+# ================== AI HELPER ==================
+def call_ai_api(data: dict) -> dict:
+    """Gọi AI và/hoặc local rule"""
+    model_url = AI_API_URL
+    hf_token = HF_TOKEN
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
-    headers = {
-        "Authorization": f"Bearer {AI_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    weather_info = get_weather_forecast()
+    weather_text = ""
+    if weather_info:
+        hn = weather_info.get("hom_nay", {})
+        weather_text = f" Dự báo hôm nay: {hn.get('weather_desc','?')}, {hn.get('temp_min','?')}–{hn.get('temp_max','?')}°C."
 
     prompt = (
-        f"Dữ liệu cảm biến: {sensor_data}. "
-        f"Thời tiết: {weather_data}. "
-        "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc."
+        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, pin {data.get('battery','?')}%. "
+        f"Cây: Rau muống tại An Phú, Hồ Chí Minh.{weather_text} "
+        "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
     )
+    body = {"inputs": prompt, "options": {"wait_for_model": True}}
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
-    }
+    def local_sections(temp: float, humi: float, battery: float | None = None) -> dict:
+        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+        nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
+        care = []
+        if temp >= 35:
+            care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+        elif temp >= 30:
+            care.append("Tưới đủ nước, theo dõi thường xuyên")
+        elif temp <= 15:
+            care.append("Giữ ấm, tránh sương muối")
+        else:
+            care.append("Nhiệt độ bình thường")
+        if humi <= 40:
+            care.append("Độ ẩm thấp: tăng tưới")
+        elif humi <= 60:
+            care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+        elif humi >= 85:
+            care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+        else:
+            care.append("Độ ẩm ổn định cho rau muống")
+        if battery is not None and battery <= 20:
+            care.append("Pin thấp: kiểm tra nguồn")
+        return {
+            "prediction": pred,
+            "advice_nutrition": " | ".join(nutrition),
+            "advice_care": " | ".join(care),
+            "advice_note": "Quan sát cây trồng và điều chỉnh thực tế"
+        }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            logging.info(f"AI ▶ {prompt}")
-            r = await client.post(AI_URL, headers=headers, json=payload)
-            logging.info(f"AI ◀ status={r.status_code}")
-            if r.status_code == 200:
-                data = r.json()
-                return data["choices"][0]["message"]["content"]
+    try:
+        logger.info(f"AI ▶ {prompt[:150]}...")
+        r = requests.post(model_url, headers=headers, json=body, timeout=30)
+        logger.info(f"AI ◀ status={r.status_code}")
+        if r.status_code == 200:
+            out = r.json()
+            text = ""
+            if isinstance(out, list) and out:
+                first = out[0]
+                if isinstance(first, dict):
+                    text = first.get("generated_text") or first.get("text") or str(first)
+                else:
+                    text = str(first)
+            elif isinstance(out, dict):
+                text = out.get("generated_text") or out.get("text") or json.dumps(out, ensure_ascii=False)
             else:
-                logging.error(f"AI trả về lỗi {r.status_code}: {r.text}")
-        except Exception as e:
-            logging.exception(f"AI call exception: {e}")
-    return None
+                text = str(out)
 
-# ===================== GỬI THINGSBOARD =====================
-async def post_to_thingsboard(data: dict):
-    if not TB_TOKEN or not THINGSBOARD_URL:
-        logging.warning("TB_TOKEN KHÔNG CÓ — bỏ qua đẩy TB")
-        return
+            sections = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+            return {
+                "prediction": sections['prediction'],
+                "advice": text.strip(),
+                "advice_nutrition": sections['advice_nutrition'],
+                "advice_care": sections['advice_care'],
+                "advice_note": sections['advice_note'],
+            }
+    except Exception as e:
+        logger.warning(f"AI API call failed: {e}, fallback local")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.post(THINGSBOARD_URL, json=data)
-            if r.status_code == 200:
-                logging.info("Đẩy TB OK")
-            else:
-                logging.error(f"Đẩy TB lỗi {r.status_code}: {r.text}")
-        except Exception as e:
-            logging.exception(f"Đẩy TB exception: {e}")
+    sec = local_sections(data['temperature'], data['humidity'], data.get('battery'))
+    sec['advice'] = f"{sec['advice_nutrition']} | {sec['advice_care']} | {sec['advice_note']}"
+    return sec
 
-# ===================== API TỪ ESP32 =====================
+# ================== THINGSBOARD ==================
+def send_to_thingsboard(data: dict):
+    try:
+        logger.info(f"TB ▶ {data}")
+        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
+        logger.info(f"TB ◀ {r.status_code}")
+    except Exception as e:
+        logger.error(f"ThingsBoard push error: {e}")
+
+# ================== ROUTES ==================
+@app.get("/")
+def root():
+    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4] + "***"}
+
 @app.post("/esp32-data")
-async def esp32_data(req: Request):
-    payload = await req.json()
-    logging.info(f"ESP32 data: {payload}")
+def receive_data(data: SensorData):
+    logger.info(f"ESP32 ▶ {data.dict()}")
+    ai_result = call_ai_api(data.dict())
+    weather_info = get_weather_forecast()
+    merged = data.dict() | ai_result | weather_info
+    send_to_thingsboard(merged)
+    return {"received": data.dict(), "pushed": merged}
 
-    # ----------- Giả lập dữ liệu thời tiết -----------
-    wx_hien_tai = {
-        "temp": 27.2,
-        "humidity": 84,
-        "desc": "Nhiều mây",
-        "iso": datetime.utcnow().isoformat()
-    }
-    wx_gio_tiep_theo = [
-        {"hour": 12, "temp": 26.7, "humidity": 88, "desc": "Giông"},
-        {"hour": 13, "temp": 26.3, "humidity": 93, "desc": "Giông"},
-        {"hour": 14, "temp": 26.7, "humidity": 88, "desc": "Mưa rào nhẹ"},
-        {"hour": 15, "temp": 27.3, "humidity": 81, "desc": "Mưa rào nhẹ"},
-        {"hour": 16, "temp": 27.4, "humidity": 77, "desc": "Nhiều mây"},
-        {"hour": 17, "temp": 27.2, "humidity": 77, "desc": "Nhiều mây"},
-    ]
-    wx_ngay_mai = {
-        "temp_min": 23.6,
-        "temp_max": 32.9,
-        "desc": "Nhiều mây"
-    }
+@app.get("/weather")
+def get_weather_api():
+    return get_weather_forecast()
 
-    # ----------- Tách 6 giờ tiếp theo thành 6 key riêng -----------
-    next_hours = {f"wx_gio_{i+1}": wx_gio_tiep_theo[i] for i in range(len(wx_gio_tiep_theo))}
-
-    # ----------- Gọi AI -----------
-    sensor_desc = f"Nhiệt độ {payload.get('temperature')}°C, độ ẩm {payload.get('humidity')}%, pin {payload.get('battery')}%. Cây: {payload.get('crop')}"
-    weather_desc = f"Hiện tại {wx_hien_tai['desc']} {wx_hien_tai['temp']}°C, Ngày mai {wx_ngay_mai['desc']} {wx_ngay_mai['temp_min']}–{wx_ngay_mai['temp_max']}°C"
-    ai_text = await call_ai_api(sensor_desc, weather_desc)
-
-    # ----------- Gom dữ liệu đẩy ThingsBoard -----------
-    tb_data = {
-        "timestamp_utc": datetime.utcnow().isoformat(),
-        "temperature": payload.get("temperature"),
-        "humidity": payload.get("humidity"),
-        "battery": payload.get("battery"),
-        "crop": payload.get("crop"),
-        "location": f"{payload.get('lat')},{payload.get('lon')}",
-        "wx_hien_tai": wx_hien_tai,
-        "wx_ngay_mai": wx_ngay_mai,
-        **next_hours
-    }
-    if ai_text:
-        tb_data["advice"] = ai_text
-
-    await post_to_thingsboard(tb_data)
-    return {"status": "ok", "ai_text": ai_text}
-
-# ===================== AUTO LOOP (NẾU CẦN) =====================
-async def auto_loop():
+# ================== AUTO LOOP ==================
+def auto_loop():
     while True:
-        # Có thể thêm logic tự gọi AI hoặc ThingsBoard mỗi X giây
-        await asyncio.sleep(60)
+        try:
+            sample = {"temperature": 30.1, "humidity": 69.2, "battery": 90}
+            logger.info(f"[AUTO] ESP32 ▶ {sample}")
+            ai_result = call_ai_api(sample)
+            weather_info = get_weather_forecast()
+            merged = sample | ai_result | weather_info
+            send_to_thingsboard(merged)
+        except Exception as e:
+            logger.error(f"AUTO loop error: {e}")
+        time.sleep(300)
 
-# ===================== CHẠY APP =====================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+threading.Thread(target=auto_loop, daemon=True).start()
