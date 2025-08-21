@@ -1,195 +1,93 @@
-import os
 import logging
-import requests
-import httpx
+import random
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
+import requests
 import uvicorn
-from datetime import datetime
 
+# --- Cấu hình logging ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+logger = logging.getLogger("main")
 
-# ==============================
-# Cấu hình token
-# ==============================
-AI_TOKEN = os.getenv("AI_TOKEN", "demo_ai_token")  # token AI
-TB_TOKEN = "pk94asonfacs6mbeuutg"  # token ThingsBoard cố định
-TB_URL = f"https://demo.thingsboard.io/api/v1/{TB_TOKEN}/telemetry"
+# --- Cấu hình ThingsBoard ---
+TB_TOKEN = "pk94asonfacs6mbeuutg"  # Token cố định cho thiết bị
+TB_URL = f"http://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
 
-logging.info(f"[DEBUG] AI_TOKEN = {AI_TOKEN}")
-logging.info(f"[DEBUG] TB_TOKEN = {TB_TOKEN}")
-
+# --- Tạo ứng dụng FastAPI ---
 app = FastAPI()
 
-# ==============================
-# Map mã thời tiết → mô tả tiếng Việt
-# ==============================
-WEATHER_CODE_MAP = {
-    0: "Trời quang đãng",
-    1: "Chủ yếu quang",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù đông đá",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào to",
-    95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá to",
-}
-
-# ==============================
-# Hàm lấy thời tiết từ Open-Meteo
-# ==============================
-def get_weather(lat: float, lon: float):
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
-        f"latitude={lat}&longitude={lon}"
-        f"&hourly=temperature_2m,weathercode"
-        f"&daily=temperature_2m_max,temperature_2m_min,weathercode"
-        f"&forecast_days=2&timezone=auto&lang=vi"
-    )
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    # --- Thời tiết hôm nay và ngày mai ---
-    daily = data["daily"]
-    hom_nay = {
-        "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không rõ"),
-        "temp_max": daily["temperature_2m_max"][0],
-        "temp_min": daily["temperature_2m_min"][0],
-    }
-    ngay_mai = {
-        "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không rõ"),
-        "temp_max": daily["temperature_2m_max"][1],
-        "temp_min": daily["temperature_2m_min"][1],
-    }
-
-    # --- Thời tiết hiện tại (lấy từ giờ gần nhất) ---
-    hourly = data["hourly"]
-    now = datetime.now().hour
-    current_temp = hourly["temperature_2m"][now]
-    current_code = hourly["weathercode"][now]
-    current_desc = WEATHER_CODE_MAP.get(current_code, "Không rõ")
-
-    # --- Dự báo 6 giờ tiếp theo ---
-    next6 = {}
-    for i in range(6):
-        idx = now + i if now + i < len(hourly["temperature_2m"]) else -1
-        temp = hourly["temperature_2m"][idx]
-        code = hourly["weathercode"][idx]
-        desc = WEATHER_CODE_MAP.get(code, "Không rõ")
-        next6[f"hour_{i+1}"] = {"temp": temp, "weather_desc": desc}
-
-    return current_temp, current_desc, hom_nay, ngay_mai, next6
-
-# ==============================
-# Hàm gọi AI API
-# ==============================
-async def call_ai_api(data: dict):
-    if not AI_TOKEN or AI_TOKEN.strip() == "":
-        logging.warning("[AI] Token rỗng hoặc không hợp lệ!")
-        return {}
-
-    url = "https://ai.example.com/predict"  # đổi theo endpoint thật
-    headers = {"Authorization": f"Bearer {AI_TOKEN}"}
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.post(url, json=data, headers=headers)
-            logging.info(f"AI ◀ status={resp.status_code}")
-            if resp.status_code != 200:
-                logging.warning(f"AI API returned {resp.status_code}: {resp.text}")
-                return {}
-            return resp.json()
-        except Exception as e:
-            logging.error(f"AI API error: {e}")
-            return {}
-
-# ==============================
-# Hàm gửi telemetry lên ThingsBoard
-# ==============================
-def send_to_tb(payload: dict):
+# --- Hàm gửi dữ liệu lên ThingsBoard ---
+def send_to_thingsboard(payload: dict):
     try:
-        r = requests.post(TB_URL, json=payload, timeout=10)
-        if r.status_code != 200:
-            logging.warning(f"[TB] HTTP {r.status_code}: {r.text}")
+        logger.info(f"[TB ▶] Payload: {payload}")
+        resp = requests.post(TB_URL, json=payload, timeout=5)
+        if resp.status_code == 200:
+            logger.info(f"[TB ◀] OK {resp.status_code}")
         else:
-            logging.info(f"TB ◀ OK {r.status_code}")
+            logger.warning(f"[TB ◀] LỖI {resp.status_code}: {resp.text}")
     except Exception as e:
-        logging.error(f"[TB] Error sending data: {e}")
+        logger.error(f"[TB] EXCEPTION: {e}")
 
-# ==============================
-# API nhận dữ liệu từ ESP32
-# ==============================
-@app.post("/esp32-data")
-async def esp32_data(req: Request):
-    body = await req.json()
-    temp = body.get("temperature")       # Nhiệt độ từ cảm biến
-    hum = body.get("humidity")           # Độ ẩm từ cảm biến
-    bat = body.get("battery")            # Pin
-    crop = "rau muống"                   # Cố định loại cây trồng
-    lat = body.get("lat")
-    lon = body.get("lon")
-
-    # --- Lấy thời tiết ---
-    current_temp, current_desc, hom_nay, ngay_mai, next6 = get_weather(lat, lon)
-
-    # --- Gọi AI API để sinh gợi ý ---
-    ai_input = {
-        "temperature": temp,
-        "humidity": hum,
-        "battery": bat,
-        "crop": crop,
-        "hom_nay": hom_nay,
-        "ngay_mai": ngay_mai,
-        "next6": next6
-    }
-    ai_result = await call_ai_api(ai_input)
-
-    # --- Payload gửi lên ThingsBoard ---
+# --- Hàm tạo dữ liệu mẫu ---
+def generate_sample_data():
+    temperature = round(random.uniform(25, 35), 1)
+    humidity = round(random.uniform(60, 80), 1)
+    battery = random.randint(50, 100)
     payload = {
-        "temperature": temp,
-        "humidity": hum,
-        "battery": bat,
-        "crop_type": crop,                          # loại cây trồng
-        "location": f"{lat},{lon}",                 # tọa độ hiện tại
-        "current_temp": current_temp,               # nhiệt độ hiện tại (theo vị trí)
-        "current_humidity": hum,                    # độ ẩm hiện tại (cảm biến)
-        "current_weather_desc": current_desc,       # mô tả thời tiết hiện tại
-        **ai_result,
-        "hom_nay": hom_nay,
-        "ngay_mai": ngay_mai,
-        **next6
+        # --- Dữ liệu cảm biến ---
+        "temperature": temperature,
+        "humidity": humidity,
+        "battery": battery,
+        # --- Thông tin dự báo và cây trồng ---
+        "plant_type": "Rau muống",  # loại cây trồng
+        "location_name": "10.80609,106.75222",  # vị trí hiện tại (ví dụ toạ độ)
+        "weather_now_desc": "Nhiều mây",  # thời tiết hiện tại
+        "weather_now_temp": temperature,
+        "weather_now_humidity": humidity,
+        # --- Lời khuyên mẫu ---
+        "advice_nutrition": "Ưu tiên Kali (K) | Cân bằng NPK | Bón phân hữu cơ",
+        "advice_care": "Tưới đủ nước, theo dõi thường xuyên | Độ ẩm ổn định cho rau muống",
+        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
+        "advice": " | ".join([
+            "Ưu tiên Kali (K)",
+            "Cân bằng NPK",
+            "Bón phân hữu cơ",
+            "Tưới đủ nước, theo dõi thường xuyên",
+            "Độ ẩm ổn định cho rau muống",
+            "Quan sát cây trồng và điều chỉnh thực tế"
+        ]),
+        "prediction": f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"
     }
-    logging.info(f"TB ▶ {payload}")
-    send_to_tb(payload)
-    return {"status": "ok", "sent": payload}
+    return payload
 
-# ==============================
-# Auto scheduler demo
-# ==============================
-def auto_loop():
-    logging.info("Auto loop running...")
+# --- Job định kỳ gửi dữ liệu mẫu ---
+def job_send_sample():
+    logger.info("[JOB] Gửi dữ liệu mẫu định kỳ lên ThingsBoard...")
+    payload = generate_sample_data()
+    send_to_thingsboard(payload)
 
+# --- Lịch chạy APScheduler ---
 scheduler = BackgroundScheduler()
-scheduler.add_job(auto_loop, "interval", minutes=30)
+scheduler.add_job(job_send_sample, 'interval', minutes=5)  # gửi 5 phút/lần
 scheduler.start()
 
-# ==============================
-# Main
-# ==============================
+# --- API nhận dữ liệu từ ESP32 ---
+@app.post("/telemetry")
+async def receive_telemetry(req: Request):
+    data = await req.json()
+    logger.info(f"[ESP32 ▶] Dữ liệu nhận: {data}")
+    send_to_thingsboard(data)
+    return {"status": "OK"}
+
+# --- Kiểm tra API ---
+@app.get("/")
+async def root():
+    return {"message": "AgriBot server đang chạy. Dữ liệu được gửi lên ThingsBoard định kỳ mỗi 5 phút."}
+
+# --- Chạy server ---
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=False)
