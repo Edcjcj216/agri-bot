@@ -9,16 +9,14 @@ import threading
 from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"
+TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-LAT = float(os.getenv("LAT", 10.79))
-LON = float(os.getenv("LON", 106.70))
-CROP_NAME = "Rau muống"
-LOCATION_NAME = "An Phú, Hồ Chí Minh"
+LAT = float(os.getenv("LAT", "10.79"))    # An Phú / Hồ Chí Minh
+LON = float(os.getenv("LON", "106.70"))
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -57,64 +55,62 @@ WEATHER_CODE_MAP = {
     99: "Giông kèm mưa đá mạnh"
 }
 
-def get_weather_forecast() -> dict:
-    """Lấy weather và humidity trung bình hôm qua / hôm nay / ngày mai"""
+def get_weather_forecast():
+    """Lấy dự báo hôm nay và ngày mai + hôm qua (từ archive API giả lập bằng lịch sử)"""
     try:
-        start_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-        end_date = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+        today_dt = datetime.now()
+        tomorrow_dt = today_dt + timedelta(days=1)
+        yesterday_dt = today_dt - timedelta(days=1)
+
+        # ================== FORECAST API ==================
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
             "latitude": LAT,
             "longitude": LON,
             "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-            "hourly": "humidity_2m",
-            "start_date": start_date,
-            "end_date": end_date,
-            "timezone": "Asia/Ho_Chi_Minh"
+            "hourly": "relativehumidity_2m",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "start_date": yesterday_dt.strftime("%Y-%m-%d"),
+            "end_date": tomorrow_dt.strftime("%Y-%m-%d")
         }
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
 
-        # Hàng ngày
+        # ================== DAILY ==================
         daily = data.get("daily", {})
         hourly = data.get("hourly", {})
 
-        def avg_humidity(date_obj):
-            date_str = date_obj.strftime("%Y-%m-%d")
-            times = hourly.get("time", [])
-            hums = hourly.get("humidity_2m", [])
-            values = [h for t, h in zip(times, hums) if t.startswith(date_str)]
-            return round(sum(values)/len(values), 1) if values else 0
+        def mean(lst):
+            return round(sum(lst)/len(lst), 1) if lst else 0
 
-        today_dt = datetime.utcnow()
-        yesterday_dt = today_dt - timedelta(days=1)
-        tomorrow_dt = today_dt + timedelta(days=1)
-
+        # Hôm qua
         weather_yesterday = {
-            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if daily else "?",
-            "weather_yesterday_max": daily["temperature_2m_max"][0] if daily else 0,
-            "weather_yesterday_min": daily["temperature_2m_min"][0] if daily else 0,
-            "humidity_yesterday": avg_humidity(yesterday_dt)
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
+            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
+            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "humidity_yesterday": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if i < 24])
         }
+
+        # Hôm nay
         weather_today = {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if daily else "?",
-            "weather_today_max": daily["temperature_2m_max"][1] if daily else 0,
-            "weather_today_min": daily["temperature_2m_min"][1] if daily else 0,
-            "humidity_today": avg_humidity(today_dt)
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
+            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
+            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "humidity_today": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 24 <= i < 48])
         }
+
+        # Ngày mai
         weather_tomorrow = {
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if daily and len(daily["weathercode"])>2 else "?",
-            "weather_tomorrow_max": daily["temperature_2m_max"][2] if daily and len(daily["temperature_2m_max"])>2 else 0,
-            "weather_tomorrow_min": daily["temperature_2m_min"][2] if daily and len(daily["temperature_2m_min"])>2 else 0,
-            "humidity_tomorrow": avg_humidity(tomorrow_dt)
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
+            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
+            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "humidity_tomorrow": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 48 <= i < 72])
         }
 
         return {**weather_yesterday, **weather_today, **weather_tomorrow}
-
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        # Fallback
         return {
             "weather_yesterday_desc":"?", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0,
             "weather_today_desc":"?", "weather_today_max":0, "weather_today_min":0, "humidity_today":0,
@@ -122,42 +118,31 @@ def get_weather_forecast() -> dict:
         }
 
 # ================== AI HELPER ==================
-def call_ai_api(data: dict) -> dict:
+def call_ai_api(data: dict):
     model_url = AI_API_URL
-    hf_token = HF_TOKEN
-    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-
-    weather_info = get_weather_forecast()
-    weather_text = f"Hôm nay: {weather_info['weather_today_desc']}, {weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C. Ngày mai: {weather_info['weather_tomorrow_desc']}, {weather_info['weather_tomorrow_min']}–{weather_info['weather_tomorrow_max']}°C."
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
     prompt = (
-        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%. "
-        f"Cây: {CROP_NAME} tại {LOCATION_NAME}. {weather_text} "
+        f"Dữ liệu cảm biến: Nhiệt độ {data['temperature']}°C, độ ẩm {data['humidity']}%, "
+        f"Cây: Rau muống tại An Phú, Hồ Chí Minh. "
         "Viết 1 câu dự báo và 1 câu gợi ý chăm sóc ngắn gọn."
     )
     body = {"inputs": prompt, "options": {"wait_for_model": True}}
 
-    def local_sections(temp: float, humi: float) -> dict:
+    def local_sections(temp, humi):
+        pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
         nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
         care = []
-        if temp >= 35:
-            care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
-        elif temp >= 30:
-            care.append("Tưới đủ nước, theo dõi thường xuyên")
-        elif temp <= 15:
-            care.append("Giữ ấm, tránh sương muối")
-        else:
-            care.append("Nhiệt độ bình thường")
-        if humi <= 40:
-            care.append("Độ ẩm thấp: tăng tưới")
-        elif humi <= 60:
-            care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-        elif humi >= 85:
-            care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
-        else:
-            care.append("Độ ẩm ổn định cho rau muống")
+        if temp >= 35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+        elif temp >= 30: care.append("Tưới đủ nước, theo dõi thường xuyên")
+        elif temp <= 15: care.append("Giữ ấm, tránh sương muối")
+        else: care.append("Nhiệt độ bình thường")
+        if humi <= 40: care.append("Độ ẩm thấp: tăng tưới")
+        elif humi <= 60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+        elif humi >= 85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+        else: care.append("Độ ẩm ổn định cho rau muống")
         return {
-            "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%",
+            "prediction": pred,
             "advice_nutrition": " | ".join(nutrition),
             "advice_care": " | ".join(care),
             "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
@@ -170,19 +155,12 @@ def call_ai_api(data: dict) -> dict:
         if r.status_code == 200:
             out = r.json()
             text = ""
-            if isinstance(out, list) and out:
-                first = out[0]
-                if isinstance(first, dict):
-                    text = first.get("generated_text") or first.get("text") or str(first)
-                else:
-                    text = str(first)
-            else:
-                text = str(out)
-            sections = local_sections(data['temperature'], data['humidity'])
-            sections['advice'] = text.strip()
-            return sections
+            if isinstance(out, list) and out: text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
+            sec = local_sections(data['temperature'], data['humidity'])
+            sec['advice'] = text.strip() or sec['advice']
+            return sec
     except Exception as e:
-        logger.warning(f"AI API failed: {e}, fallback local")
+        logger.warning(f"AI API call failed: {e}, fallback local")
 
     return local_sections(data['temperature'], data['humidity'])
 
@@ -198,14 +176,14 @@ def send_to_thingsboard(data: dict):
 # ================== ROUTES ==================
 @app.get("/")
 def root():
-    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4] + "***"}
+    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4]+"***"}
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ {data.dict()}")
     ai_result = call_ai_api(data.dict())
     weather_info = get_weather_forecast()
-    merged = data.dict() | {"location": LOCATION_NAME, "crop": CROP_NAME} | ai_result | weather_info
+    merged = data.dict() | ai_result | weather_info | {"location":"An Phú, Hồ Chí Minh","crop":"Rau muống"}
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
 
@@ -216,11 +194,10 @@ def auto_loop():
             sample = {"temperature": 30.1, "humidity": 69.2}
             ai_result = call_ai_api(sample)
             weather_info = get_weather_forecast()
-            merged = sample | {"location": LOCATION_NAME, "crop": CROP_NAME} | ai_result | weather_info
+            merged = sample | ai_result | weather_info | {"location":"An Phú, Hồ Chí Minh","crop":"Rau muống"}
             send_to_thingsboard(merged)
-            logger.info(f"[AUTO LOOP] Pushed telemetry.")
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
-        time.sleep(300)
+        time.sleep(300)  # 5 phút
 
 threading.Thread(target=auto_loop, daemon=True).start()
