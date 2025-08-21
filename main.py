@@ -6,10 +6,10 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
+TB_DEMO_TOKEN = "I1s5bI2FQCZw6umLvwLG"  # Device DEMO token mới
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
@@ -17,6 +17,7 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 LAT = float(os.getenv("LAT", "10.79"))    # An Phú / Hồ Chí Minh
 LON = float(os.getenv("LON", "106.70"))
+OW_KEY = os.getenv("OW_KEY", "a53f443795604c41b72305c1806784db")
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -30,89 +31,47 @@ class SensorData(BaseModel):
     humidity: float
     battery: float | None = None
 
-# ================== WEATHER ==================
-WEATHER_CODE_MAP = {
-    0: "Trời quang",
-    1: "Trời quang nhẹ",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù đóng băng",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    71: "Tuyết nhẹ",
-    73: "Tuyết vừa",
-    75: "Tuyết dày",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá mạnh"
-}
-
+# ================== WEATHER (OpenWeather) ==================
 def get_weather_forecast():
-    """Lấy dự báo hôm nay và ngày mai + hôm qua (từ archive API giả lập bằng lịch sử)"""
+    """Lấy dự báo hôm nay và ngày mai từ OpenWeather (daily.humidity, temp_min/max, description)."""
     try:
-        today_dt = datetime.now()
-        tomorrow_dt = today_dt + timedelta(days=1)
-        yesterday_dt = today_dt - timedelta(days=1)
-
-        # ================== FORECAST API ==================
-        url = "https://api.open-meteo.com/v1/forecast"
+        url = "https://api.openweathermap.org/data/3.0/onecall"
         params = {
-            "latitude": LAT,
-            "longitude": LON,
-            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-            "hourly": "relativehumidity_2m",
-            "timezone": "Asia/Ho_Chi_Minh",
-            "start_date": yesterday_dt.strftime("%Y-%m-%d"),
-            "end_date": tomorrow_dt.strftime("%Y-%m-%d")
+            "lat": LAT,
+            "lon": LON,
+            "exclude": "current,minutely,hourly,alerts",
+            "appid": OW_KEY,
+            "units": "metric",
+            "lang": "vi"
         }
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
+        daily = data.get("daily", [])
 
-        # ================== DAILY ==================
-        daily = data.get("daily", {})
-        hourly = data.get("hourly", {})
+        def pick_day(idx, prefix):
+            if idx < len(daily):
+                d = daily[idx]
+                return {
+                    f"weather_{prefix}_desc": d["weather"][0]["description"] if d.get("weather") else "?",
+                    f"weather_{prefix}_max": round(d["temp"]["max"],1) if "temp" in d else 0,
+                    f"weather_{prefix}_min": round(d["temp"]["min"],1) if "temp" in d else 0,
+                    f"humidity_{prefix}": d.get("humidity",0)
+                }
+            return {
+                f"weather_{prefix}_desc": "?",
+                f"weather_{prefix}_max": 0,
+                f"weather_{prefix}_min": 0,
+                f"humidity_{prefix}": 0
+            }
 
-        def mean(lst):
-            return round(sum(lst)/len(lst), 1) if lst else 0
+        weather_today = pick_day(0,"today")
+        weather_tomorrow = pick_day(1,"tomorrow")
 
-        # Hôm qua
-        weather_yesterday = {
-            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
-            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
-            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
-            "humidity_yesterday": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if i < 24])
-        }
-
-        # Hôm nay
-        weather_today = {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
-            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
-            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
-            "humidity_today": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 24 <= i < 48])
-        }
-
-        # Ngày mai
-        weather_tomorrow = {
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
-            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
-            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
-            "humidity_tomorrow": mean([h for i,h in enumerate(hourly.get("relativehumidity_2m",[])) if 48 <= i < 72])
-        }
-
-        return {**weather_yesterday, **weather_today, **weather_tomorrow}
+        return {**weather_today, **weather_tomorrow}
     except Exception as e:
-        logger.warning(f"Weather API error: {e}")
+        logger.warning(f"OpenWeather API error: {e}")
         return {
-            "weather_yesterday_desc":"?", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0,
             "weather_today_desc":"?", "weather_today_max":0, "weather_today_min":0, "humidity_today":0,
             "weather_tomorrow_desc":"?", "weather_tomorrow_max":0, "weather_tomorrow_min":0, "humidity_tomorrow":0
         }
@@ -155,7 +114,8 @@ def call_ai_api(data: dict):
         if r.status_code == 200:
             out = r.json()
             text = ""
-            if isinstance(out, list) and out: text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
+            if isinstance(out, list) and out:
+                text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
             sec = local_sections(data['temperature'], data['humidity'])
             sec['advice'] = text.strip() or sec['advice']
             return sec
