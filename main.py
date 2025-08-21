@@ -1,336 +1,134 @@
-import os
 import requests
-from fastapi import FastAPI
-from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timezone
-from fastapi.responses import JSONResponse
-from zoneinfo import ZoneInfo
+import json
+from datetime import datetime, timezone, timedelta
 
-# === Config từ Environment Render ===
-OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")   # API key OpenWeather (có thể None)
-THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Device token ThingsBoard (bắt buộc để push)
-LAT = os.getenv("LAT", "10.806094263669602")
-LON = os.getenv("LON", "106.75222004270555")
-CROP = os.getenv("CROP", "Rau muống")
-# Nếu muốn override tên location thủ công, set env LOCATION_NAME="An Phú, Thành phố Hồ Chí Minh"
-LOCATION_NAME_OVERRIDE = os.getenv("LOCATION_NAME")
-
-THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
-
-app = FastAPI()
-scheduler = BackgroundScheduler()
-
-# Local timezone VN
-LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-
-# Cache tên location sau lần lấy đầu
-_LOCATION_NAME_CACHE = None
-
-def _log(msg):
-    print(f"[{datetime.now().isoformat()}] {msg}")
-
-# Open-Meteo -> mô tả tiếng Việt
-OM_VN = {
-    0: "Trời quang", 1: "Hầu như quang", 2: "Mây phân bố", 3: "Nhiều mây",
-    45: "Sương mù", 48: "Sương giá", 51: "Mưa phùn nhẹ", 53: "Mưa phùn",
-    55: "Mưa phùn dày", 61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
-    71: "Tuyết nhẹ", 73: "Tuyết vừa", 75: "Tuyết nhiều",
-    80: "Dải mưa rào", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
-    95: "Giông", 96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá nặng"
-}
-def _om_vn(code):
+# ===== Hàm lấy tên vị trí từ toạ độ =====
+def get_location_name(lat, lon):
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "json",
+        "accept-language": "vi"
+    }
     try:
-        return OM_VN.get(int(code), "N/A")
-    except Exception:
-        return "N/A"
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        address = data.get("address", {})
 
-# ================= get_location_name (Thay thế, im lặng khi 404, fallback Nominatim, cache) ================
-def get_location_name():
-    """
-    Trả về tên vị trí có dấu tiếng Việt, ưu tiên:
-      1) LOCATION_NAME env override
-      2) Cache
-      3) Open-Meteo reverse geocoding (language=vi) — if status 200 and contains non-ascii
-      4) Nominatim reverse geocoding (accept-language=vi) — fallback nếu Open-Meteo thiếu hoặc trả non-ascii
-      5) Fallback: "LAT,LON"
-    """
-    global _LOCATION_NAME_CACHE
-    if LOCATION_NAME_OVERRIDE:
-        _LOCATION_NAME_CACHE = LOCATION_NAME_OVERRIDE
-        return _LOCATION_NAME_CACHE
+        # Ưu tiên phường, quận, TP
+        ward = address.get("suburb") or address.get("neighbourhood") or address.get("quarter") or ""
+        district = address.get("city_district") or address.get("district") or ""
+        city = address.get("city") or address.get("town") or address.get("state") or ""
 
-    if _LOCATION_NAME_CACHE:
-        return _LOCATION_NAME_CACHE
-
-    try:
-        lat_f = float(LAT)
-        lon_f = float(LON)
-    except Exception:
-        return f"{LAT},{LON}"
-
-    # 1) Thử Open-Meteo reverse (không raise error trên 404)
-    try:
-        om_url = (
-            f"https://geocoding-api.open-meteo.com/v1/reverse?"
-            f"latitude={lat_f}&longitude={lon_f}&language=vi&count=1"
-        )
-        r = requests.get(om_url, timeout=8)
-        if r.status_code == 200:
-            j = r.json()
-            results = j.get("results") or []
-            if results:
-                r0 = results[0]
-                parts = []
-                for v in (r0.get("name"), r0.get("admin2"), r0.get("admin1"), r0.get("country")):
-                    if v and v not in parts:
-                        parts.append(v)
-                pretty = ", ".join(parts) if parts else None
-                # nếu có dấu (non-ascii) thì chấp nhận
-                if pretty and any(ord(ch) > 127 for ch in pretty):
-                    _LOCATION_NAME_CACHE = pretty
-                    return _LOCATION_NAME_CACHE
-                # nếu trả ASCII-only hoặc empty -> tiếp fallback
-        else:
-            _log(f"Open-Meteo geocode trả status {r.status_code} — chuyển sang fallback.")
+        parts = [p for p in [ward, district, city] if p]
+        return ", ".join(parts) if parts else data.get("display_name", f"{lat},{lon}")
     except Exception as e:
-        _log(f"Open-Meteo geocode lỗi (bỏ qua): {e}")
+        print(f"[{datetime.now()}] Lỗi reverse-geocode: {e}")
+        return f"{lat},{lon}"
 
-    # 2) Fallback: Nominatim (OpenStreetMap) với accept-language=vi
-    try:
-        nom_url = (
-            f"https://nominatim.openstreetmap.org/reverse?"
-            f"format=jsonv2&lat={lat_f}&lon={lon_f}&accept-language=vi"
-        )
-        headers = {"User-Agent": "agri-bot/1.0 (contact: your-email@example.com)"}
-        r2 = requests.get(nom_url, headers=headers, timeout=8)
-        if r2.status_code == 200:
-            j2 = r2.json()
-            display = j2.get("display_name")
-            if display:
-                parts = [p.strip() for p in display.split(",")]
-                short = ", ".join(parts[0:3]) if len(parts) >= 3 else display
-                _LOCATION_NAME_CACHE = short
-                return _LOCATION_NAME_CACHE
-        else:
-            _log(f"Nominatim trả status {r2.status_code}")
-    except Exception as e:
-        _log(f"Nominatim reverse-geocode lỗi (bỏ qua): {e}")
+# ===== Hàm lấy dữ liệu thời tiết từ Open-Meteo =====
+def get_weather(lat, lon):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,relative_humidity_2m,weathercode",
+        "current_weather": "true",
+        "forecast_days": 2,
+        "timezone": "Asia/Ho_Chi_Minh",
+        "language": "vi"
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
-    # 3) fallback cuối cùng: lat,lon
-    _LOCATION_NAME_CACHE = f"{LAT},{LON}"
-    return _LOCATION_NAME_CACHE
+# ===== Chuyển weather code thành mô tả tiếng Việt =====
+def weather_code_to_text(code):
+    mapping = {
+        0: "Trời quang",
+        1: "Ít mây",
+        2: "Nhiều mây",
+        3: "U ám",
+        45: "Sương mù",
+        48: "Sương mù rải rác",
+        51: "Mưa phùn nhẹ",
+        53: "Mưa phùn",
+        55: "Mưa phùn nặng hạt",
+        61: "Mưa nhẹ",
+        63: "Mưa vừa",
+        65: "Mưa to",
+        80: "Mưa rào nhẹ",
+        81: "Mưa rào",
+        82: "Mưa rào to",
+        95: "Giông",
+        96: "Giông kèm mưa đá nhẹ",
+        99: "Giông kèm mưa đá mạnh"
+    }
+    return mapping.get(code, "N/A")
 
-# ================= fetch_weather (tiếng Việt keys, timezone VN, OpenWeather + Open-Meteo fallback) ================
-def fetch_weather():
-    try:
-        # ==== Lấy tên vị trí chi tiết (1 lần) ====
-        vi_tri_text = get_location_name()
+# ===== Push lên ThingsBoard hoặc InfluxDB =====
+def push_telemetry(payload):
+    print(f"[{datetime.now()}] ✅ Pushed telemetry: {json.dumps(payload, ensure_ascii=False)}")
+    # TODO: Thay bằng hàm push thực tế (MQTT/HTTP)
 
-        # ==== OpenWeather (nếu có key) ====
-        if OWM_API_KEY:
-            url = (
-                f"https://api.openweathermap.org/data/2.5/onecall"
-                f"?lat={LAT}&lon={LON}&units=metric&lang=vi&appid={OWM_API_KEY}"
-            )
-            r = requests.get(url, timeout=10)
-            if r.status_code == 401:
-                _log("OpenWeather returned 401 Unauthorized — API key invalid.")
-                raise requests.HTTPError("401 Unauthorized from OpenWeather")
-            r.raise_for_status()
-            data = r.json()
+# ===== Main =====
+if __name__ == "__main__":
+    lat, lon = 10.806094263669602, 106.75222004270555
+    vi_tri = get_location_name(lat, lon)
+    data = get_weather(lat, lon)
 
-            now = datetime.now(LOCAL_TZ)
-            current_hour = now.hour
+    now = datetime.now(timezone.utc)
+    now_vn = now.astimezone(timezone(timedelta(hours=7)))
 
-            # Keys tiếng Việt
-            hien_tai = {
-                "gio": current_hour,
-                "nhiet_do": data["current"]["temp"],
-                "do_am": data["current"]["humidity"],
-                "thoi_tiet": data["current"]["weather"][0]["description"],
-                "iso": now.isoformat()
-            }
-
-            hom_nay = []
-            included = set()
-            for h in data.get("hourly", []):
-                t_dt = datetime.fromtimestamp(h["dt"], tz=timezone.utc).astimezone(LOCAL_TZ)
-                if t_dt >= now:
-                    key = (t_dt.date().isoformat(), t_dt.hour)
-                    if key in included:
-                        continue
-                    included.add(key)
-                    hom_nay.append({
-                        "iso": t_dt.isoformat(),
-                        "gio": t_dt.hour,
-                        "nhiet_do": h["temp"],
-                        "do_am": h["humidity"],
-                        "thoi_tiet": h["weather"][0]["description"]
-                    })
-                    if len(hom_nay) >= 12:
-                        break
-
-            ngay_mai = {}
-            if len(data.get("daily", [])) > 1:
-                ngay_mai = {
-                    "nhiet_do_min": data["daily"][1]["temp"]["min"],
-                    "nhiet_do_max": data["daily"][1]["temp"]["max"],
-                    "do_am": data["daily"][1].get("humidity"),
-                    "thoi_tiet": data["daily"][1]["weather"][0]["description"]
-                }
-
-            payload = {
-                "vi_tri": vi_tri_text,
-                "cay": CROP,
-                "hien_tai": hien_tai,
-                "hom_nay": hom_nay,
-                "ngay_mai": ngay_mai,
-                "nguon": "openweather",
-                "cap_nhat_utc": datetime.now(timezone.utc).isoformat()
-            }
-            return payload
-
-        # ==== Fallback Open-Meteo ====
-        _log("OPENWEATHER_API_KEY không tồn tại — chuyển sang Open-Meteo (fallback).")
-        om_url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={LAT}&longitude={LON}"
-            f"&hourly=temperature_2m,relativehumidity_2m,weathercode"
-            f"&daily=temperature_2m_min,temperature_2m_max,weathercode"
-            f"&timezone=UTC"
-        )
-        r2 = requests.get(om_url, timeout=10)
-        r2.raise_for_status()
-        d2 = r2.json()
-
-        # now in local timezone
-        now = datetime.now(LOCAL_TZ)
-
-        times = d2.get("hourly", {}).get("time", [])
-        temps = d2.get("hourly", {}).get("temperature_2m", [])
-        hums = d2.get("hourly", {}).get("relativehumidity_2m", [])
-        wcodes = d2.get("hourly", {}).get("weathercode", [])
-
-        hom_nay = []
-        included = set()
-        for i, tstr in enumerate(times):
-            try:
-                t_dt = datetime.fromisoformat(tstr.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            t_dt = t_dt.astimezone(LOCAL_TZ)
-
-            if t_dt >= now:
-                key = (t_dt.date().isoformat(), t_dt.hour)
-                if key in included:
-                    continue
-                included.add(key)
-
-                hom_nay.append({
-                    "iso": t_dt.isoformat(),
-                    "gio": t_dt.hour,
-                    "nhiet_do": temps[i] if i < len(temps) else None,
-                    "do_am": hums[i] if i < len(hums) else None,
-                    "thoi_tiet": _om_vn(wcodes[i]) if i < len(wcodes) else "N/A"
-                })
-
-            if len(hom_nay) >= 12:
-                break
-
-        # Ngày mai
-        ngay_mai = {}
-        daily = d2.get("daily", {})
-        try:
-            if daily:
-                tmins = daily.get("temperature_2m_min", [])
-                tmaxs = daily.get("temperature_2m_max", [])
-                dwcodes = daily.get("weathercode", [])
-                if len(tmins) > 1 and len(tmaxs) > 1:
-                    ngay_mai = {
-                        "nhiet_do_min": tmins[1],
-                        "nhiet_do_max": tmaxs[1],
-                        "thoi_tiet": _om_vn(dwcodes[1]) if len(dwcodes) > 1 else "N/A"
-                    }
-        except Exception:
-            ngay_mai = {}
-
-        payload = {
-            "vi_tri": vi_tri_text,
-            "cay": CROP,
-            "hien_tai": {
-                "gio": now.hour,
-                "nhiet_do": hom_nay[0]["nhiet_do"] if hom_nay else None,
-                "do_am": hom_nay[0]["do_am"] if hom_nay else None,
-                "thoi_tiet": hom_nay[0]["thoi_tiet"] if hom_nay else "N/A",
-                "iso": now.isoformat()
-            },
-            "hom_nay": hom_nay,
-            "ngay_mai": ngay_mai,
-            "nguon": "open-meteo",
-            "cap_nhat_utc": datetime.now(timezone.utc).isoformat()
-        }
-        return payload
-
-    except requests.HTTPError as he:
-        _log(f"❌ HTTP error fetching weather: {he}")
-        return None
-    except Exception as e:
-        _log(f"❌ Error fetching weather: {e}")
-        return None
-
-# ================= push_to_thingsboard & scheduler ====================
-def push_to_thingsboard():
-    if not THINGSBOARD_TOKEN:
-        _log("THINGSBOARD_TOKEN không được cấu hình. Bỏ qua việc push telemetry.")
-        return {"ok": False, "reason": "missing_token"}
-
-    weather = fetch_weather()
-    if not weather:
-        _log("Không có payload thời tiết, bỏ qua push.")
-        return {"ok": False, "reason": "no_payload"}
-
-    try:
-        resp = requests.post(THINGSBOARD_URL, json=weather, timeout=10)
-        if resp.status_code in (200, 201, 204):
-            _log(f"✅ Pushed telemetry at {datetime.now().isoformat()}")
-            return {"ok": True, "status_code": resp.status_code}
-        else:
-            _log(f"❌ ThingsBoard trả status {resp.status_code}: {resp.text}")
-            return {"ok": False, "status_code": resp.status_code, "body": resp.text}
-    except Exception as e:
-        _log(f"❌ Error pushing to ThingsBoard: {e}")
-        return {"ok": False, "reason": str(e)}
-
-# Scheduler
-scheduler.add_job(push_to_thingsboard, "interval", minutes=5)
-scheduler.start()
-
-if THINGSBOARD_TOKEN:
-    push_to_thingsboard()
-else:
-    _log("Không tự gửi lần đầu vì thiếu THINGSBOARD_TOKEN.")
-
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "message": "Weather bot running",
-        "owm_key_set": bool(OWM_API_KEY),
-        "thingsboard_token_set": bool(THINGSBOARD_TOKEN)
+    # Dữ liệu hiện tại
+    current = data.get("current_weather", {})
+    hien_tai = {
+        "gio": now_vn.hour,
+        "nhiet_do": current.get("temperature"),
+        "do_am": data["hourly"]["relative_humidity_2m"][0] if "hourly" in data else None,
+        "thoi_tiet": weather_code_to_text(current.get("weathercode")),
+        "iso": now_vn.isoformat()
     }
 
-@app.get("/debug")
-def debug_payload():
-    """Trả về payload weather hiện tại (không push). Dùng để debug."""
-    payload = fetch_weather()
-    if payload:
-        return JSONResponse(content={"ok": True, "payload": payload})
-    return JSONResponse(content={"ok": False, "error": "Không lấy được payload"} , status_code=500)
+    # Dữ liệu hôm nay
+    hom_nay = []
+    hours = data["hourly"]["time"]
+    temps = data["hourly"]["temperature_2m"]
+    hums = data["hourly"]["relative_humidity_2m"]
+    codes = data["hourly"]["weathercode"]
+    for t, temp, hum, code in zip(hours, temps, hums, codes):
+        dt = datetime.fromisoformat(t)
+        if dt.date() == now_vn.date():
+            hom_nay.append({
+                "iso": dt.isoformat(),
+                "gio": dt.hour,
+                "nhiet_do": temp,
+                "do_am": hum,
+                "thoi_tiet": weather_code_to_text(code)
+            })
 
-@app.post("/push")
-def push_now():
-    """Trigger push 1 lần và trả kết quả (useful để test token)."""
-    result = push_to_thingsboard()
-    if result.get("ok"):
-        return JSONResponse(content={"ok": True, "result": result})
-    return JSONResponse(content={"ok": False, "result": result}, status_code=500)
+    # Dữ liệu ngày mai (lấy min/max và mô tả)
+    ngay_mai = {}
+    tomorrow = now_vn.date() + timedelta(days=1)
+    temps_tmr = [temp for t, temp in zip(hours, temps) if datetime.fromisoformat(t).date() == tomorrow]
+    codes_tmr = [code for t, code in zip(hours, codes) if datetime.fromisoformat(t).date() == tomorrow]
+    if temps_tmr:
+        ngay_mai = {
+            "nhiet_do_min": min(temps_tmr),
+            "nhiet_do_max": max(temps_tmr),
+            "thoi_tiet": weather_code_to_text(max(set(codes_tmr), key=codes_tmr.count)) if codes_tmr else "N/A"
+        }
+
+    payload = {
+        "cap_nhat_utc": now.isoformat(),
+        "cay": "Rau muống",
+        "hien_tai": hien_tai,
+        "hom_nay": hom_nay,
+        "ngay_mai": ngay_mai,
+        "nguon": "open-meteo",
+        "vi_tri": vi_tri
+    }
+
+    push_telemetry(payload)
