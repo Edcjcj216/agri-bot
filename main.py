@@ -6,7 +6,6 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 import threading
-from datetime import datetime
 
 # ================== CONFIG ==================
 TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"
@@ -47,7 +46,7 @@ def get_weather_forecast() -> dict:
         params = {
             "latitude": LAT,
             "longitude": LON,
-            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min,humidity_2m_max,humidity_2m_min",
             "timezone": "Asia/Ho_Chi_Minh"
         }
         r = requests.get(url, params=params, timeout=10)
@@ -61,6 +60,7 @@ def get_weather_forecast() -> dict:
             "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?"),
             "weather_yesterday_max": daily["temperature_2m_max"][0],
             "weather_yesterday_min": daily["temperature_2m_min"][0],
+            "humidity_yesterday": round((daily["humidity_2m_max"][0]+daily["humidity_2m_min"][0])/2,1),
 
             "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?"),
             "weather_today_max": daily["temperature_2m_max"][1],
@@ -69,6 +69,7 @@ def get_weather_forecast() -> dict:
             "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?"),
             "weather_tomorrow_max": daily["temperature_2m_max"][2],
             "weather_tomorrow_min": daily["temperature_2m_min"][2],
+            "humidity_tomorrow": round((daily["humidity_2m_max"][2]+daily["humidity_2m_min"][2])/2,1),
         }
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
@@ -76,12 +77,14 @@ def get_weather_forecast() -> dict:
             "weather_yesterday_desc": "?",
             "weather_yesterday_max": 0,
             "weather_yesterday_min": 0,
+            "humidity_yesterday": 0,
             "weather_today_desc": "?",
             "weather_today_max": 0,
             "weather_today_min": 0,
             "weather_tomorrow_desc": "?",
             "weather_tomorrow_max": 0,
             "weather_tomorrow_min": 0,
+            "humidity_tomorrow": 0
         }
 
 # ================== AI HELPER ==================
@@ -92,7 +95,7 @@ def call_ai_api(data: dict) -> dict:
     headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
     weather_info = get_weather_forecast()
-    weather_text = f" Dự báo hôm nay: {weather_info['weather_today_desc']}, {weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C." \
+    weather_text = f" Hôm nay: {weather_info['weather_today_desc']}, {weather_info['weather_today_min']}–{weather_info['weather_today_max']}°C." \
                    f" Ngày mai: {weather_info['weather_tomorrow_desc']}, {weather_info['weather_tomorrow_min']}–{weather_info['weather_tomorrow_max']}°C."
 
     prompt = (
@@ -207,6 +210,6 @@ def auto_loop():
             send_to_thingsboard(merged)
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
-        time.sleep(300)  # 5 phút
+        time.sleep(300)
 
 threading.Thread(target=auto_loop, daemon=True).start()
