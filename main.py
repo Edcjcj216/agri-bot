@@ -2,26 +2,25 @@ import os
 import time
 import json
 import logging
+import threading
 import requests
-from datetime import datetime
-import random
+from fastapi import FastAPI
 
 # ================== CONFIG ==================
 TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "I1s5bI2FQCZw6umLvwLG")
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
-
-AI_API_URL = os.getenv("AI_API_URL", "https://api-inference.huggingface.co/models/gpt2")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-
 OWM_API_KEY = os.getenv("OWM_API_KEY", "")
 LAT = float(os.getenv("LAT", "10.79"))
 LON = float(os.getenv("LON", "106.70"))
-
 LOOP_INTERVAL = 300  # 5 phút
 
 # ================== LOGGING ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ================== FASTAPI ==================
+app = FastAPI()
+_last_payload = None
 
 # ================== WEATHER ==================
 OWM_DESC_VI = {
@@ -52,6 +51,7 @@ def get_weather_forecast():
     try:
         now = int(time.time())
         yesterday = now - 86400
+
         # Forecast
         r = requests.get("https://api.openweathermap.org/data/2.5/onecall", params={
             "lat": LAT, "lon": LON, "exclude": "minutely,hourly,alerts", "units": "metric", "appid": OWM_API_KEY
@@ -105,53 +105,23 @@ def get_weather_forecast():
         return _empty_weather()
 
 # ================== AI ADVICE ==================
-def call_ai_api(data: dict):
-    prompt = f"Nhiệt độ {data['temperature']:.1f}°C, độ ẩm {data['humidity']:.1f}%, thời tiết {data.get('weather_today_desc','?')}."
-    try:
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-        body = {"inputs": prompt, "options":{"wait_for_model":True}}
-        r = requests.post(AI_API_URL, headers=headers, json=body, timeout=20)
-        r.raise_for_status()
-        out = r.json()
-        text = ""
-        if isinstance(out, list) and out:
-            text = out[0].get("generated_text","") if isinstance(out[0],dict) else str(out[0])
-        if text.strip():
-            return _parse_ai_advice(text, data)
-    except Exception as e:
-        logger.warning(f"AI API failed: {e}")
-    return _local_ai_advice(data)
-
-def _parse_ai_advice(text:str, data:dict):
-    advice_care = text.strip().replace("\n"," | ")
-    nutrition = ["Ưu tiên Kali (K)","Cân bằng NPK","Bón phân hữu cơ"]
-    return {
-        "prediction": f"Nhiệt độ {data['temperature']:.1f}°C, độ ẩm {data['humidity']:.1f}%",
-        "advice_nutrition": " | ".join(nutrition),
-        "advice_care": advice_care,
-        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
-        "advice": " | ".join(nutrition + [advice_care] + ["Quan sát cây trồng và điều chỉnh thực tế"])
-    }
-
-def _local_ai_advice(data:dict):
-    temp = data['temperature']
-    humi = data['humidity']
+def call_ai_advice(temperature, humidity, weather_desc):
+    # Local logic linh hoạt
     care_options = []
-
-    if temp > 35:
-        care_options.append(random.choice(["Tránh nắng gắt", "Tưới sáng sớm/chiều mát"]))
-    elif temp >= 30:
-        care_options.append(random.choice(["Tưới đủ nước", "Theo dõi sâu bệnh"]))
-    elif temp <= 15:
-        care_options.append(random.choice(["Giữ ấm", "Tránh sương muối"]))
+    if temperature > 35:
+        care_options.append("Tránh nắng gắt")
+    elif temperature >= 30:
+        care_options.append("Tưới đủ nước")
+    elif temperature <= 15:
+        care_options.append("Giữ ấm")
     else:
         care_options.append("Nhiệt độ bình thường")
 
-    if humi <= 40:
+    if humidity <= 40:
         care_options.append("Độ ẩm thấp: tăng tưới")
-    elif humi <= 60:
+    elif humidity <= 60:
         care_options.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-    elif humi >= 85:
+    elif humidity >= 85:
         care_options.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
     else:
         care_options.append("Độ ẩm ổn định cho rau muống")
@@ -159,7 +129,7 @@ def _local_ai_advice(data:dict):
     nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
 
     return {
-        "prediction": f"Nhiệt độ {temp:.1f}°C, độ ẩm {humi:.1f}%",
+        "prediction": f"Nhiệt độ {temperature:.1f}°C, độ ẩm {humidity:.1f}%",
         "advice_nutrition": " | ".join(nutrition),
         "advice_care": " | ".join(care_options),
         "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
@@ -167,30 +137,38 @@ def _local_ai_advice(data:dict):
     }
 
 # ================== TELEMETRY ==================
-def read_sensors():
-    # Giả lập ESP32 sensor
-    return {
-        "temperature": round(random.uniform(20,35),1),
-        "humidity": round(random.uniform(40,85),1),
-        "battery_voltage": round(random.uniform(3.5,4.2),2),
-        "battery_percent": random.randint(60,100)
-    }
-
-def send_telemetry():
-    sensor_data = read_sensors()
+def send_telemetry(sensor_data):
+    global _last_payload
     weather = get_weather_forecast()
-    ai_advice = call_ai_api(sensor_data | {"weather_today_desc": weather.get("weather_today_desc","?")})
-    payload = sensor_data | weather | ai_advice
+    ai_advice = call_ai_advice(sensor_data['temperature'], sensor_data['humidity'], weather['weather_today_desc'])
+    payload = {**sensor_data, **weather, **ai_advice}
     try:
         r = requests.post(TB_DEVICE_URL, json=payload, timeout=10)
         r.raise_for_status()
-        logger.info(f"Telemetry sent: {json.dumps(payload)}")
+        logger.info(f"Telemetry sent: {payload}")
+        _last_payload = payload
     except Exception as e:
         logger.error(f"Send telemetry failed: {e}")
 
-# ================== MAIN LOOP ==================
-if __name__ == "__main__":
-    logger.info("Starting telemetry loop...")
+# ================== BACKGROUND LOOP ==================
+def telemetry_loop():
     while True:
-        send_telemetry()
+        # Nếu ESP32 đã gửi lên TB, lấy dữ liệu từ TB hoặc giả lập tạm sensor
+        sensor_data = {
+            "temperature": round(random.uniform(20,35),1),  # Thay bằng dữ liệu ESP32 nếu cần
+            "humidity": round(random.uniform(40,85),1),
+            "battery_voltage": round(random.uniform(3.5,4.2),2),
+            "battery_percent": round(random.uniform(60,100),0),
+            "crop": "Rau muống",
+            "location": "An Phú, Hồ Chí Minh"
+        }
+        send_telemetry(sensor_data)
         time.sleep(LOOP_INTERVAL)
+
+@app.on_event("startup")
+def start_background_loop():
+    threading.Thread(target=telemetry_loop, daemon=True).start()
+
+@app.get("/last")
+def last_telemetry():
+    return _last_payload or {"message": "Chưa có dữ liệu"}
