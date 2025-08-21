@@ -1,132 +1,184 @@
 import os
-import json
 import logging
-from fastapi import FastAPI, Request
+import requests
 import httpx
-import asyncio
+from fastapi import FastAPI, Request
+from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ==============================
+# Cấu hình token
+# ==============================
+AI_TOKEN = os.getenv("AI_TOKEN", "demo_ai_token")  # token AI
+TB_TOKEN = "pk94asonfacs6mbeuutg"  # token ThingsBoard cố định
+TB_URL = f"https://demo.thingsboard.io/api/v1/{TB_TOKEN}/telemetry"
+
+logging.info(f"[DEBUG] AI_TOKEN = {AI_TOKEN}")
+logging.info(f"[DEBUG] TB_TOKEN = {TB_TOKEN}")
 
 app = FastAPI()
 
-# --- Config ---
-AI_TOKEN = os.getenv("AI_TOKEN", "YOUR_AI_TOKEN_HERE")
-TB_TOKEN = "pk94asonfacs6mbeuutg"   # luôn dùng token cố định
-TB_URL = "https://demo.thingsboard.io"
+# ==============================
+# Map mã thời tiết → mô tả tiếng Việt
+# ==============================
+WEATHER_CODE_MAP = {
+    0: "Trời quang đãng",
+    1: "Chủ yếu quang",
+    2: "Có mây",
+    3: "Nhiều mây",
+    45: "Sương mù",
+    48: "Sương mù đông đá",
+    51: "Mưa phùn nhẹ",
+    53: "Mưa phùn vừa",
+    55: "Mưa phùn dày",
+    61: "Mưa nhẹ",
+    63: "Mưa vừa",
+    65: "Mưa to",
+    80: "Mưa rào nhẹ",
+    81: "Mưa rào vừa",
+    82: "Mưa rào to",
+    95: "Giông nhẹ hoặc vừa",
+    96: "Giông kèm mưa đá nhẹ",
+    99: "Giông kèm mưa đá to",
+}
 
-# In ra token để debug
-logging.info(f"AI_TOKEN = {AI_TOKEN}")
-logging.info(f"TB_TOKEN = {TB_TOKEN}")
+# ==============================
+# Hàm lấy thời tiết từ Open-Meteo
+# ==============================
+def get_weather(lat: float, lon: float):
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        f"&hourly=temperature_2m,weathercode"
+        f"&daily=temperature_2m_max,temperature_2m_min,weathercode"
+        f"&forecast_days=2&timezone=auto&lang=vi"
+    )
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
 
-# --- Hàm gọi AI ---
-async def call_ai_api(sensor_data: dict, weather_today: dict, weather_tomorrow: dict) -> dict:
-    if not AI_TOKEN or AI_TOKEN == "YOUR_AI_TOKEN_HERE":
-        logging.warning("AI_TOKEN chưa được cấu hình!")
-        return {
-            "advice": "Không thể sinh gợi ý (chưa có AI_TOKEN).",
-            "advice_nutrition": "",
-            "advice_care": "",
-            "advice_note": ""
-        }
-
-    url = "https://api.your-ai-service.com/advice"  # thay bằng endpoint thực tế
-    payload = {
-        "temperature": sensor_data.get("temperature"),
-        "humidity": sensor_data.get("humidity"),
-        "battery": sensor_data.get("battery"),
-        "weather_today": weather_today,
-        "weather_tomorrow": weather_tomorrow,
-        "plant": "Rau muống",
-        "location": "An Phú, Thành phố Hồ Chí Minh"
+    # Dữ liệu hôm nay và ngày mai
+    daily = data["daily"]
+    hom_nay = {
+        "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "Không rõ"),
+        "temp_max": daily["temperature_2m_max"][0],
+        "temp_min": daily["temperature_2m_min"][0],
     }
+    ngay_mai = {
+        "weather_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "Không rõ"),
+        "temp_max": daily["temperature_2m_max"][1],
+        "temp_min": daily["temperature_2m_min"][1],
+    }
+
+    # Lấy 6 giờ tiếp theo từ hourly
+    hourly = data["hourly"]
+    now = datetime.now().hour
+    next6 = {}
+    for i in range(6):
+        idx = now + i if now + i < len(hourly["temperature_2m"]) else -1
+        temp = hourly["temperature_2m"][idx]
+        code = hourly["weathercode"][idx]
+        desc = WEATHER_CODE_MAP.get(code, "Không rõ")
+        next6[f"hour_{i+1}"] = {"temp": temp, "weather_desc": desc}
+
+    return hom_nay, ngay_mai, next6
+
+# ==============================
+# Hàm gọi AI API
+# ==============================
+async def call_ai_api(data: dict):
+    if not AI_TOKEN or AI_TOKEN.strip() == "":
+        logging.warning("[AI] Token rỗng hoặc không hợp lệ!")
+        return {}
+
+    url = "https://ai.example.com/predict"  # đổi theo endpoint thật
     headers = {"Authorization": f"Bearer {AI_TOKEN}"}
 
-    logging.info(f"AI ▶ {payload}")
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         try:
-            resp = await client.post(url, json=payload, headers=headers)
+            resp = await client.post(url, json=data, headers=headers)
             logging.info(f"AI ◀ status={resp.status_code}")
             if resp.status_code != 200:
                 logging.warning(f"AI API returned {resp.status_code}: {resp.text}")
-                return {
-                    "advice": "Không thể sinh gợi ý (AI lỗi).",
-                    "advice_nutrition": "",
-                    "advice_care": "",
-                    "advice_note": ""
-                }
+                return {}
             return resp.json()
         except Exception as e:
-            logging.error(f"AI API exception: {e}")
-            return {
-                "advice": "Không thể sinh gợi ý (AI exception).",
-                "advice_nutrition": "",
-                "advice_care": "",
-                "advice_note": ""
-            }
+            logging.error(f"AI API error: {e}")
+            return {}
 
-# --- Hàm gửi dữ liệu lên ThingsBoard ---
-async def send_to_tb(telemetry: dict):
-    url = f"{TB_URL}/api/v1/{TB_TOKEN}/telemetry"
-    logging.info(f"TB ▶ POST {url}")
-    logging.info(f"TB ▶ Payload = {telemetry}")
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            resp = await client.post(url, json=telemetry)
-            if resp.status_code != 200:
-                logging.warning(f"TB API returned {resp.status_code}: {resp.text}")
-            else:
-                logging.info(f"TB ◀ OK {resp.status_code}")
-        except Exception as e:
-            logging.error(f"TB API exception: {e}")
+# ==============================
+# Hàm gửi telemetry lên ThingsBoard
+# ==============================
+def send_to_tb(payload: dict):
+    try:
+        r = requests.post(TB_URL, json=payload, timeout=10)
+        if r.status_code != 200:
+            logging.warning(f"[TB] HTTP {r.status_code}: {r.text}")
+        else:
+            logging.info(f"TB ◀ OK {r.status_code}")
+    except Exception as e:
+        logging.error(f"[TB] Error sending data: {e}")
 
-# --- API nhận dữ liệu từ ESP32 ---
+# ==============================
+# API nhận dữ liệu từ ESP32
+# ==============================
 @app.post("/esp32-data")
-async def receive_data(request: Request):
-    data = await request.json()
-    temperature = float(data.get("temperature", 0))
-    humidity = float(data.get("humidity", 0))
-    battery = float(data.get("battery", 0))
+async def esp32_data(req: Request):
+    body = await req.json()
+    temp = body.get("temperature")
+    hum = body.get("humidity")
+    bat = body.get("battery")
+    crop = body.get("crop", "Không rõ")
+    lat = body.get("lat")
+    lon = body.get("lon")
 
-    # TODO: Tích hợp dữ liệu thời tiết thực (6 giờ + ngày mai)
-    weather_today = {"weather_desc": "Giông nhẹ hoặc vừa", "temp_max": 27.1, "temp_min": 24.4}
-    weather_tomorrow = {"weather_desc": "Nhiều mây", "temp_max": 32.0, "temp_min": 23.5}
+    # Lấy thời tiết
+    hom_nay, ngay_mai, next6 = get_weather(lat, lon)
 
-    sensor_data = {"temperature": temperature, "humidity": humidity, "battery": battery,
-                   "prediction": f"Nhiệt độ {temperature}°C, độ ẩm {humidity}%"}
-
-    advice = await call_ai_api(sensor_data, weather_today, weather_tomorrow)
-
-    telemetry = {
-        **sensor_data,
-        **advice,
-        "hom_nay": weather_today,
-        "ngay_mai": weather_tomorrow
+    # Gọi AI API để sinh gợi ý
+    ai_input = {
+        "temperature": temp,
+        "humidity": hum,
+        "battery": bat,
+        "crop": crop,
+        "hom_nay": hom_nay,
+        "ngay_mai": ngay_mai,
+        "next6": next6
     }
+    ai_result = await call_ai_api(ai_input)
 
-    await send_to_tb(telemetry)
-    return {"status": "ok", "data": telemetry}
+    payload = {
+        "temperature": temp,
+        "humidity": hum,
+        "battery": bat,
+        **ai_result,
+        "hom_nay": hom_nay,
+        "ngay_mai": ngay_mai,
+        **next6
+    }
+    logging.info(f"TB ▶ {payload}")
+    send_to_tb(payload)
+    return {"status": "ok", "sent": payload}
 
-# --- Trang chủ ---
-@app.get("/")
-def root():
-    return {"message": "Service is running", "time": datetime.now().isoformat()}
+# ==============================
+# Auto scheduler demo
+# ==============================
+def auto_loop():
+    logging.info("Auto loop running...")
 
-# --- Auto loop nếu cần ---
-async def auto_loop():
-    while True:
-        fake_data = {
-            "temperature": 30.1,
-            "humidity": 69.2,
-            "battery": 90
-        }
-        await receive_data(type("obj", (object,), {"json": lambda: fake_data}))
-        await asyncio.sleep(60)
+scheduler = BackgroundScheduler()
+scheduler.add_job(auto_loop, "interval", minutes=30)
+scheduler.start()
 
-# --- Khởi động ---
+# ==============================
+# Main
+# ==============================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    logging.info(f"Starting server on port {port}")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
