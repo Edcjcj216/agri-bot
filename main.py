@@ -47,9 +47,11 @@ OWM_DESC_VI = {
 }
 
 def get_weather_forecast():
+    """Lấy weather chi tiết hôm qua, hôm nay, ngày mai từ OpenWeatherMap"""
     if not OWM_API_KEY:
         logger.warning("OWM_API_KEY chưa cấu hình")
         return {}
+
     try:
         url = "https://api.openweathermap.org/data/2.5/onecall"
         params = {
@@ -63,24 +65,46 @@ def get_weather_forecast():
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        today = data["daily"][0]
-        tomorrow = data["daily"][1]
+        daily = data.get("daily", [])
 
-        def vi_desc(weather):
-            d = weather[0]["description"]
-            return OWM_DESC_VI.get(d.lower(), d.capitalize())
+        result = {}
+        for idx, label in zip([0,1,2], ["yesterday", "today", "tomorrow"]):
+            if idx >= len(daily):
+                continue
+            d = daily[idx]
+            desc_raw = d["weather"][0]["description"]
+            desc_vi = OWM_DESC_VI.get(desc_raw.lower(), desc_raw.capitalize())
+            temp_max = d["temp"]["max"]
+            temp_min = d["temp"]["min"]
+            humi_avg = d.get("humidity", 0)
+            # Ghi kiểu "Trời có mưa, kéo dài vài giờ" nếu mưa
+            if "rain" in desc_raw.lower():
+                note = "Trời có mưa, dự kiến kéo dài vài giờ"
+            elif "snow" in desc_raw.lower():
+                note = "Trời có tuyết"
+            elif "cloud" in desc_raw.lower():
+                note = "Trời nhiều mây"
+            elif "clear" in desc_raw.lower():
+                note = "Trời quang, nắng đẹp"
+            else:
+                note = desc_vi
 
-        return {
-            "weather_today_desc": vi_desc(today["weather"]),
-            "weather_today_max": today["temp"]["max"],
-            "weather_today_min": today["temp"]["min"],
-            "weather_tomorrow_desc": vi_desc(tomorrow["weather"]),
-            "weather_tomorrow_max": tomorrow["temp"]["max"],
-            "weather_tomorrow_min": tomorrow["temp"]["min"]
-        }
+            result.update({
+                f"weather_{label}_desc": desc_vi,
+                f"weather_{label}_max": temp_max,
+                f"weather_{label}_min": temp_min,
+                f"humidity_{label}": humi_avg,
+                f"weather_{label}_note": note
+            })
+        return result
+
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        return {}
+        return {
+            "weather_yesterday_desc":"?", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0, "weather_yesterday_note":"?",
+            "weather_today_desc":"?", "weather_today_max":0, "weather_today_min":0, "humidity_today":0, "weather_today_note":"?",
+            "weather_tomorrow_desc":"?", "weather_tomorrow_max":0, "weather_tomorrow_min":0, "humidity_tomorrow":0, "weather_tomorrow_note":"?"
+        }
 
 # ================== AI ==================
 def call_ai_api(temp, humi):
@@ -191,10 +215,7 @@ def receive_data(data: SensorData):
 def auto_loop():
     while True:
         try:
-            sample = {
-                "temperature": round(random.uniform(20, 35), 1),
-                "humidity": round(random.uniform(40, 85), 1)
-            }
+            sample = {"temperature": random.uniform(18,32), "humidity": random.uniform(40,85)}
             ai_result = call_ai_api(sample["temperature"], sample["humidity"])
             weather_info = get_weather_forecast()
             merged = sample | ai_result | weather_info | {"location": "An Phú, Hồ Chí Minh", "crop": "Rau muống"}
