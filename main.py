@@ -9,7 +9,7 @@ import threading
 from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = "pk94asonfacs6mbeuutg"  # Device DEMO token
+TB_DEMO_TOKEN = "sgkxcrqntuki8gu1oj8u"  # Device DEMO token
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 TB_TENANT_USER = os.getenv("TB_TENANT_USER", "")
