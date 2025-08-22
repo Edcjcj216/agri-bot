@@ -1,135 +1,170 @@
 import os
 import json
-import logging
 import requests
 import httpx
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ================== CONFIG ==================
-TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+TB_BASE_URL = "https://thingsboard.cloud"
+TB_DEVICE_TOKEN = os.getenv("TB_DEMO_TOKEN", "")
+OWM_API_KEY = os.getenv("OWM_API_KEY", "")
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
-HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+# AI API keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "")
 
-OWM_KEY = os.getenv("OWM_API_KEY")  # để nguyên phần thời tiết
-
-logging.basicConfig(level=logging.INFO)
+# FastAPI app
 app = FastAPI()
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# ============= AI CLIENTS ==============
-async def ask_openai(prompt: str) -> str:
-    if not OPENAI_KEY:
-        raise ValueError("Missing OPENAI_API_KEY")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-async def ask_openrouter(prompt: str) -> str:
-    if not OPENROUTER_KEY:
-        raise ValueError("Missing OPENROUTER_API_KEY")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "HTTP-Referer": "https://github.com/your/repo",
-                "X-Title": "Agri-Bot",
-            },
-            json={
-                "model": "openai/gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-async def ask_hf(prompt: str) -> str:
-    if not HF_KEY:
-        raise ValueError("Missing HUGGINGFACE_API_TOKEN")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
-            headers={"Authorization": f"Bearer {HF_KEY}"},
-            json={"inputs": prompt},
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data[0]["generated_text"].strip()
-
-async def ask_gemini(prompt: str) -> str:
-    if not GEMINI_KEY:
-        raise ValueError("Missing GEMINI_API_KEY")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-        )
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-async def get_ai_advice(prompt: str) -> str:
-    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_hf]:
-        try:
-            return await fn(prompt)
-        except Exception as e:
-            logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau hoặc cấu hình API key."
-
-# ============= THINGSBOARD ==============
-def push_to_tb(data: dict):
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+# =============== WEATHER ====================
+def get_weather(location: str):
+    """Fetch weather forecast from OpenWeatherMap"""
     try:
-        r = requests.post(url, json=data, timeout=10)
-        r.raise_for_status()
-        logging.info(f"✅ Sent to ThingsBoard: {data}")
+        url = "http://api.openweathermap.org/data/2.5/forecast"
+        params = {"q": location, "appid": OWM_API_KEY, "units": "metric", "lang": "vi"}
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+
+        if "list" not in data:
+            return {}
+
+        forecast = {}
+        for i in range(7):  # 7 hours ahead
+            hour = data["list"][i]
+            forecast[f"hour_{i}_temperature"] = hour["main"]["temp"]
+            forecast[f"hour_{i}_humidity"] = hour["main"]["humidity"]
+            forecast[f"hour_{i}_weather_desc"] = hour["weather"][0]["description"]
+
+        # Today summary
+        forecast["temperature"] = data["list"][0]["main"]["temp"]
+        forecast["humidity"] = data["list"][0]["main"]["humidity"]
+        forecast["weather_today_desc"] = data["list"][0]["weather"][0]["description"]
+
+        return forecast
     except Exception as e:
-        logging.error(f"❌ Failed to push telemetry: {e}")
+        print("Weather error:", e)
+        return {}
 
-# ============= ENDPOINTS ==============
-@app.post("/tb-webhook")
+# =============== AI CLIENT ==================
+async def ask_ai(question: str, crop: str, location: str, weather: dict) -> str:
+    """Query AI API to generate advice"""
+    prompt = f"""
+Bạn là chuyên gia nông nghiệp.
+Người dùng hỏi: {question}
+Cây trồng: {crop}
+Địa điểm: {location}
+Thời tiết: {json.dumps(weather, ensure_ascii=False)}
+
+→ Hãy đưa ra 1 đoạn lời khuyên duy nhất, súc tích, dễ hiểu.
+"""
+
+    # 1. Try OpenAI
+    if OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print("OpenAI error:", e)
+
+    # 2. Try OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "HTTP-Referer": "https://github.com/Edcjcj216/agri-bot",
+                        "X-Title": "Agri-Bot",
+                    },
+                    json={
+                        "model": "openai/gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print("OpenRouter error:", e)
+
+    # 3. Try Gemini
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}",
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                )
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            print("Gemini error:", e)
+
+    # 4. Try Hugging Face
+    if HUGGINGFACE_API_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
+                    headers={"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"},
+                    json={"inputs": prompt},
+                )
+                return r.json()[0]["generated_text"].strip()
+        except Exception as e:
+            print("HuggingFace error:", e)
+
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau."
+
+# =============== THINGSBOARD =================
+def push_telemetry(payload: dict):
+    url = f"{TB_BASE_URL}/api/v1/{TB_DEVICE_TOKEN}/telemetry"
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        print("TB Push:", res.status_code, payload)
+    except Exception as e:
+        print("TB error:", e)
+
+# =============== HANDLERS ====================
+@app.post("/webhook")
 async def tb_webhook(req: Request):
-    body = await req.json()
-    logging.info(f"📩 Got TB webhook: {body}")
+    """Receive shared attributes from ThingsBoard"""
+    data = await req.json()
+    print("Webhook data:", data)
 
-    shared = body.get("shared", {})
-    hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
-    crop = shared.get("crop", "cây trồng")
+    shared = data.get("shared", {})
+    question = shared.get("hoi", "Tư vấn nông nghiệp")
+    crop = shared.get("crop", "rau muống")
     location = shared.get("location", "Hồ Chí Minh")
 
-    prompt = f"""
-    Người dùng hỏi: {hoi}
-    Cây trồng: {crop}
-    Vị trí: {location}
+    # Lấy thời tiết
+    weather = get_weather(location)
 
-    Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-    Chỉ cần đưa ra 1 đoạn văn duy nhất.
-    """
+    # Gọi AI
+    advice = await ask_ai(question, crop, location, weather)
 
-    advice_text = await get_ai_advice(prompt)
-    push_to_tb({"advice_text": advice_text})
-    return {"status": "ok", "advice_text": advice_text}
+    # Push duy nhất advice_text
+    push_telemetry({"advice_text": advice})
 
-@app.get("/")
-def root():
-    return {"status": "running"}
+    return {"status": "ok", "advice_text": advice}
 
-# ============= STARTUP ==============
-@app.on_event("startup")
-def init():
-    logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
+# Auto push ping để tránh timeout
+def auto_ping():
+    push_telemetry({"advice_text": "Ping: server đang hoạt động."})
+
+scheduler.add_job(auto_ping, "interval", minutes=5)
+
+# Run local
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
