@@ -12,13 +12,16 @@ app = FastAPI()
 
 # ================== CONFIG ==================
 SEND_INTERVAL = 300  # 5 phút
-TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN")  # Set Render Secret
-PORT = int(os.getenv("PORT", 10000))
-LOCAL_WEBHOOK = f"http://127.0.0.1:{PORT}/tb-webhook"
-
+TB_TOKEN = os.getenv("TB_TOKEN")  # Render Secret: TB_TOKEN
+PORT = int(os.getenv("PORT", 10000))  # Render inject PORT
+# Nếu TB_TOKEN chưa set, bỏ qua push nhưng vẫn chạy server
 if not TB_TOKEN:
-    logging.warning("❌ TB_TOKEN chưa được cấu hình!")
+    logging.warning("⚠️ TB_TOKEN chưa được cấu hình! Chỉ log locally.")
+
+# ================== URL webhook nội bộ ==================
+# Sử dụng URL public nếu deploy Render, fallback nội bộ
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL")  # Optional: set nếu muốn dùng public URL
+LOCAL_WEBHOOK = APP_PUBLIC_URL or f"http://127.0.0.1:{PORT}/tb-webhook"
 
 # ================== FastAPI Endpoints ==================
 @app.post("/tb-webhook")
@@ -30,8 +33,9 @@ async def tb_webhook(req: Request):
     shared = body.get("shared", {})
     advice_text = f"AI advice placeholder for crop {shared.get('crop','unknown')}"
 
-    # Push chỉ advice_text lên ThingsBoard
-    await push_to_tb({"advice_text": advice_text})
+    # Chỉ push advice_text lên ThingsBoard nếu TB_TOKEN có
+    if TB_TOKEN:
+        await push_to_tb({"advice_text": advice_text})
 
     return {"status": "ok", "advice_text": advice_text}
 
@@ -54,9 +58,7 @@ def generate_payload():
 
 # ================== ThingsBoard Push ==================
 async def push_to_tb(data: dict):
-    if not TB_TOKEN:
-        return
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+    url = f"https://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
     data["_ts"] = int(datetime.utcnow().timestamp() * 1000)
     async with httpx.AsyncClient() as client:
         try:
