@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from collections import deque
 
-# zoneinfo để xử lý timezone chính xác (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -26,25 +25,21 @@ TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 LAT = float(os.getenv("LAT", "10.79"))
 LON = float(os.getenv("LON", "106.70"))
-AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "300"))  # giây giữa các lần gửi mẫu (auto-loop)
-WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", str(15 * 60)))  # cache thời tiết mặc định 15 phút
+AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "300"))
+WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", str(15 * 60)))
 TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
 
-# LLM / OpenRouter (Gemini) - giữ tên key như bạn muốn
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-pro")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Số giờ mở rộng để xuất hour_0..hour_N-1 (mặc định 12 theo yêu cầu)
 EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", "12"))
 
-# Bias correction (lưu ở memory + SQLite)
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", "48"))
 bias_history = deque(maxlen=MAX_HISTORY)
 BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
 
-# LLM backoff khi gặp lỗi (ví dụ 402) -> tránh spam request
 LLM_BACKOFF_SECONDS_ON_402 = int(os.getenv("LLM_BACKOFF_SECONDS_ON_402", str(3600)))
 llm_disabled_until = 0  # timestamp UNIX khi LLM được phép gọi lại
 
@@ -55,13 +50,12 @@ logger = logging.getLogger("agri-bot")
 # ================== FASTAPI ==================
 app = FastAPI(title="Agri Bot - ThingsBoard Gateway with Bias & LLM")
 
-# Dữ liệu sensor từ ESP32
 class SensorData(BaseModel):
     temperature: float
     humidity: float
     battery: float | None = None
 
-# ================== MAPPING MÃ THỜI TIẾT ==================
+# ================== MÃ THỜI TIẾT ==================
 WEATHER_CODE_MAP = {
     0: "Trời quang",
     1: "Trời quang nhẹ",
@@ -95,9 +89,8 @@ WEATHER_CODE_MAP = {
 
 weather_cache = {"ts": 0, "data": {}}
 
-# ================== SQLITE: persist bias history ==================
+# ================== SQLITE PERSIST BIAS ==================
 def init_db():
-    """Khởi tạo DB sqlite để lưu history bias (nếu chưa tồn tại)."""
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
         cur = conn.cursor()
@@ -118,13 +111,12 @@ def init_db():
         logger.warning(f"Không thể khởi tạo DB bias: {e}")
 
 def load_history_from_db():
-    """Load các dòng gần nhất vào deque bias_history khi ứng dụng khởi động."""
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
         cur = conn.cursor()
         cur.execute("SELECT api_temp, observed_temp FROM bias_history ORDER BY id DESC LIMIT ?", (MAX_HISTORY,))
         rows = cur.fetchall()
-        rows.reverse()  # chuyển thành thứ tự thời gian tăng dần
+        rows.reverse()
         for api, obs in rows:
             bias_history.append((float(api), float(obs)))
         conn.close()
@@ -133,7 +125,6 @@ def load_history_from_db():
         logger.warning(f"Failed to load bias history from DB: {e}")
 
 def insert_history_to_db(api_temp, observed_temp):
-    """Insert 1 record vào SQLite (dùng khi có sample mới)."""
     try:
         conn = sqlite3.connect(BIAS_DB_FILE, timeout=10)
         cur = conn.cursor()
@@ -146,9 +137,8 @@ def insert_history_to_db(api_temp, observed_temp):
     except Exception as e:
         logger.warning(f"Failed to insert bias history to DB: {e}")
 
-# ================== THỜI GIAN HIỆN TẠI (LOCAL TZ) ==================
+# ================== TIME HELPERS ==================
 def _now_local():
-    """Trả về datetime theo TIMEZONE nếu có zoneinfo, ngược lại trả datetime naive."""
     if ZoneInfo is not None:
         try:
             return datetime.now(ZoneInfo(TIMEZONE))
@@ -156,12 +146,10 @@ def _now_local():
             return datetime.now()
     return datetime.now()
 
-# ================== HELPER NHỎ ==================
 def _safe_mean(lst):
     return round(sum(lst) / len(lst), 1) if lst else None
 
 def _find_nearest_index(times, target_iso):
-    """Tìm index gần nhất với target_iso trong danh sách times (ISO strings)."""
     if not times:
         return None
     if target_iso in times:
@@ -174,26 +162,13 @@ def _find_nearest_index(times, target_iso):
     except Exception:
         return 0
 
-# ================== GỌI OPEN-METEO (forecast) ==================
+# ================== GỌI OPEN-METEO ==================
 def get_weather_forecast():
-    """
-    Gọi Open-Meteo, trả về cấu trúc:
-    {
-      meta: {...},
-      yesterday: {...},
-      today: {...},
-      tomorrow: {...},
-      next_hours: [ {time, temperature, humidity, weather_code, weather_desc, precipitation, precip_probability, windspeed, winddir}, ... ],
-      humidity_yesterday, humidity_today, humidity_tomorrow
-    }
-    Có cache để giảm tần suất gọi API.
-    """
     now = _now_local()
     if time.time() - weather_cache["ts"] < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
         return weather_cache["data"]
 
     try:
-        # start/end ngày để request daily summary; nếu bị lỗi sẽ thử lại không dùng start/end
         start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         end_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
         url = "https://api.open-meteo.com/v1/forecast"
@@ -214,7 +189,6 @@ def get_weather_forecast():
         }
 
         r = requests.get(url, params=params, timeout=12)
-        # nếu status không phải 200, thử fallback (bỏ start_date/end_date) vì một số endpoint có vấn đề với date range
         if r.status_code != 200:
             logger.warning(f"Weather API non-200 ({r.status_code}). Body: {r.text}")
             try:
@@ -247,13 +221,11 @@ def get_weather_forecast():
             except Exception:
                 return None
 
-        # Tính độ ẩm trung bình cho yesterday/today/tomorrow (nếu hourly có đủ)
         hums = hourly.get("relativehumidity_2m", [])
         humidity_yesterday = round(sum(hums[0:24]) / len(hums[0:24]), 1) if len(hums) >= 24 else None
         humidity_today = round(sum(hums[24:48]) / len(hums[24:48]), 1) if len(hums) >= 48 else None
         humidity_tomorrow = round(sum(hums[48:72]) / len(hums[48:72]), 1) if len(hums) >= 72 else None
 
-        # Build daily summaries (yesterday/today/tomorrow) an toàn
         weather_yesterday = {"date": None, "desc": None, "max": None, "min": None, "precipitation_sum": None, "windspeed_max": None}
         weather_today = weather_yesterday.copy()
         weather_tomorrow = weather_yesterday.copy()
@@ -282,7 +254,6 @@ def get_weather_forecast():
                 else:
                     weather_tomorrow.update(target)
 
-        # Lấy danh sách giờ tiếp theo - dùng EXTENDED_HOURS (mặc định 12)
         hour_times = hourly.get("time", [])
         current_hour_iso = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
         idx = _find_nearest_index(hour_times, current_hour_iso) or 0
@@ -334,11 +305,6 @@ def get_weather_forecast():
 
 # ================== BIAS CORRECTION ==================
 def update_bias_and_correct(next_hours, observed_temp):
-    """
-    Cập nhật history bias (api_now, observed_temp) -> tính bias = mean(obs - api).
-    Trả về bias và next_hours không sửa fields nhiệt độ (KHÔNG thêm temperature_corrected).
-    Lưu history cả vào SQLite.
-    """
     global bias_history
     if not next_hours:
         return 0.0, next_hours
@@ -349,10 +315,8 @@ def update_bias_and_correct(next_hours, observed_temp):
             bias_history.append((api_now, observed_temp))
             insert_history_to_db(api_now, observed_temp)
         except Exception:
-            # Không phá flow nếu DB lỗi
             pass
 
-    # compute diffs
     if bias_history:
         diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
     else:
@@ -360,16 +324,11 @@ def update_bias_and_correct(next_hours, observed_temp):
 
     bias = round(sum(diffs) / len(diffs), 1) if diffs else 0.0
 
-    # IMPORTANT: theo yêu cầu bạn, KHÔNG gửi hour_N_temperature_corrected lên ThingsBoard.
-    # Vì vậy, ở đây chúng ta tính bias nội bộ nhưng không modify next_hours temperature fields.
+    # Theo yêu cầu: KHÔNG thêm temperature_corrected keys vào telemetry.
     return bias, next_hours
 
-# ================== LLM (OpenRouter/Gemini) ==================
+# ================== LLM ==================
 def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_MODEL, max_tokens: int = 400, temperature: float = 0.0):
-    """
-    Gọi OpenRouter Chat Completions (nếu OPENROUTER_API_KEY được set).
-    Nếu không set key, raise RuntimeError.
-    """
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY chưa được cấu hình trong environment")
 
@@ -387,21 +346,17 @@ def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_M
         "temperature": temperature
     }
     r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=20)
-    # Ném exception cho caller xử lý; caller sẽ bắt lỗi 402/other và backoff
     r.raise_for_status()
     data = r.json()
     try:
-        # Cấu trúc dựa trên OpenRouter Chat completions
         content = data["choices"][0]["message"]["content"]
     except Exception:
         content = json.dumps(data, ensure_ascii=False)
     return content
 
 def extract_json_like(text: str):
-    """Cố gắng tìm JSON object trong string trả về bởi LLM và parse thành dict."""
     if not text:
         raise ValueError("Empty text")
-    # Tìm block JSON đầu tiên
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
         candidate = m.group(0)
@@ -409,18 +364,13 @@ def extract_json_like(text: str):
             return json.loads(candidate)
         except Exception:
             pass
-    # fallback: thử load toàn chuỗi
     try:
         return json.loads(text)
     except Exception as e:
         raise ValueError("No JSON found in LLM response") from e
 
-# ================== AI HELPER (rule-based fallback) ==================
+# ================== RULE-BASED ADVICE ==================
 def get_advice_rule_based(temp, humi, upcoming_weather=None):
-    """
-    Nếu LLM không khả dụng, sử dụng luật đơn giản để trả advice.
-    Trả dict chứa các key giống như telemetry: advice, advice_nutrition, advice_care, advice_note, prediction
-    """
     nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
     care = []
 
@@ -468,13 +418,8 @@ def get_advice_rule_based(temp, humi, upcoming_weather=None):
         "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
     }
 
-# ================== MỸ NGHĨA MÔ TẢ THỜI TIẾT TỰ NHIÊN ==================
+# ================== MÔ TẢ GIỜ TỰ NHIÊN ==================
 def nice_hourly_description(h):
-    """
-    Tạo mô tả tự nhiên cho 1 mốc giờ dự báo.
-    h là dict chứa: weather_desc_simple, precip_probability, precipitation, windspeed
-    Trả chuỗi mô tả ngắn, ví dụ: "Nhiều mây, khả năng mưa ~40%, mưa nhỏ, gió nhẹ ~8 km/h"
-    """
     parts = []
     desc = h.get("weather_desc_simple") or "Không rõ"
     parts.append(desc)
@@ -488,10 +433,8 @@ def nice_hourly_description(h):
                 parts.append(f"khả năng mưa ~{pp_i}%")
         except Exception:
             pass
-    # nếu có lượng mưa
     if prec is not None and prec > 0.0:
         parts.append(f"lượng mưa ~{round(float(prec),1)} mm")
-    # gió
     ws = h.get("windspeed")
     if ws is not None:
         try:
@@ -509,7 +452,6 @@ def nice_hourly_description(h):
 
 # ================== SEND TO THINGSBOARD ==================
 def send_to_thingsboard(payload: dict):
-    """Gửi payload telemetry lên ThingsBoard device token (TB_DEVICE_URL)."""
     try:
         logger.info(f"TB ▶ sending payload keys: {list(payload.keys())}")
         r = requests.post(TB_DEVICE_URL, json=payload, timeout=10)
@@ -517,21 +459,14 @@ def send_to_thingsboard(payload: dict):
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
-# ================== MERGE WEATHER + FORMAT TELEMETRY ==================
+# ================== MERGE WEATHER & FORMAT ==================
 def merge_weather_and_hours(existing_data=None):
-    """
-    Hợp nhất forecast với existing_data (sensor + advice + meta) → tạo dict phẳng để push.
-    Giữ NGUYÊN tên key telemetry hiện có (hour_0, hour_0_temperature, hour_0_weather_desc,...).
-    Không thêm các key *_temperature_corrected theo yêu cầu.
-    """
     if existing_data is None:
         existing_data = {}
     weather = get_weather_forecast()
     now = _now_local()
-
     flattened = {**existing_data}
 
-    # daily
     t = weather.get("today", {})
     tm = weather.get("tomorrow", {})
     y = weather.get("yesterday", {})
@@ -548,7 +483,6 @@ def merge_weather_and_hours(existing_data=None):
         flattened["weather_yesterday_max"] = y.get("max")
         flattened["weather_yesterday_min"] = y.get("min")
 
-    # humidity aggregated
     if weather.get("humidity_today") is not None:
         flattened["humidity_today"] = weather.get("humidity_today")
     else:
@@ -560,7 +494,6 @@ def merge_weather_and_hours(existing_data=None):
     if weather.get("humidity_yesterday") is not None:
         flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
 
-    # hours: tạo keys hour_0 ... hour_{EXTENDED_HOURS-1}
     for idx in range(0, EXTENDED_HOURS):
         h = None
         if idx < len(weather.get("next_hours", [])):
@@ -574,20 +507,17 @@ def merge_weather_and_hours(existing_data=None):
             except Exception:
                 time_label = h.get("time")
 
-        # NOTE: giữ nguyên tên key theo yêu cầu
         flattened[f"hour_{idx}"] = time_label
         if h and h.get("temperature") is not None:
             flattened[f"hour_{idx}_temperature"] = h.get("temperature")
         if h and h.get("humidity") is not None:
             flattened[f"hour_{idx}_humidity"] = h.get("humidity")
 
-        # weather desc: dùng mô tả tự nhiên, không cộc lốc
         if h:
             flattened[f"hour_{idx}_weather_desc"] = nice_hourly_description(h)
         else:
             flattened[f"hour_{idx}_weather_desc"] = None
 
-    # giữ các key quan trọng khác
     if "temperature" not in flattened:
         flattened["temperature"] = existing_data.get("temperature")
     if "humidity" not in flattened:
@@ -608,33 +538,22 @@ def root():
 
 @app.get("/weather")
 def weather_endpoint():
-    """Endpoint kiểm tra forecast đã xử lý (dùng để test)."""
     return get_weather_forecast()
 
 @app.get("/bias")
 def bias_status():
-    """Trả trạng thái bias hiện tại (dùng để debug)."""
     diffs = [round(obs - api, 2) for api, obs in bias_history if api is not None and obs is not None]
     bias = round(sum(diffs) / len(diffs), 2) if diffs else 0.0
     return {"bias": bias, "history_len": len(diffs)}
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    """
-    Điểm vào chính khi ESP32 POST dữ liệu sensor.
-    - Cập nhật bias history
-    - Tính advice rule-based
-    - Gọi LLM (nếu bật và không đang backoff)
-    - Hợp nhất weather và push lên ThingsBoard giữ nguyên tên key
-    """
+    global llm_disabled_until  # khai báo global ở đầu hàm (sửa lỗi SyntaxError trước đó)
     logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
     weather = get_weather_forecast()
     next_hours = weather.get("next_hours", [])
 
-    # update bias và lấy bias (không thay đổi next_hours fields)
     bias, updated_next_hours = update_bias_and_correct(next_hours, data.temperature)
-
-    # advice cơ bản nếu LLM không hoạt động
     advice_data = get_advice_rule_based(data.temperature, data.humidity, upcoming_weather=updated_next_hours)
 
     merged = {
@@ -646,18 +565,14 @@ def receive_data(data: SensorData):
         "forecast_history_len": len(bias_history)
     }
 
-    # LLM: gọi nếu có key và không trong thời gian backoff
     llm_advice = None
-    global llm_disabled_until
     now_ts = time.time()
     if OPENROUTER_API_KEY:
         if now_ts < llm_disabled_until:
-            # đang backoff do lỗi trước đó
             llm_advice = {"skipped": "disabled/backoff_or_rate_or_history", "reason": f"llm_disabled_until={llm_disabled_until}"}
             logger.info("LLM bị skip do đang backoff.")
         else:
             try:
-                # Hướng dẫn LLM trả về CHỈ JSON object ngắn gọn
                 system_prompt = (
                     "Bạn là chuyên gia nông nghiệp, chuyên đưa khuyến nghị ngắn gọn bằng tiếng Việt. "
                     "Trả VỀ CHỈ MỘT ĐỐI TƯỢNG JSON duy nhất với các trường (tùy chọn): "
@@ -673,7 +588,6 @@ def receive_data(data: SensorData):
                 try:
                     llm_json = extract_json_like(resp_text)
                     llm_advice = llm_json
-                    # Nếu nhận dict, map 1 số field vào telemetry hiện có
                     if isinstance(llm_json, dict):
                         if llm_json.get("advice"):
                             merged["advice"] = llm_json.get("advice")
@@ -682,17 +596,14 @@ def receive_data(data: SensorData):
                         if llm_json.get("priority"):
                             merged["advice_note"] = f"priority: {llm_json.get('priority')}"
                 except ValueError:
-                    # Không parse được JSON -> lưu raw text
                     llm_advice = {"raw": resp_text}
             except requests.HTTPError as he:
-                # Xử lý lỗi HTTP (ví dụ 402 insufficient credits)
                 try:
                     body = he.response.text if he.response is not None else str(he)
                 except Exception:
                     body = str(he)
                 logger.warning(f"LLM HTTP error: {he} - body: {body}")
                 llm_advice = {"error": "http_error", "status": getattr(he.response, "status_code", None), "body": body}
-                # Nếu 402 thì backoff
                 status_code = getattr(he.response, "status_code", None)
                 if status_code == 402:
                     llm_disabled_until = time.time() + LLM_BACKOFF_SECONDS_ON_402
@@ -705,19 +616,14 @@ def receive_data(data: SensorData):
 
     merged["llm_advice"] = llm_advice
 
-    # attach next_hours (không sửa temp) vào weather để merge
     weather["next_hours"] = updated_next_hours
     merged = merge_weather_and_hours(existing_data=merged)
-
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
 
-# ================== AUTO SIMULATOR (auto-loop) ==================
+# ================== AUTO SIMULATOR ==================
 async def auto_loop():
-    """
-    Auto-loop để mô phỏng ESP32 gửi dữ liệu, hữu ích khi phát triển / demo.
-    Nó cũng gọi LLM nếu bật (tuy nhiên sẽ dùng backoff khi LLM trả lỗi).
-    """
+    global llm_disabled_until  # khai báo global ở đầu hàm để tránh SyntaxError
     logger.info("Auto-loop simulator started (calls LLM if enabled).")
     battery = 4.2
     while True:
@@ -744,7 +650,6 @@ async def auto_loop():
                 "forecast_history_len": len(bias_history)
             }
 
-            # Gọi LLM tự động giống endpoint nếu enabled (có backoff)
             llm_advice = None
             if OPENROUTER_API_KEY and time.time() >= llm_disabled_until:
                 try:
@@ -770,8 +675,6 @@ async def auto_loop():
                     logger.warning(f"LLM HTTP {getattr(he.response,'status_code',None)}: {body}")
                     llm_advice = {"error": "http_error", "status": getattr(he.response, "status_code", None), "body": body}
                     if getattr(he.response, "status_code", None) == 402:
-                        # backoff
-                        global llm_disabled_until
                         llm_disabled_until = time.time() + LLM_BACKOFF_SECONDS_ON_402
                         logger.warning(f"LLM disabled for {LLM_BACKOFF_SECONDS_ON_402} seconds due to 402.")
                 except Exception as e:
@@ -793,15 +696,10 @@ async def auto_loop():
 # ================== STARTUP ==================
 @app.on_event("startup")
 async def startup_event():
-    # Init DB và load history (nếu có)
     init_db()
     load_history_from_db()
-    # Start auto-loop task
     asyncio.create_task(auto_loop())
 
 # ================== HƯỚNG DẪN NGẮN ==================
-# - Chạy bằng: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - Configure env vars trên Render:
-#   TB_DEMO_TOKEN, LAT, LON, AUTO_LOOP_INTERVAL, WEATHER_CACHE_SECONDS, TZ,
-#   OPENROUTER_API_KEY (nếu muốn AI), GEMINI_API_KEY (không bắt buộc), EXTENDED_HOURS (mặc định 12)
-# - Các key telemetry được giữ nguyên tên để không làm vỡ dashboard ThingsBoard.
+# - Chạy: uvicorn main:app --host 0.0.0.0 --port $PORT
+# - Env vars: TB_DEMO_TOKEN, LAT, LON, AUTO_LOOP_INTERVAL, WEATHER_CACHE_SECONDS, TZ, OPENROUTER_API_KEY, EXTENDED_HOURS
