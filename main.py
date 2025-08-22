@@ -302,7 +302,8 @@ def get_weather_forecast():
     idx = _find_hour_index(hour_times, current_hour_str) or 0
 
     next_hours = []
-    for offset in range(0, 6):
+    # *** CHANGE: build 7 hours (0..6) to match hour_0..hour_6 on ThingsBoard ***
+    for offset in range(0, 7):
         i = idx + offset
         if i >= len(hour_times):
             break
@@ -512,6 +513,7 @@ def merge_weather_and_hours(existing_data=None):
     Merge weather forecast into telemetry but DO NOT overwrite telemetry keys with None.
     Use local rounded hour labels for hour_0..hour_6 so labels always reflect current local time,
     while temperatures/humidities are taken from weather['next_hours'].
+    Also remove stale keys if API did not return data for that slot.
     """
     if existing_data is None:
         existing_data = {}
@@ -581,23 +583,38 @@ def merge_weather_and_hours(existing_data=None):
         # set time label from local rounding (always set)
         flattened[f"hour_{idx}"] = hour_labels[idx]
 
-        h = None
         if idx < len(weather.get("next_hours", [])):
             h = weather["next_hours"][idx]
+            temp = h.get("temperature")
+            hum = h.get("humidity")
+            desc = h.get("weather_desc")
+            corrected = h.get("temperature_corrected")
 
-        temp = h.get("temperature") if h else None
-        hum = h.get("humidity") if h else None
-        desc = h.get("weather_desc") if h else None
-        corrected = h.get("temperature_corrected") if h else None
+            if temp is not None:
+                flattened[f"hour_{idx}_temperature"] = temp
+            else:
+                flattened.pop(f"hour_{idx}_temperature", None)
 
-        if temp is not None:
-            flattened[f"hour_{idx}_temperature"] = temp
-        if hum is not None:
-            flattened[f"hour_{idx}_humidity"] = hum
-        if desc is not None:
-            flattened[f"hour_{idx}_weather_desc"] = desc
-        if corrected is not None:
-            flattened[f"hour_{idx}_temperature_corrected"] = corrected
+            if hum is not None:
+                flattened[f"hour_{idx}_humidity"] = hum
+            else:
+                flattened.pop(f"hour_{idx}_humidity", None)
+
+            if desc is not None:
+                flattened[f"hour_{idx}_weather_desc"] = desc
+            else:
+                flattened.pop(f"hour_{idx}_weather_desc", None)
+
+            if corrected is not None:
+                flattened[f"hour_{idx}_temperature_corrected"] = corrected
+            else:
+                flattened.pop(f"hour_{idx}_temperature_corrected", None)
+        else:
+            # no new data for this slot -> remove the keys so ThingsBoard doesn't show stale values
+            flattened.pop(f"hour_{idx}_temperature", None)
+            flattened.pop(f"hour_{idx}_humidity", None)
+            flattened.pop(f"hour_{idx}_weather_desc", None)
+            flattened.pop(f"hour_{idx}_temperature_corrected", None)
 
     # keep observed (do not overwrite with None)
     if "temperature" not in flattened and existing_data.get("temperature") is not None:
@@ -627,6 +644,20 @@ def bias_status():
     diffs = [round(obs - api, 2) for api, obs in bias_history if api is not None and obs is not None]
     bias = round(sum(diffs) / len(diffs), 2) if diffs else 0.0
     return {"bias": bias, "history_len": len(diffs)}
+
+# debug endpoints added
+@app.get("/history")
+def get_bias_history():
+    """Return current in-memory bias_history (chronological oldest-first) for debugging."""
+    items = [{"api_temp": api, "observed_temp": obs} for api, obs in list(bias_history)]
+    return {"history": items, "len": len(items)}
+
+@app.post("/llm-unblock")
+def llm_unblock():
+    """Reset LLM backoff immediately (useful if you refilled credits)."""
+    global llm_disabled_until
+    llm_disabled_until = 0
+    return {"ok": True, "llm_disabled_until": llm_disabled_until}
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
@@ -715,40 +746,6 @@ def receive_data(data: SensorData):
     merged = merge_weather_and_hours(existing_data=merged)
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
-
-@app.post("/call-llm")
-def call_llm_manual():
-    """
-    Trigger LLM manually with last observed values. Useful for debugging / manual runs.
-    Returns raw openrouter response dict.
-    """
-    global _last_llm_call_ts
-    if not OPENROUTER_API_KEY:
-        return {"ok": False, "error": "OPENROUTER_API_KEY_not_set"}
-
-    if not bias_history:
-        return {"ok": False, "error": "no_bias_history", "reason": "need at least one sample in bias history to form context"}
-
-    # Use latest bias_history entry as recent observed
-    api_last, obs_last = bias_history[-1]
-    weather = get_weather_forecast()
-    next_hours = weather.get("next_hours", [])
-
-    system_prompt = (
-        "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: "
-        "advice (string ngắn, tiếng Việt), priority (low/medium/high), actions (mảng string các hành động cụ thể), "
-        "reason (giải thích ngắn). KHÔNG kèm văn bản khác."
-    )
-    user_prompt = f"Observed: temp={obs_last}C, bias reference api_now={api_last}. Corrected next_hours: {json.dumps(next_hours, ensure_ascii=False)}. Return JSON only."
-
-    # Rate-limit manual calls as well
-    now_ts = time.time()
-    if (now_ts - _last_llm_call_ts) < LLM_MIN_INTERVAL:
-        return {"ok": False, "error": "rate_limited", "retry_after": LLM_MIN_INTERVAL - (now_ts - _last_llm_call_ts)}
-
-    _last_llm_call_ts = now_ts
-    resp = call_openrouter_llm(system_prompt, user_prompt)
-    return resp
 
 # ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
@@ -851,4 +848,4 @@ async def startup():
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - To enable LLM (Gemini via OpenRouter), set OPENROUTER_API_KEY in your Render environment.
 # - This version persists bias history in SQLite (BIAS_DB_FILE), protects telemetry keys from being overwritten by None,
-#   uses a safer Open-Meteo fallback if the detailed params fail, and temporary disables LLM on HTTP 402 to avoid spam.
+#   uses a safer Open-Meteo fallback if detailed params fail, builds 7 hourly slots, and temporary disables LLM on HTTP 402 to avoid spam.
