@@ -1,3 +1,4 @@
+# main.py (đã chỉnh sửa)
 import os
 import time
 import json
@@ -41,6 +42,9 @@ LLM_CALL_MIN_HISTORY = int(os.getenv("LLM_CALL_MIN_HISTORY", 1))
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
 bias_history = deque(maxlen=MAX_HISTORY)
 BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
+
+# LLM backoff state: when set to a timestamp > time.time(), skip LLM calls
+llm_disabled_until = 0
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -184,154 +188,153 @@ def _find_hour_index(hour_times, target_hour_str):
         return 0
 
 
+def _call_open_meteo(params):
+    """Helper wrapper to call Open-Meteo and return (status, response-json-or-text)."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return r.status_code, r.text
+        return 200, r.json()
+    except Exception as e:
+        return None, str(e)
+
+
 def get_weather_forecast():
+    """Fetch forecast with robust fallbacks and preserve cache if new fetch fails."""
     now = _now_local()
+    # return cached if still fresh
     if time.time() - weather_cache["ts"] < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
         return weather_cache["data"]
 
-    try:
-        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        end_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": LAT,
-            "longitude": LON,
-            "daily": ",".join([
-                "weathercode", "temperature_2m_max", "temperature_2m_min",
-                "precipitation_sum", "windspeed_10m_max"
-            ]),
-            "hourly": ",".join([
-                "time", "temperature_2m", "relativehumidity_2m", "weathercode",
-                "precipitation", "windspeed_10m", "winddirection_10m", "precipitation_probability"
-            ]),
-            "timezone": TIMEZONE,
-            "start_date": start_date,
-            "end_date": end_date
-        }
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            logger.warning(f"Weather API non-200 ({r.status_code}). Body: {r.text}")
-            # try retry without start/end dates
-            try:
-                params.pop("start_date", None)
-                params.pop("end_date", None)
-                r2 = requests.get(url, params=params, timeout=10)
-                if r2.status_code == 200:
-                    data = r2.json()
-                else:
-                    logger.warning(f"Retry without dates also failed ({r2.status_code}): {r2.text}")
-                    if weather_cache.get("data"):
-                        return weather_cache["data"]
-                    r2.raise_for_status()
-            except Exception as e2:
-                logger.warning(f"Retry error: {e2}")
-                if weather_cache.get("data"):
-                    return weather_cache["data"]
-                raise
+    # primary params (more detailed)
+    start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    common = {
+        "latitude": LAT,
+        "longitude": LON,
+        "timezone": TIMEZONE,
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    primary = dict(common)
+    primary.update({
+        "daily": ",".join(["weathercode", "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "windspeed_10m_max"]),
+        "hourly": ",".join(["time", "temperature_2m", "relativehumidity_2m", "weathercode", "precipitation", "windspeed_10m", "winddirection_10m", "precipitation_probability"])
+    })
+
+    # a simpler fallback hourly list (less likely to trigger server-side parsing bugs)
+    fallback_hourly = ",".join(["temperature_2m", "relativehumidity_2m", "weathercode", "precipitation", "windspeed_10m"])
+    fallback = dict(common)
+    fallback.update({
+        "daily": ",".join(["weathercode", "temperature_2m_max", "temperature_2m_min"]),
+        "hourly": fallback_hourly
+    })
+
+    # Try primary
+    status, data_or_text = _call_open_meteo(primary)
+    if status == 200:
+        data = data_or_text
+    else:
+        logger.warning(f"Weather API non-200 ({status}). Body: {str(data_or_text)[:1000]}")
+        # Try fallback
+        status2, data_or_text2 = _call_open_meteo(fallback)
+        if status2 == 200:
+            data = data_or_text2
+            logger.info("Weather API: fallback parameters succeeded.")
         else:
-            r.raise_for_status()
-            data = r.json()
+            logger.warning(f"Fallback weather API failed ({status2}). Body: {str(data_or_text2)[:1000]}")
+            # If we have cached data, return it (do not overwrite cache or set nulls)
+            if weather_cache.get("data"):
+                logger.info("Returning existing cached weather data due to API failure.")
+                return weather_cache["data"]
+            # Otherwise return a safe empty skeleton (but avoid populating None keys in telemetry later)
+            return {"meta": {}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
 
-        daily = data.get("daily", {})
-        hourly = data.get("hourly", {})
+    # At this point `data` is the parsed JSON
+    daily = data.get("daily", {})
+    hourly = data.get("hourly", {})
 
-        def safe_get(arr, idx):
-            try:
-                return arr[idx]
-            except Exception:
-                return None
+    def safe_get(arr, idx):
+        try:
+            return arr[idx]
+        except Exception:
+            return None
 
-        hums = hourly.get("relativehumidity_2m", [])
-        humidity_yesterday = round(sum(hums[0:24]) / len(hums[0:24]), 1) if len(hums) >= 24 else None
-        humidity_today = round(sum(hums[24:48]) / len(hums[24:48]), 1) if len(hums) >= 48 else None
-        humidity_tomorrow = round(sum(hums[48:72]) / len(hums[48:72]), 1) if len(hums) >= 72 else None
+    hums = hourly.get("relativehumidity_2m", [])
+    humidity_yesterday = round(sum(hums[0:24]) / len(hums[0:24]), 1) if len(hums) >= 24 else None
+    humidity_today = round(sum(hums[24:48]) / len(hums[24:48]), 1) if len(hums) >= 48 else None
+    humidity_tomorrow = round(sum(hums[48:72]) / len(hums[48:72]), 1) if len(hums) >= 72 else None
 
-        weather_yesterday = {"date": None, "desc": None, "max": None, "min": None, "precipitation_sum": None, "windspeed_max": None}
-        weather_today = weather_yesterday.copy()
-        weather_tomorrow = weather_yesterday.copy()
+    weather_yesterday = {"date": None, "desc": None, "max": None, "min": None, "precipitation_sum": None, "windspeed_max": None}
+    weather_today = weather_yesterday.copy()
+    weather_tomorrow = weather_yesterday.copy()
 
-        if "time" in daily and daily["time"]:
-            today_str = now.strftime("%Y-%m-%d")
-            try:
-                idx_today = daily["time"].index(today_str)
-            except ValueError:
-                idx_today = 1 if len(daily.get("time", [])) > 1 else 0
-            idx_yesterday = max(0, idx_today - 1)
-            idx_tomorrow = min(len(daily.get("time", [])) - 1, idx_today + 1)
-            for name, idx in [("yesterday", idx_yesterday), ("today", idx_today), ("tomorrow", idx_tomorrow)]:
-                target = {
-                    "date": safe_get(daily.get("time", []), idx),
-                    "desc": WEATHER_CODE_MAP.get(safe_get(daily.get("weathercode", []), idx), "?"),
-                    "max": safe_get(daily.get("temperature_2m_max", []), idx),
-                    "min": safe_get(daily.get("temperature_2m_min", []), idx),
-                    "precipitation_sum": safe_get(daily.get("precipitation_sum", []), idx),
-                    "windspeed_max": safe_get(daily.get("windspeed_10m_max", []), idx)
-                }
-                if name == "yesterday":
-                    weather_yesterday.update(target)
-                elif name == "today":
-                    weather_today.update(target)
-                else:
-                    weather_tomorrow.update(target)
-
-        hour_times = hourly.get("time", [])
-        current_hour_str = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
-        idx = _find_hour_index(hour_times, current_hour_str) or 0
-
-        next_hours = []
-        for offset in range(0, 6):
-            i = idx + offset
-            if i >= len(hour_times):
-                break
-            h = {
-                "time": hour_times[i],
-                "temperature": safe_get(hourly.get("temperature_2m", []), i),
-                "humidity": safe_get(hourly.get("relativehumidity_2m", []), i),
-                "weather_code": safe_get(hourly.get("weathercode", []), i),
-                "weather_desc": WEATHER_CODE_MAP.get(safe_get(hourly.get("weathercode", []), i), "?"),
-                "precipitation": safe_get(hourly.get("precipitation", []), i),
-                "precip_probability": safe_get(hourly.get("precipitation_probability", []), i),
-                "windspeed": safe_get(hourly.get("windspeed_10m", []), i),
-                "winddir": safe_get(hourly.get("winddirection_10m", []), i)
+    if "time" in daily and daily["time"]:
+        today_str = now.strftime("%Y-%m-%d")
+        try:
+            idx_today = daily["time"].index(today_str)
+        except ValueError:
+            idx_today = 1 if len(daily.get("time", [])) > 1 else 0
+        idx_yesterday = max(0, idx_today - 1)
+        idx_tomorrow = min(len(daily.get("time", [])) - 1, idx_today + 1)
+        for name, idx in [("yesterday", idx_yesterday), ("today", idx_today), ("tomorrow", idx_tomorrow)]:
+            target = {
+                "date": safe_get(daily.get("time", []), idx),
+                "desc": WEATHER_CODE_MAP.get(safe_get(daily.get("weathercode", []), idx), "?"),
+                "max": safe_get(daily.get("temperature_2m_max", []), idx),
+                "min": safe_get(daily.get("temperature_2m_min", []), idx),
+                "precipitation_sum": safe_get(daily.get("precipitation_sum", []), idx),
+                "windspeed_max": safe_get(daily.get("windspeed_10m_max", []), idx)
             }
-            next_hours.append(h)
+            if name == "yesterday":
+                weather_yesterday.update(target)
+            elif name == "today":
+                weather_today.update(target)
+            else:
+                weather_tomorrow.update(target)
 
-        result = {
-            "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat()},
-            "yesterday": weather_yesterday,
-            "today": weather_today,
-            "tomorrow": weather_tomorrow,
-            "next_hours": next_hours,
-            "humidity_yesterday": humidity_yesterday,
-            "humidity_today": humidity_today,
-            "humidity_tomorrow": humidity_tomorrow
+    hour_times = hourly.get("time", [])
+    current_hour_str = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
+    idx = _find_hour_index(hour_times, current_hour_str) or 0
+
+    next_hours = []
+    for offset in range(0, 6):
+        i = idx + offset
+        if i >= len(hour_times):
+            break
+        h = {
+            "time": hour_times[i],
+            "temperature": safe_get(hourly.get("temperature_2m", []), i),
+            "humidity": safe_get(hourly.get("relativehumidity_2m", []), i),
+            "weather_code": safe_get(hourly.get("weathercode", []), i),
+            "weather_desc": WEATHER_CODE_MAP.get(safe_get(hourly.get("weathercode", []), i), "?"),
+            "precipitation": safe_get(hourly.get("precipitation", []), i),
+            "precip_probability": safe_get(hourly.get("precipitation_probability", []), i),
+            "windspeed": safe_get(hourly.get("windspeed_10m", []), i),
+            "winddir": safe_get(hourly.get("winddirection_10m", []), i)
         }
+        next_hours.append(h)
 
-        weather_cache["data"] = result
-        weather_cache["ts"] = time.time()
-        return result
+    result = {
+        "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat()},
+        "yesterday": weather_yesterday,
+        "today": weather_today,
+        "tomorrow": weather_tomorrow,
+        "next_hours": next_hours,
+        "humidity_yesterday": humidity_yesterday,
+        "humidity_today": humidity_today,
+        "humidity_tomorrow": humidity_tomorrow
+    }
 
-    except requests.HTTPError as he:
-        logger.warning(f"Weather API HTTPError: {he}")
-        if weather_cache.get("data"):
-            logger.info("Returning last cached weather data due to API error.")
-            return weather_cache["data"]
-        return {"meta": {}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
-    except Exception as e:
-        logger.warning(f"Weather API unexpected error: {e}")
-        if weather_cache.get("data"):
-            return weather_cache["data"]
-        return {"meta": {}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
+    weather_cache["data"] = result
+    weather_cache["ts"] = time.time()
+    return result
 
+# ================== BIAS CORRECTION ==================
 
 def update_bias_and_correct(next_hours, observed_temp):
-    """Update bias history with (api_now, observed_temp) and return bias + corrected next_hours.
-
-    - Stores recent pairs in a deque (bias_history) and persists into SQLite.
-    - Computes bias = mean(observed - api) and applies it to each hourly temperature
-      producing 'temperature_corrected'.
-    - Returns (bias, next_hours_modified).
-    """
+    """Update bias history with (api_now, observed_temp) and return bias + corrected next_hours."""
     global bias_history
     if not next_hours:
         return 0.0, next_hours
@@ -367,6 +370,11 @@ def update_bias_and_correct(next_hours, observed_temp):
 
 def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_MODEL, max_tokens: int = 400, temperature: float = 0.0):
     """Call OpenRouter and return a dict with detailed result for robust handling."""
+    global llm_disabled_until
+    # quick skip if previously disabled due to 402
+    if time.time() < llm_disabled_until:
+        return {"ok": False, "error": "llm_disabled_temporarily", "detail": f"disabled until {llm_disabled_until}"}
+
     if not OPENROUTER_API_KEY:
         return {"ok": False, "error": "OPENROUTER_API_KEY_not_set"}
 
@@ -400,6 +408,10 @@ def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_M
 
     if status != 200:
         logger.warning(f"LLM HTTP {status}: {body_text[:1000]}")
+        # If insufficient credits (402), temporarily disable LLM calls for 1 hour to avoid spam
+        if status == 402:
+            llm_disabled_until = time.time() + 3600
+            logger.warning("LLM disabled for 1 hour due to HTTP 402 (insufficient credits).")
         return {"ok": False, "error": "http_error", "status": status, "body": body_text}
 
     try:
@@ -493,84 +505,106 @@ def send_to_thingsboard(data: dict):
 # ================== HELPERS ==================
 
 def merge_weather_and_hours(existing_data=None):
+    """
+    Merge weather forecast into telemetry but DO NOT overwrite telemetry keys with None.
+    Only set keys when we have real values.
+    """
     if existing_data is None:
         existing_data = {}
     weather = get_weather_forecast()
 
     now = _now_local()
-    flattened = {**existing_data}
+    flattened = {**existing_data}  # start with existing telemetry keys (preserve!)
 
-    # daily
+    # daily: only set values when not None
     if weather.get("today"):
-        if weather.get("today", {}).get("desc") is not None:
-            flattened["weather_today_desc"] = weather.get("today", {}).get("desc")
-        if weather.get("today", {}).get("max") is not None:
-            flattened["weather_today_max"] = weather.get("today", {}).get("max")
-        if weather.get("today", {}).get("min") is not None:
-            flattened["weather_today_min"] = weather.get("today", {}).get("min")
-    if weather.get("tomorrow"):
-        if weather.get("tomorrow", {}).get("desc") is not None:
-            flattened["weather_tomorrow_desc"] = weather.get("tomorrow", {}).get("desc")
-        if weather.get("tomorrow", {}).get("max") is not None:
-            flattened["weather_tomorrow_max"] = weather.get("tomorrow", {}).get("max")
-        if weather.get("tomorrow", {}).get("min") is not None:
-            flattened["weather_tomorrow_min"] = weather.get("tomorrow", {}).get("min")
-    if weather.get("yesterday"):
-        if weather.get("yesterday", {}).get("desc") is not None:
-            flattened["weather_yesterday_desc"] = weather.get("yesterday", {}).get("desc")
-        if weather.get("yesterday", {}).get("max") is not None:
-            flattened["weather_yesterday_max"] = weather.get("yesterday", {}).get("max")
-        if weather.get("yesterday", {}).get("min") is not None:
-            flattened["weather_yesterday_min"] = weather.get("yesterday", {}).get("min")
+        tdesc = weather.get("today", {}).get("desc")
+        if tdesc is not None:
+            flattened["weather_today_desc"] = tdesc
+        tmax = weather.get("today", {}).get("max")
+        if tmax is not None:
+            flattened["weather_today_max"] = tmax
+        tmin = weather.get("today", {}).get("min")
+        if tmin is not None:
+            flattened["weather_today_min"] = tmin
 
-    # humidity aggregated
+    if weather.get("tomorrow"):
+        tdesc = weather.get("tomorrow", {}).get("desc")
+        if tdesc is not None:
+            flattened["weather_tomorrow_desc"] = tdesc
+        tmax = weather.get("tomorrow", {}).get("max")
+        if tmax is not None:
+            flattened["weather_tomorrow_max"] = tmax
+        tmin = weather.get("tomorrow", {}).get("min")
+        if tmin is not None:
+            flattened["weather_tomorrow_min"] = tmin
+
+    if weather.get("yesterday"):
+        tdesc = weather.get("yesterday", {}).get("desc")
+        if tdesc is not None:
+            flattened["weather_yesterday_desc"] = tdesc
+        tmax = weather.get("yesterday", {}).get("max")
+        if tmax is not None:
+            flattened["weather_yesterday_max"] = tmax
+        tmin = weather.get("yesterday", {}).get("min")
+        if tmin is not None:
+            flattened["weather_yesterday_min"] = tmin
+
+    # humidity aggregated: only set when not None
     if weather.get("humidity_today") is not None:
         flattened["humidity_today"] = weather.get("humidity_today")
     else:
+        # try compute from next_hours if available and not empty
         hlist = [h.get("humidity") for h in weather.get("next_hours", []) if h.get("humidity") is not None]
-        flattened["humidity_today"] = round(sum(hlist)/len(hlist),1) if hlist else None
+        if hlist:
+            flattened["humidity_today"] = round(sum(hlist)/len(hlist),1)
+
     if weather.get("humidity_tomorrow") is not None:
         flattened["humidity_tomorrow"] = weather.get("humidity_tomorrow")
     if weather.get("humidity_yesterday") is not None:
         flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
 
-    # hours
+    # hours: set only when we have values
     for idx in range(0, 7):
         h = None
         if idx < len(weather.get("next_hours", [])):
             h = weather["next_hours"][idx]
-        time_label = None
+
+        # time label (hour_0, hour_1, ...)
         if h and h.get("time"):
             try:
                 t = datetime.fromisoformat(h.get("time"))
                 time_label = t.strftime("%H:%M")
             except Exception:
                 time_label = h.get("time")
-        if time_label is not None:
-            flattened[f"hour_{idx}"] = time_label
+            if time_label is not None:
+                flattened[f"hour_{idx}"] = time_label
+
+        # temperature, humidity, weather desc
         temp = h.get("temperature") if h else None
         hum = h.get("humidity") if h else None
         desc = h.get("weather_desc") if h else None
+        corrected = h.get("temperature_corrected") if h else None
+
         if temp is not None:
             flattened[f"hour_{idx}_temperature"] = temp
         if hum is not None:
             flattened[f"hour_{idx}_humidity"] = hum
         if desc is not None:
             flattened[f"hour_{idx}_weather_desc"] = desc
-        corrected = h.get("temperature_corrected") if h else None
         if corrected is not None:
             flattened[f"hour_{idx}_temperature_corrected"] = corrected
 
-    # keep observed
-    if "temperature" not in flattened:
+    # keep observed (do not overwrite with None)
+    if "temperature" not in flattened and existing_data.get("temperature") is not None:
         flattened["temperature"] = existing_data.get("temperature")
-    if "humidity" not in flattened:
+    if "humidity" not in flattened and existing_data.get("humidity") is not None:
         flattened["humidity"] = existing_data.get("humidity")
-    if "prediction" not in flattened:
+    if "prediction" not in flattened and existing_data.get("prediction") is not None:
         flattened["prediction"] = existing_data.get("prediction")
-    if "location" not in flattened:
+    if "location" not in flattened and existing_data.get("location") is not None:
         flattened["location"] = existing_data.get("location")
-    if "crop" not in flattened:
+    if "crop" not in flattened and existing_data.get("crop") is not None:
         flattened["crop"] = existing_data.get("crop")
 
     return flattened
@@ -612,8 +646,8 @@ def receive_data(data: SensorData):
     }
 
     llm_advice = None
-    # CALL LLM ALWAYS if OPENROUTER_API_KEY is set (user requested AI on every request)
-    if OPENROUTER_API_KEY:
+    # CALL LLM only if OPENROUTER_API_KEY is set AND LLM not temporarily disabled
+    if OPENROUTER_API_KEY and time.time() >= llm_disabled_until:
         try:
             system_prompt = (
                 "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: "
@@ -627,7 +661,6 @@ def receive_data(data: SensorData):
 
             resp = call_openrouter_llm(system_prompt, user_prompt)
             if not resp.get("ok"):
-                # store detailed error info for telemetry + log
                 llm_advice = {
                     "error": resp.get("error"),
                     "status": resp.get("status"),
@@ -654,7 +687,11 @@ def receive_data(data: SensorData):
             logger.warning(f"LLM call unexpected error: {e}")
             llm_advice = {"error": "llm_failed", "reason": str(e)}
     else:
-        logger.info("OPENROUTER_API_KEY not set; skipping LLM call (set env to enable)")
+        if OPENROUTER_API_KEY:
+            logger.info("Skipping LLM call: temporarily disabled due to previous error or backoff.")
+            llm_advice = {"error": "llm_skipped", "reason": "disabled or in backoff"}
+        else:
+            logger.info("OPENROUTER_API_KEY not set; skipping LLM call (set env to enable)")
 
     merged["llm_advice"] = llm_advice
 
@@ -693,9 +730,9 @@ async def auto_loop():
                 "forecast_history_len": len(bias_history)
             }
 
-            # Call LLM in auto-loop as well if key present (user asked AI always on)
+            # Call LLM in auto-loop as well if key present and not in backoff
             llm_advice = None
-            if OPENROUTER_API_KEY:
+            if OPENROUTER_API_KEY and time.time() >= llm_disabled_until:
                 try:
                     system_prompt = (
                         "Bạn là một chuyên gia nông nghiệp. Trả về CHỈ MỘT JSON ngắn gọn gồm: "
@@ -728,6 +765,11 @@ async def auto_loop():
                 except Exception as e:
                     logger.warning(f"LLM call failed in auto-loop: {e}")
                     llm_advice = {"error": "llm_failed", "reason": str(e)}
+            else:
+                if OPENROUTER_API_KEY:
+                    llm_advice = {"error": "llm_skipped", "reason": "disabled/backoff"}
+                else:
+                    llm_advice = None
             merged["llm_advice"] = llm_advice
 
             weather["next_hours"] = corrected_next_hours
@@ -749,4 +791,5 @@ async def startup():
 # ================== NOTES ==================
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - To enable LLM (Gemini via OpenRouter), set OPENROUTER_API_KEY in your Render environment.
-# - This version persists bias history in SQLite (BIAS_DB_FILE) and calls LLM when OPENROUTER_API_KEY is set.
+# - This version persists bias history in SQLite (BIAS_DB_FILE), protects telemetry keys from being overwritten by None,
+#   uses a safer Open-Meteo fallback if the detailed params fail, and temporary disables LLM on HTTP 402 to avoid spam.
