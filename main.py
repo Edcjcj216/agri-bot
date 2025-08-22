@@ -13,31 +13,27 @@ app = FastAPI()
 # ================== CONFIG ==================
 SEND_INTERVAL = 300  # 5 phút
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN")  # Set Render Secret: TB_TOKEN
-PORT = int(os.getenv("PORT", 10000))  # Render inject PORT env
+TB_TOKEN = os.getenv("TB_TOKEN")  # Set Render Secret
+PORT = int(os.getenv("PORT", 10000))
 LOCAL_WEBHOOK = f"http://127.0.0.1:{PORT}/tb-webhook"
 
 if not TB_TOKEN:
-    logging.warning("❌ TB_TOKEN chưa được cấu hình trong Render Secrets!")
+    logging.warning("❌ TB_TOKEN chưa được cấu hình!")
 
 # ================== FastAPI Endpoints ==================
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
-    try:
-        body = await req.json()
-        logging.info("📩 Got payload:")
-        logging.info(json.dumps(body, ensure_ascii=False, indent=2))
+    body = await req.json()
+    logging.info("📩 Got payload:")
+    logging.info(json.dumps(body, ensure_ascii=False, indent=2))
 
-        shared = body.get("shared", {})
-        advice_text = f"AI advice placeholder for crop {shared.get('crop','unknown')}"
+    shared = body.get("shared", {})
+    advice_text = f"AI advice placeholder for crop {shared.get('crop','unknown')}"
 
-        # Push lên ThingsBoard
-        await push_to_tb({"advice_text": advice_text})
+    # Push chỉ advice_text lên ThingsBoard
+    await push_to_tb({"advice_text": advice_text})
 
-        return {"status": "ok", "advice_text": advice_text}
-    except Exception as e:
-        logging.error(f"❌ Error handling webhook: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "advice_text": advice_text}
 
 @app.get("/")
 def root():
@@ -52,9 +48,6 @@ def generate_payload():
             "hoi": random.choice(questions),
             "crop": random.choice(crops),
             "location": "Hồ Chí Minh",
-            "temperature": round(24 + 8 * random.random(), 1),
-            "humidity": round(60 + 30 * random.random(), 1),
-            "battery": round(3.5 + 0.7 * random.random(), 2),
         }
     }
     return payload
