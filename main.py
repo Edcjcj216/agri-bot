@@ -1,4 +1,4 @@
-# main.py (đã chỉnh sửa)
+# main.py
 import os
 import time
 import json
@@ -35,16 +35,20 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-pro")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# You can tune this if you want to require more history before LLM is meaningful
-LLM_CALL_MIN_HISTORY = int(os.getenv("LLM_CALL_MIN_HISTORY", 1))
+
+# LLM calling behavior
+LLM_CALL_MIN_HISTORY = int(os.getenv("LLM_CALL_MIN_HISTORY", 1))  # minimum bias samples before calling LLM
+LLM_BACKOFF_SECONDS = int(os.getenv("LLM_BACKOFF_SECONDS", 3600))  # backoff after 402 by default 1 hour
+LLM_MIN_INTERVAL = int(os.getenv("LLM_MIN_INTERVAL", 300))  # minimal seconds between LLM calls (throttle)
 
 # Bias correction settings (kept in-memory and persisted in SQLite)
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
 bias_history = deque(maxlen=MAX_HISTORY)
 BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
 
-# LLM backoff state: when set to a timestamp > time.time(), skip LLM calls
-llm_disabled_until = 0
+# LLM runtime state
+llm_disabled_until = 0  # timestamp until which LLM calls are skipped due to 402 or manual disable
+_last_llm_call_ts = 0   # last LLM call timestamp (for rate-limiting)
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -408,10 +412,10 @@ def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_M
 
     if status != 200:
         logger.warning(f"LLM HTTP {status}: {body_text[:1000]}")
-        # If insufficient credits (402), temporarily disable LLM calls for 1 hour to avoid spam
+        # If insufficient credits (402), temporarily disable LLM calls for configured backoff
         if status == 402:
-            llm_disabled_until = time.time() + 3600
-            logger.warning("LLM disabled for 1 hour due to HTTP 402 (insufficient credits).")
+            llm_disabled_until = time.time() + LLM_BACKOFF_SECONDS
+            logger.warning(f"LLM disabled for {LLM_BACKOFF_SECONDS} seconds due to HTTP 402 (insufficient credits).")
         return {"ok": False, "error": "http_error", "status": status, "body": body_text}
 
     try:
@@ -626,6 +630,7 @@ def bias_status():
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
+    global _last_llm_call_ts
     logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
     weather = get_weather_forecast()
     next_hours = weather.get("next_hours", [])
@@ -646,8 +651,17 @@ def receive_data(data: SensorData):
     }
 
     llm_advice = None
-    # CALL LLM only if OPENROUTER_API_KEY is set AND LLM not temporarily disabled
-    if OPENROUTER_API_KEY and time.time() >= llm_disabled_until:
+    # Decide whether to call LLM:
+    now_ts = time.time()
+    can_call_llm = (
+        OPENROUTER_API_KEY
+        and now_ts >= llm_disabled_until
+        and len(bias_history) >= LLM_CALL_MIN_HISTORY
+        and (now_ts - _last_llm_call_ts) >= LLM_MIN_INTERVAL
+    )
+
+    if can_call_llm:
+        _last_llm_call_ts = now_ts
         try:
             system_prompt = (
                 "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: "
@@ -687,11 +701,13 @@ def receive_data(data: SensorData):
             logger.warning(f"LLM call unexpected error: {e}")
             llm_advice = {"error": "llm_failed", "reason": str(e)}
     else:
-        if OPENROUTER_API_KEY:
-            logger.info("Skipping LLM call: temporarily disabled due to previous error or backoff.")
-            llm_advice = {"error": "llm_skipped", "reason": "disabled or in backoff"}
-        else:
-            logger.info("OPENROUTER_API_KEY not set; skipping LLM call (set env to enable)")
+        # reason for skipping
+        reason = "OPENROUTER_API_KEY_not_set" if not OPENROUTER_API_KEY else (
+                 "in_backoff" if now_ts < llm_disabled_until else
+                 ("history_too_short" if len(bias_history) < LLM_CALL_MIN_HISTORY else
+                  "rate_limited"))
+        logger.info(f"Skipping LLM call: {reason}")
+        llm_advice = {"skipped": reason}
 
     merged["llm_advice"] = llm_advice
 
@@ -701,8 +717,43 @@ def receive_data(data: SensorData):
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
 
+@app.post("/call-llm")
+def call_llm_manual():
+    """
+    Trigger LLM manually with last observed values. Useful for debugging / manual runs.
+    Returns raw openrouter response dict.
+    """
+    global _last_llm_call_ts
+    if not OPENROUTER_API_KEY:
+        return {"ok": False, "error": "OPENROUTER_API_KEY_not_set"}
+
+    if not bias_history:
+        return {"ok": False, "error": "no_bias_history", "reason": "need at least one sample in bias history to form context"}
+
+    # Use latest bias_history entry as recent observed
+    api_last, obs_last = bias_history[-1]
+    weather = get_weather_forecast()
+    next_hours = weather.get("next_hours", [])
+
+    system_prompt = (
+        "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: "
+        "advice (string ngắn, tiếng Việt), priority (low/medium/high), actions (mảng string các hành động cụ thể), "
+        "reason (giải thích ngắn). KHÔNG kèm văn bản khác."
+    )
+    user_prompt = f"Observed: temp={obs_last}C, bias reference api_now={api_last}. Corrected next_hours: {json.dumps(next_hours, ensure_ascii=False)}. Return JSON only."
+
+    # Rate-limit manual calls as well
+    now_ts = time.time()
+    if (now_ts - _last_llm_call_ts) < LLM_MIN_INTERVAL:
+        return {"ok": False, "error": "rate_limited", "retry_after": LLM_MIN_INTERVAL - (now_ts - _last_llm_call_ts)}
+
+    _last_llm_call_ts = now_ts
+    resp = call_openrouter_llm(system_prompt, user_prompt)
+    return resp
+
 # ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
+    global _last_llm_call_ts
     logger.info("Auto-loop simulator started (auto-calling LLM on each sample if enabled)")
     battery = 4.2
     tick = 0
@@ -730,9 +781,17 @@ async def auto_loop():
                 "forecast_history_len": len(bias_history)
             }
 
-            # Call LLM in auto-loop as well if key present and not in backoff
+            # Call LLM in auto-loop as well if key present and not in backoff and history/min-interval satisfied
             llm_advice = None
-            if OPENROUTER_API_KEY and time.time() >= llm_disabled_until:
+            now_ts = time.time()
+            can_call_llm = (
+                OPENROUTER_API_KEY
+                and now_ts >= llm_disabled_until
+                and len(bias_history) >= LLM_CALL_MIN_HISTORY
+                and (now_ts - _last_llm_call_ts) >= LLM_MIN_INTERVAL
+            )
+            if can_call_llm:
+                _last_llm_call_ts = now_ts
                 try:
                     system_prompt = (
                         "Bạn là một chuyên gia nông nghiệp. Trả về CHỈ MỘT JSON ngắn gọn gồm: "
@@ -767,9 +826,10 @@ async def auto_loop():
                     llm_advice = {"error": "llm_failed", "reason": str(e)}
             else:
                 if OPENROUTER_API_KEY:
-                    llm_advice = {"error": "llm_skipped", "reason": "disabled/backoff"}
+                    llm_advice = {"skipped": "disabled/backoff_or_rate_or_history"}
                 else:
                     llm_advice = None
+
             merged["llm_advice"] = llm_advice
 
             weather["next_hours"] = corrected_next_hours
