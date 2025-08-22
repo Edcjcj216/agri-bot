@@ -12,7 +12,13 @@ app = FastAPI()
 
 # ================== CONFIG ==================
 SEND_INTERVAL = 300  # 5 phút
-LOCAL_WEBHOOK = "http://127.0.0.1:10000/tb-webhook"
+TB_URL = "https://thingsboard.cloud/api/v1"
+TB_TOKEN = os.getenv("TB_TOKEN")  # Set Render Secret: TB_TOKEN
+PORT = int(os.getenv("PORT", 10000))  # Render inject PORT env
+LOCAL_WEBHOOK = f"http://127.0.0.1:{PORT}/tb-webhook"
+
+if not TB_TOKEN:
+    logging.warning("❌ TB_TOKEN chưa được cấu hình trong Render Secrets!")
 
 # ================== FastAPI Endpoints ==================
 @app.post("/tb-webhook")
@@ -24,6 +30,9 @@ async def tb_webhook(req: Request):
 
         shared = body.get("shared", {})
         advice_text = f"AI advice placeholder for crop {shared.get('crop','unknown')}"
+
+        # Push lên ThingsBoard
+        await push_to_tb({"advice_text": advice_text})
 
         return {"status": "ok", "advice_text": advice_text}
     except Exception as e:
@@ -50,6 +59,20 @@ def generate_payload():
     }
     return payload
 
+# ================== ThingsBoard Push ==================
+async def push_to_tb(data: dict):
+    if not TB_TOKEN:
+        return
+    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+    data["_ts"] = int(datetime.utcnow().timestamp() * 1000)
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(url, json=data, timeout=10)
+            r.raise_for_status()
+            logging.info(f"✅ Sent to ThingsBoard: {data}")
+        except Exception as e:
+            logging.warning(f"❌ Failed to push telemetry: {e}")
+
 # ================== Auto-send Task ==================
 async def auto_send_payload():
     async with httpx.AsyncClient() as client:
@@ -58,10 +81,10 @@ async def auto_send_payload():
             try:
                 response = await client.post(LOCAL_WEBHOOK, json=payload, timeout=10)
                 data = response.json()
-                logging.info(f"✅ Payload sent at {datetime.now().strftime('%H:%M:%S')}")
+                logging.info(f"🚀 Payload sent at {datetime.now().strftime('%H:%M:%S')}")
                 logging.info(f"AI advice: {data.get('advice_text')}")
             except Exception as e:
-                logging.warning(f"❌ Failed to send payload: {e}")
+                logging.warning(f"❌ Failed to send payload to /tb-webhook: {e}")
             await asyncio.sleep(SEND_INTERVAL)
 
 # ================== Startup Event ==================
@@ -73,5 +96,5 @@ async def startup_event():
 # ================== Run Server ==================
 if __name__ == "__main__":
     import uvicorn
-    logging.info("🚀 Starting FastAPI server on http://127.0.0.1:10000")
-    uvicorn.run(app, host="127.0.0.1", port=10000)
+    logging.info(f"🚀 Starting FastAPI server on 0.0.0.0:{PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
