@@ -16,7 +16,6 @@ TB_TOKEN = os.getenv("TB_TOKEN")  # Device token từ Render env
 if not TB_TOKEN:
     logger.warning("⚠️ TB_TOKEN chưa được cấu hình! Chỉ log locally.")
 
-# Crop + hành động tự sinh logic
 CROPS = ["rau muống", "cà chua", "lúa"]
 ACTIONS = {
     "rau muống": ["tưới nước", "bón phân hữu cơ", "tỉa lá già"],
@@ -25,7 +24,7 @@ ACTIONS = {
 }
 
 _last_push = {"ok": False, "status": None, "body": None, "time": None}
-_sent_pairs = set()  # tránh lặp crop+action
+_sent_pairs = set()
 
 # ================== APP ==================
 app = FastAPI()
@@ -42,7 +41,6 @@ def generate_payload():
             question = f"{action} cho {crop}"
             return {"shared": {"crop": crop, "hoi": question}}
         attempts += 1
-    # Nếu lặp quá nhiều lần, reset set
     _sent_pairs.clear()
     crop = random.choice(CROPS)
     action = random.choice(ACTIONS[crop])
@@ -76,6 +74,14 @@ async def push_to_tb(payload: dict):
             logger.exception(f"❌ Failed to push telemetry: {e}")
             _last_push.update({"ok": False, "status": "exception", "body": str(e), "time": datetime.utcnow().isoformat()})
 
+async def push_10_quick():
+    logger.info("🚀 Quick test: push 10 payloads immediately")
+    for i in range(10):
+        payload = generate_payload()
+        logger.info(f"🚀 Payload {i+1}: {json.dumps(payload, ensure_ascii=False)}")
+        await push_to_tb(payload)
+        await asyncio.sleep(0.2)
+
 async def auto_send_loop(interval_sec: int = 300):
     logger.info(f"🚀 Auto-send loop started. Interval: {interval_sec}s")
     while True:
@@ -88,7 +94,10 @@ async def auto_send_loop(interval_sec: int = 300):
 # ================== STARTUP ==================
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(auto_send_loop(interval_sec=300))  # 5 phút/lần
+    # Push 10 payload đầu tiên ngay lập tức
+    asyncio.create_task(push_10_quick())
+    # Bắt đầu auto-send loop 5 phút/lần
+    asyncio.create_task(auto_send_loop(interval_sec=300))
 
 # ================== ROUTES ==================
 @app.get("/")
@@ -97,7 +106,6 @@ def root():
 
 @app.get("/last-push")
 def last_push():
-    """Return last push status for debugging."""
     return _last_push
 
 # ================== MAIN ==================
