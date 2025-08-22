@@ -2,21 +2,16 @@ import os
 import json
 import logging
 import requests
-import httpx
 from datetime import datetime
 from fastapi import FastAPI, Request
-from apscheduler.schedulers.background import BackgroundScheduler
 from pathlib import Path
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "kRCUZFGs9gq5GAkIWZTq")  # device mới
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "kRCUZFGs9gq5GAkIWZTq")  # set trong Render secrets
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
-scheduler = BackgroundScheduler()
-scheduler.start()
-
 LOG_FILE = Path("/tmp/tb_payloads.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
