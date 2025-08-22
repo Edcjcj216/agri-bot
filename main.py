@@ -1,21 +1,21 @@
-# main.py
+# main_test_quick.py
 import os
 import json
 import random
 import logging
 from datetime import datetime
-from fastapi import FastAPI
 import asyncio
 import httpx
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agri-bot")
+logger = logging.getLogger("agri-bot-test")
 
-app = FastAPI()
-TB_TOKEN = os.getenv("TB_TOKEN")  # Device token từ Render env
-PORT = int(os.getenv("PORT", 10000))
+# Token từ env
+TB_TOKEN = os.getenv("TB_TOKEN")
+if not TB_TOKEN:
+    raise RuntimeError("⚠️ TB_TOKEN chưa được cấu hình!")
 
-# Crop + hành động (action) tự sinh logic
+# Crop + hành động (action)
 CROPS = ["rau muống", "cà chua", "lúa"]
 ACTIONS = {
     "rau muống": ["tưới nước", "bón phân hữu cơ", "tỉa lá già"],
@@ -23,7 +23,6 @@ ACTIONS = {
     "lúa": ["bón phân đợt 1", "bón phân đợt 2", "tỉa lá", "phòng sâu"]
 }
 
-_last_push = {"ok": False, "status": None, "body": None, "time": None}
 _sent_pairs = set()  # tránh lặp crop+action
 
 def generate_payload():
@@ -51,12 +50,6 @@ def make_advice_text(shared: dict) -> str:
     return f"AI advice placeholder for crop {crop} — question: {hoi}"
 
 async def push_to_tb(payload: dict):
-    global _last_push
-    if not TB_TOKEN:
-        logger.warning("⚠️ TB_TOKEN chưa được cấu hình! Chỉ log locally.")
-        _last_push.update({"ok": False, "status": "no_token", "body": None, "time": datetime.utcnow().isoformat()})
-        return
-
     advice_text = make_advice_text(payload["shared"])
     send_payload = {"advice_text": advice_text, "_ts": int(datetime.utcnow().timestamp() * 1000)}
     url = f"https://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
@@ -65,36 +58,18 @@ async def push_to_tb(payload: dict):
         try:
             resp = await client.post(url, json=send_payload, timeout=10)
             status = resp.status_code
-            body_text = resp.text
-            _last_push.update({"ok": 200 <= status < 300, "status": status, "body": body_text, "time": datetime.utcnow().isoformat()})
-            logger.info(f"✅ Sent to ThingsBoard: {send_payload}")
+            logger.info(f"✅ Sent ({status}): {send_payload}")
         except Exception as e:
             logger.exception(f"❌ Failed to push telemetry: {e}")
-            _last_push.update({"ok": False, "status": "exception", "body": str(e), "time": datetime.utcnow().isoformat()})
 
-async def auto_send_loop(interval_sec: int = 300):
-    logger.info(f"🚀 Auto-send loop started. Interval: {interval_sec}s")
-    while True:
+async def push_10_payloads_quick():
+    logger.info("🚀 Starting quick test: push 10 payloads immediately")
+    for i in range(10):
         payload = generate_payload()
-        logger.info(f"🚀 Auto-generated payload at {datetime.utcnow().isoformat()}")
-        logger.info(json.dumps(payload, ensure_ascii=False))
+        logger.info(f"🚀 Payload {i+1}: {json.dumps(payload, ensure_ascii=False)}")
         await push_to_tb(payload)
-        await asyncio.sleep(interval_sec)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(auto_send_loop(interval_sec=300))
-
-@app.get("/")
-def root():
-    return {"status": "running"}
-
-@app.get("/last-push")
-def last_push():
-    """Return last push status for debugging (no secrets)."""
-    return _last_push
+        await asyncio.sleep(0.2)  # small delay để không bị rate limit
 
 if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"Starting server on 0.0.0.0:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    asyncio.run(push_10_payloads_quick())
+    logger.info("✅ Quick test finished. Check ThingsBoard Latest Telemetry.")
