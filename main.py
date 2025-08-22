@@ -1,119 +1,170 @@
 import os
-import logging
+import json
+import requests
 import httpx
 from fastapi import FastAPI, Request
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ------------------------
-# Config
-# ------------------------
-THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN", "sgkxcrqntuki8gu1oj8u")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCdF-cPhDw9Mn83F-or_26TTBq0UYGcYUI")
-OWM_API_KEY = os.getenv("OWM_API_KEY", "a53f443795604c41b72305c1806784db")
+# ================== CONFIG ==================
+TB_BASE_URL = "https://thingsboard.cloud"
+TB_DEVICE_TOKEN = os.getenv("TB_DEMO_TOKEN", "")
+OWM_API_KEY = os.getenv("OWM_API_KEY", "")
 
-THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
-OWM_URL = f"http://api.openweathermap.org/data/2.5/weather?q=Ho%20Chi%20Minh,vn&appid={OWM_API_KEY}&units=metric&lang=vi"
+# AI API keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# FastAPI app
+app = FastAPI()
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-app = FastAPI(title="AgriBot AI Service")
-
-
-# ------------------------
-# Gọi Gemini AI
-# ------------------------
-async def generate_advice(prompt: str) -> str:
+# =============== WEATHER ====================
+def get_weather(location: str):
+    """Fetch weather forecast from OpenWeatherMap"""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            payload = {
-                "contents": [{
-                    "parts": [{"text": f"Bạn là chuyên gia nông nghiệp. Hãy trả lời ngắn gọn, dễ hiểu.\n\nCâu hỏi: {prompt}"}]
-                }]
-            }
-            resp = await client.post(GEMINI_URL, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        logging.error(f"Gemini API error: {e}")
-        return "Xin lỗi, hệ thống AI hiện không khả dụng. Vui lòng thử lại sau."
+        url = f"http://api.openweathermap.org/data/2.5/forecast"
+        params = {"q": location, "appid": OWM_API_KEY, "units": "metric", "lang": "vi"}
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
 
+        if "list" not in data:
+            return {}
 
-# ------------------------
-# Lấy thời tiết từ OpenWeatherMap
-# ------------------------
-async def get_weather():
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(OWM_URL)
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "temperature": data["main"]["temp"],
-                "humidity": data["main"]["humidity"],
-                "weather_desc": data["weather"][0]["description"]
-            }
+        forecast = {}
+        for i in range(7):  # 7 hours ahead
+            hour = data["list"][i]
+            forecast[f"hour_{i}_temperature"] = hour["main"]["temp"]
+            forecast[f"hour_{i}_humidity"] = hour["main"]["humidity"]
+            forecast[f"hour_{i}_weather_desc"] = hour["weather"][0]["description"]
+
+        # Today / Tomorrow summary
+        forecast["temperature"] = data["list"][0]["main"]["temp"]
+        forecast["humidity"] = data["list"][0]["main"]["humidity"]
+        forecast["weather_today_desc"] = data["list"][0]["weather"][0]["description"]
+
+        return forecast
     except Exception as e:
-        logging.error(f"Weather API error: {e}")
+        print("Weather error:", e)
         return {}
 
+# =============== AI CLIENT ==================
+async def ask_ai(question: str, crop: str, location: str, weather: dict) -> str:
+    """Query AI API to generate advice"""
+    prompt = f"""
+Bạn là chuyên gia nông nghiệp.
+Người dùng hỏi: {question}
+Cây trồng: {crop}
+Địa điểm: {location}
+Thời tiết: {json.dumps(weather, ensure_ascii=False)}
 
-# ------------------------
-# Gửi dữ liệu lên ThingsBoard
-# ------------------------
-async def push_to_thingsboard(payload: dict):
+→ Hãy đưa ra 1 đoạn lời khuyên duy nhất, súc tích, dễ hiểu.
+"""
+
+    # 1. Try OpenAI
+    if OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print("OpenAI error:", e)
+
+    # 2. Try OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "HTTP-Referer": "https://github.com/Edcjcj216/agri-bot",
+                        "X-Title": "Agri-Bot",
+                    },
+                    json={
+                        "model": "openai/gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print("OpenRouter error:", e)
+
+    # 3. Try Gemini
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}",
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                )
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            print("Gemini error:", e)
+
+    # 4. Try Hugging Face
+    if HUGGINGFACE_API_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
+                    headers={"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"},
+                    json={"inputs": prompt},
+                )
+                return r.json()[0]["generated_text"].strip()
+        except Exception as e:
+            print("HuggingFace error:", e)
+
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau."
+
+# =============== THINGSBOARD =================
+def push_telemetry(payload: dict):
+    url = f"{TB_BASE_URL}/api/v1/{TB_DEVICE_TOKEN}/telemetry"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(THINGSBOARD_URL, json=payload)
-            resp.raise_for_status()
-            logging.info(f"✅ Sent to ThingsBoard: {payload}")
+        res = requests.post(url, json=payload, timeout=10)
+        print("TB Push:", res.status_code, payload)
     except Exception as e:
-        logging.error(f"❌ Failed to send to ThingsBoard: {e}")
+        print("TB error:", e)
 
-
-# ------------------------
-# Endpoint nhận Shared Attributes từ ThingsBoard
-# ------------------------
+# =============== HANDLERS ====================
 @app.post("/webhook")
-async def webhook_handler(request: Request):
-    data = await request.json()
-    logging.info(f"📩 Received from TB: {data}")
+async def tb_webhook(req: Request):
+    """Receive shared attributes from ThingsBoard"""
+    data = await req.json()
+    print("Webhook data:", data)
 
-    try:
-        shared_attrs = data.get("shared", {})
-        if not shared_attrs:
-            return {"status": "no shared attributes"}
+    shared = data.get("shared", {})
+    question = shared.get("hoi", "Tư vấn nông nghiệp")
+    crop = shared.get("crop", "rau muống")
+    location = shared.get("location", "Hồ Chí Minh")
 
-        # Lấy câu hỏi từ key "hoi"
-        question = shared_attrs.get("hoi", "Làm nông thế nào?")
-        logging.info(f"👉 Question: {question}")
+    # Lấy thời tiết
+    weather = get_weather(location)
 
-        # Gọi AI
-        advice = await generate_advice(question)
+    # Gọi AI
+    advice = await ask_ai(question, crop, location, weather)
 
-        # Lấy thời tiết
-        weather = await get_weather()
+    # Push duy nhất advice_text
+    push_telemetry({"advice_text": advice, **weather})
 
-        # Push lên ThingsBoard
-        payload = {
-            "advice_text": advice,
-            "question": question
-        }
-        if weather:
-            payload.update(weather)
+    return {"status": "ok", "advice_text": advice}
 
-        await push_to_thingsboard(payload)
+# Auto push ping để tránh timeout
+def auto_ping():
+    push_telemetry({"advice_text": "Ping: server đang hoạt động."})
 
-        return {"status": "ok", "advice": advice, "weather": weather}
+scheduler.add_job(auto_ping, "interval", minutes=5)
 
-    except Exception as e:
-        logging.error(f"Error in webhook handler: {e}")
-        return {"status": "error", "msg": str(e)}
-
-
-# ------------------------
-# Root test
-# ------------------------
-@app.get("/")
-async def root():
-    return {"msg": "AgriBot AI Service running 🚀"}
+# Run local
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
