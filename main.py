@@ -69,23 +69,23 @@ def get_weather_forecast():
 
         # Hôm qua
         weather_yesterday = {
-            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
-            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
-            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily and len(daily.get("weathercode", []))>0 else "?",
+            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily and len(daily.get("temperature_2m_max", []))>0 else 0,
+            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily and len(daily.get("temperature_2m_min", []))>0 else 0,
             "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
         }
         # Hôm nay
         weather_today = {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
-            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
-            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily and len(daily.get("weathercode", []))>1 else "?",
+            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily and len(daily.get("temperature_2m_max", []))>1 else 0,
+            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily and len(daily.get("temperature_2m_min", []))>1 else 0,
             "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
         }
         # Ngày mai
         weather_tomorrow = {
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
-            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
-            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily and len(daily.get("weathercode", []))>2 else "?",
+            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily and len(daily.get("temperature_2m_max", []))>2 else 0,
+            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily and len(daily.get("temperature_2m_min", []))>2 else 0,
             "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
         }
 
@@ -136,13 +136,32 @@ def get_advice(temp, humi):
     }
 
 # ================== THINGSBOARD ==================
-def send_to_thingsboard(data: dict):
+def send_to_thingsboard(data: dict) -> bool:
+    """
+    Gửi data (object JSON) đến ThingsBoard.
+    Trả về True nếu 200/204, False nếu lỗi.
+    """
     try:
-        logger.info(f"TB ▶ {json.dumps(data, ensure_ascii=False)}")
-        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
-        logger.info(f"TB ◀ {r.status_code}")
-    except Exception as e:
-        logger.error(f"ThingsBoard push error: {e}")
+        # Log payload (không in token)
+        logger.info("TB ▶ %s", json.dumps(data, ensure_ascii=False))
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(TB_DEVICE_URL, json=data, headers=headers, timeout=10)
+        # Log response code và body để debug (r.text có thể cho biết lỗi)
+        logger.info("TB ◀ status=%s body=%s", r.status_code, (r.text[:1000] if r.text else ""))
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        resp_text = ""
+        try:
+            resp_text = e.response.text if e.response is not None else ""
+        except Exception:
+            resp_text = ""
+        logger.error("ThingsBoard push error: %s - resp: %s", e, resp_text)
+        # Nếu 401/403: token sai hoặc bị thu hồi -> nên regen token
+        if hasattr(e, "response") and e.response is not None:
+            if e.response.status_code in (401, 403):
+                logger.error("HTTP %s from ThingsBoard — kiểm tra TB_DEMO_TOKEN / Device Credentials", e.response.status_code)
+        return False
 
 # ================== ROUTES ==================
 @app.get("/")
@@ -151,7 +170,7 @@ def root():
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ {data.dict()}")
+    logger.info("ESP32 ▶ %s", data.dict())
     advice_data = get_advice(data.temperature,data.humidity)
     weather_data = get_weather_forecast()
     merged = {
@@ -161,8 +180,21 @@ def receive_data(data: SensorData):
         "location":"An Phú, Hồ Chí Minh",
         "crop":"Rau muống"
     }
-    send_to_thingsboard(merged)
-    return {"received": data.dict(), "pushed": merged}
+    ok = send_to_thingsboard(merged)
+    return {"received": data.dict(), "pushed": merged if ok else None, "ok": ok}
+
+@app.get("/tb-test")
+def tb_test():
+    """
+    Endpoint để test trực tiếp từ server (không cần ESP32).
+    Gửi payload mẫu và trả về kết quả.
+    """
+    sample = {"temperature": 25.5, "humidity": 60.0, "note": "tb-test"}
+    weather_data = get_weather_forecast()
+    advice_data = get_advice(sample["temperature"], sample["humidity"])
+    merged = {**sample, **advice_data, **weather_data, "location":"Test"}
+    ok = send_to_thingsboard(merged)
+    return {"ok": ok, "payload": merged}
 
 # ================== AUTO LOOP ==================
 async def auto_loop():
