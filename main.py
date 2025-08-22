@@ -130,12 +130,13 @@ async def call_openai_answer(question: str) -> str:
     if not OPENAI_API_KEY or not _HAS_OPENAI:
         raise RuntimeError("OpenAI not configured or client missing")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    # build prompt using concatenation to avoid unterminated f-string issues
     prompt = (
         "Bạn là một chuyên gia nông nghiệp/toàn diện. Trả lời NGẮN GỌN, rõ ràng, bằng tiếng Việt, "
         "với phong cách tự nhiên, hữu ích, không liệt kê nội dung có sẵn. "
-        f"Câu hỏi: {question}
+        + f"Câu hỏi: {question}
 "
-        "Trả lời giữ trong giới hạn 2-6 câu, tránh mở rộng quá dài."
+        + "Trả lời giữ trong giới hạn 2-6 câu, tránh mở rộng quá dài."
     )
     resp = await client.chat.completions.create(
         model=OPENAI_MODEL,
