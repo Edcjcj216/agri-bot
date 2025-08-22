@@ -5,18 +5,18 @@ import requests
 import httpx
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
 TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
-
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+OWM_KEY = os.getenv("OWM_API_KEY")  # OpenWeatherMap API key (optional)
 
-OWM_KEY = os.getenv("OWM_API_KEY")  # để nguyên phần thời tiết
-
+# để nguyên phần thời tiết
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 scheduler = BackgroundScheduler()
@@ -91,6 +91,72 @@ async def get_ai_advice(prompt: str) -> str:
             logging.warning(f"AI provider failed: {e}")
     return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau hoặc cấu hình API key."
 
+# ============= WEATHER (Next 6 hours) ==============
+async def get_hourly_forecast(location: str, hours: int = 6):
+    """
+    Trả về danh sách forecast trong `hours` giờ tới.
+    Mỗi item: {"hours_ahead": n, "time": "HH:MM dd-mm", "temp_c": X, "desc": "..."}
+    Nếu không có OWM_KEY hoặc lỗi, trả về [].
+    """
+    if not OWM_KEY:
+        logging.info("OWM_KEY not configured — skipping weather forecast.")
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # 1) Geocoding: lấy lat/lon từ tên địa điểm (limit=1)
+            geo_url = "http://api.openweathermap.org/geo/1.0/direct"
+            geo_params = {"q": location, "limit": 1, "appid": OWM_KEY}
+            geo_r = await client.get(geo_url, params=geo_params)
+            geo_r.raise_for_status()
+            geo_data = geo_r.json()
+            if not geo_data:
+                logging.warning(f"Geocoding không tìm thấy toạ độ cho '{location}'")
+                return []
+
+            lat = geo_data[0]["lat"]
+            lon = geo_data[0]["lon"]
+
+            # 2) One Call API để lấy hourly
+            onecall_url = "https://api.openweathermap.org/data/2.5/onecall"
+            oc_params = {
+                "lat": lat,
+                "lon": lon,
+                "exclude": "minutely,daily,alerts",
+                "appid": OWM_KEY,
+                "units": "metric",
+            }
+            oc_r = await client.get(onecall_url, params=oc_params)
+            oc_r.raise_for_status()
+            oc = oc_r.json()
+
+            hourly = oc.get("hourly", [])
+            timezone_offset = oc.get("timezone_offset", 0)  # seconds
+
+            result = []
+            for i in range(min(hours, len(hourly))):
+                h = hourly[i]
+                dt_unix = h.get("dt")
+                # convert to local time with timezone_offset
+                local_dt = datetime.utcfromtimestamp(dt_unix + timezone_offset)
+                time_str = local_dt.strftime("%H:%M %d-%m")
+                temp_c = h.get("temp")
+                weather_desc = ""
+                if h.get("weather"):
+                    weather_desc = h["weather"][0].get("description", "")
+                result.append({
+                    "hours_ahead": i + 1,
+                    "time": time_str,
+                    "temp_c": temp_c,
+                    "desc": weather_desc
+                })
+
+            return result
+
+    except Exception as e:
+        logging.error(f"Lỗi khi lấy forecast từ OWM: {e}")
+        return []
+
 # ============= THINGSBOARD ==============
 def push_to_tb(data: dict):
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
@@ -116,14 +182,35 @@ async def tb_webhook(req: Request):
     Người dùng hỏi: {hoi}
     Cây trồng: {crop}
     Vị trí: {location}
-
-    Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-    Chỉ cần đưa ra 1 đoạn văn duy nhất.
+    Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. Chỉ cần đưa ra 1 đoạn văn duy nhất.
     """
 
     advice_text = await get_ai_advice(prompt)
-    push_to_tb({"advice_text": advice_text})
-    return {"status": "ok", "advice_text": advice_text}
+
+    # Lấy forecast 6 giờ tiếp theo (nếu có)
+    forecast = await get_hourly_forecast(location, hours=6)
+
+    # Chuẩn bị payload để push lên ThingsBoard
+    payload = {"advice_text": advice_text}
+
+    # Thêm các trường '1_gio_tiep_theo', '2_gio_tiep_theo', ...
+    # format: "HH:MM dd-mm — 29.3°C — nhẹ mưa"
+    for item in forecast:
+        n = item["hours_ahead"]
+        key = f"{n}_gio_tiep_theo"
+        friendly = f'{item["time"]} — {round(item["temp_c"],1)}°C'
+        if item.get("desc"):
+            friendly += f' — {item["desc"]}'
+        payload[key] = friendly
+
+    # Nếu muốn đẩy cả danh sách chi tiết, có thể thêm:
+    if forecast:
+        payload["hourly_forecast"] = forecast
+
+    push_to_tb(payload)
+
+    # Trả response cho ThingsBoard webhook caller
+    return {"status": "ok", "advice_text": advice_text, "forecast": forecast}
 
 @app.get("/")
 def root():
@@ -133,9 +220,3 @@ def root():
 @app.on_event("startup")
 def init():
     logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
-
-# ============= RENDER ENTRYPOINT ==============
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))  # Render cấp PORT động
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
