@@ -1,3 +1,4 @@
+# (START OF FILE)
 import os
 import time
 import json
@@ -335,8 +336,12 @@ def update_bias_and_correct(next_hours, observed_temp):
         except Exception:
             pass
 
-    diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
-    bias = round(sum(diffs) / len(diffs), 1) if diffs else 0.0
+    diffs = [obs - api for api, obs in bias_history if api is not None and obs are not None] if bias_history else []
+    # fallback safe compute
+    if diffs:
+        bias = round(sum(diffs) / len(diffs), 1)
+    else:
+        bias = 0.0
 
     for h in next_hours:
         if h.get("temperature") is not None:
@@ -579,14 +584,13 @@ def receive_data(data: SensorData):
     if OPENROUTER_API_KEY:
         try:
             system_prompt = (
-                "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: '
-                'advice' (string ngắn, tiếng Việt), 'priority' (low/medium/high), 'actions' (mảng string các hành động cụ thể), '
-                "'reason'" "(giải thích ngắn). KHÔNG kèm văn bản khác."
+                "Bạn là một chuyên gia nông nghiệp và dự báo thời tiết. Trả về CHỈ MỘT đối tượng JSON ngắn gọn với các trường: "
+                "advice (string ngắn, tiếng Việt), priority (low/medium/high), actions (mảng string các hành động cụ thể), "
+                "reason (giải thích ngắn). KHÔNG kèm văn bản khác."
             )
             user_prompt = (
                 f"Observed: temp={data.temperature}C, hum={data.humidity}%. Bias={bias}. "
-                f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}
-Return JSON only."
+                f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}. Return JSON only."
             )
             resp_text = call_openrouter_llm(system_prompt, user_prompt)
             try:
@@ -654,11 +658,13 @@ async def auto_loop():
             if OPENROUTER_API_KEY:
                 try:
                     system_prompt = (
-                        "Bạn là một chuyên gia nông nghiệp. Trả về CHỈ MỘT JSON ngắn gọn: '
-                        'advice', 'priority', 'actions', 'reason'. Return JSON only."
+                        "Bạn là một chuyên gia nông nghiệp. Trả về CHỈ MỘT JSON ngắn gọn gồm: "
+                        "advice, priority, actions, reason. Return JSON only."
                     )
-                    user_prompt = f"Auto-sim sample: temp={sample['temperature']}C, hum={sample['humidity']}%. Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}
-Return JSON only."
+                    user_prompt = (
+                        f"Auto-sim sample: temp={sample['temperature']}C, hum={sample['humidity']}%. "
+                        f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}. Return JSON only."
+                    )
                     resp_text = call_openrouter_llm(system_prompt, user_prompt)
                     try:
                         llm_json = extract_json_like(resp_text)
@@ -695,3 +701,4 @@ async def startup():
 # - To enable LLM (Gemini via OpenRouter), set OPENROUTER_API_KEY in your Render environment.
 # - This version persists bias history in SQLite (BIAS_DB_FILE) and only calls LLM after
 #   LLM_CALL_MIN_HISTORY samples to reduce cost.
+# (END OF FILE)
