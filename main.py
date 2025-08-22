@@ -1,4 +1,3 @@
-# main.py
 import os
 import json
 import logging
@@ -16,56 +15,58 @@ logger = logging.getLogger("agri-bot")
 app = FastAPI()
 
 # ---------- Config (env-friendly) ----------
-SEND_INTERVAL = int(os.getenv("SEND_INTERVAL_SECONDS", 300))  # default 300s (5 phút)
+SEND_INTERVAL = int(os.getenv("SEND_INTERVAL_SECONDS", 300))  # default 300s (5 minutes)
 TB_TOKEN = os.getenv("TB_TOKEN")  # Render Secret (optional)
 PORT = int(os.getenv("PORT", 10000))
-APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL")  # optional, not required
 
 if TB_TOKEN:
     logger.info("TB_TOKEN present — will push advice_text to ThingsBoard.")
 else:
-    # no warning-level noise if not configured
+    # do not spam warning; use info so logs are cleaner
     logger.info("TB_TOKEN not set — running in local/demo mode (no push to ThingsBoard).")
+
+# ---------- Last push status (for /last-push) ----------
+_last_push = {"ok": False, "status": None, "body": None, "time": None}
 
 # ---------- Helper: generate advice_text ----------
 def make_advice_text(shared: dict) -> str:
-    # simple deterministic advice text generator — replace with real AI logic if needed
     crop = shared.get("crop", "unknown")
     hoi = shared.get("hoi", "")
+    # Simple deterministic advice placeholder — replace with real AI logic if needed
     return f"AI advice placeholder for crop {crop} — question: {hoi}"
 
-# ---------- ThingsBoard push ----------
+# ---------- ThingsBoard push (detailed logging) ----------
 async def push_to_thingsboard(payload: dict):
-    """
-    Push only advice_text (single key) to ThingsBoard telemetry.
-    If TB_TOKEN not set, function returns silently after logging info.
-    """
+    global _last_push
     if not TB_TOKEN:
+        _last_push.update({"ok": False, "status": "no_token", "body": None, "time": datetime.utcnow().isoformat()})
+        logger.info("TB_TOKEN not set — skipping push to ThingsBoard.")
         return
 
     url = f"https://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
-    # ThingsBoard prefers timestamp in ms under _ts
     payload["_ts"] = int(datetime.utcnow().timestamp() * 1000)
+
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(url, json=payload, timeout=10)
-            resp.raise_for_status()
-            logger.info(f"✅ Sent to ThingsBoard: {payload}")
+            text = resp.text
+            status = resp.status_code
+            if 200 <= status < 300:
+                logger.info(f"✅ Sent to ThingsBoard ({status}): {payload}")
+                _last_push.update({"ok": True, "status": status, "body": text, "time": datetime.utcnow().isoformat()})
+            else:
+                logger.warning(f"❌ TB push failed ({status}): {text}")
+                _last_push.update({"ok": False, "status": status, "body": text, "time": datetime.utcnow().isoformat()})
         except Exception as e:
-            # keep this as warning/error so operator can see actual push failures
-            logger.warning(f"❌ Failed to push to ThingsBoard: {e}")
+            logger.exception(f"❌ Exception pushing to ThingsBoard: {e}")
+            _last_push.update({"ok": False, "status": "exception", "body": str(e), "time": datetime.utcnow().isoformat()})
 
 # ---------- FastAPI endpoints ----------
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
-    """
-    Accept external payloads (e.g., from a device or external script).
-    We compute advice_text and (if configured) push advice_text to ThingsBoard.
-    """
     try:
         body = await req.json()
     except Exception:
-        # fallback if body not JSON
         body = {}
 
     logger.info("📩 Received external payload:")
@@ -83,7 +84,12 @@ async def tb_webhook(req: Request):
 def root():
     return {"status": "running"}
 
-# ---------- Auto-send task (DIRECT CALL, no internal HTTP) ----------
+@app.get("/last-push")
+def last_push():
+    """Return last push status for debugging."""
+    return _last_push
+
+# ---------- Auto-send task (direct call, no internal HTTP) ----------
 def generate_payload():
     crops = ["rau muống", "cà chua", "lúa"]
     questions = ["cách trồng rau muống", "tưới nước cho cà chua", "bón phân cho lúa"]
@@ -96,24 +102,19 @@ def generate_payload():
     }
 
 async def auto_send_loop():
-    """
-    Instead of doing an HTTP POST to our own /tb-webhook (which caused connection failures),
-    we call the handler logic directly: generate payload -> compute advice_text -> push to TB.
-    """
     logger.info("🚀 Auto-send loop started (direct calls). Interval: %s seconds", SEND_INTERVAL)
     while True:
         payload = generate_payload()
         shared = payload.get("shared", {})
         advice_text = make_advice_text(shared)
 
-        # log locally
         logger.info("🚀 Auto-generated payload at %s", datetime.utcnow().isoformat())
         logger.info(json.dumps(payload, ensure_ascii=False))
 
         # push only advice_text
         await push_to_thingsboard({"advice_text": advice_text})
 
-        # Also log the advice locally
+        # local log
         logger.info("AI advice: %s", advice_text)
 
         await asyncio.sleep(SEND_INTERVAL)
