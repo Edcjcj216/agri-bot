@@ -3,15 +3,17 @@
 main.py
 
 FastAPI app to receive ThingsBoard Shared Attributes (e.g. key "hoi": "cách trồng rau muống"),
-call an LLM (OpenRouter / OpenAI / HuggingFace / Gemini) to answer *any* question dynamically
+call an LLM (OpenAI / HuggingFace / Gemini) to answer *any* question dynamically
 (in Vietnamese, natural-sounding), and push the answer back to ThingsBoard as telemetry.
 
+OpenRouter has been removed from this version per your request.
+
 - All API keys are read from environment variables (do NOT hardcode keys).
-- Weather code kept intact for you to edit later.
+- Weather code kept minimal for you to edit later.
 
 Environment variables used (examples):
-  TB_DEMO_TOKEN, OPENROUTER_API_KEY, OPENAI_API_KEY, HUGGINGFACE_API_TOKEN, GEMINI_API_KEY,
-  PREFERRED_AI (auto/openrouter/openai/huggingface/gemini)
+  TB_DEMO_TOKEN, OPENAI_API_KEY, HUGGINGFACE_API_TOKEN, GEMINI_API_KEY,
+  PREFERRED_AI (auto/openai/huggingface/gemini)
 
 Deploy: set env vars on Render and deploy this repo. Do not commit secrets.
 """
@@ -52,12 +54,10 @@ LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "300"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-PREFERRED_AI = os.getenv("PREFERRED_AI", "auto").lower()  # auto/openrouter/openai/huggingface/gemini
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+PREFERRED_AI = os.getenv("PREFERRED_AI", "auto").lower()  # auto/openai/huggingface/gemini
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "gpt2")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-mini")
@@ -133,7 +133,8 @@ async def call_openai_answer(question: str) -> str:
     prompt = (
         "Bạn là một chuyên gia nông nghiệp/toàn diện. Trả lời NGẮN GỌN, rõ ràng, bằng tiếng Việt, "
         "với phong cách tự nhiên, hữu ích, không liệt kê nội dung có sẵn. "
-        f"Câu hỏi: {question}\n"
+        f"Câu hỏi: {question}
+"
         "Trả lời giữ trong giới hạn 2-6 câu, tránh mở rộng quá dài."
     )
     resp = await client.chat.completions.create(
@@ -147,26 +148,6 @@ async def call_openai_answer(question: str) -> str:
     except Exception:
         text = getattr(resp, "text", str(resp))
     return text.strip()
-
-async def call_openrouter_answer(question: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OpenRouter key missing")
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type":"application/json"}
-    prompt = (
-        "Bạn là một chuyên gia nông nghiệp/toàn diện. Trả lời NGẮN GỌN, rõ ràng, bằng tiếng Việt, "
-        "với phong cách tự nhiên, hữu ích."
-        f"Câu hỏi: {question}"
-    )
-    payload = {"model": OPENROUTER_MODEL, "messages": [{"role":"user","content":prompt}], "temperature":0.3, "max_tokens":400}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return json.dumps(data, ensure_ascii=False)
 
 async def call_hf_answer(question: str) -> str:
     if not HUGGINGFACE_API_TOKEN:
@@ -200,15 +181,13 @@ async def ai_answer_question(question: str) -> str:
     """Try providers in order and return the first successful answer. Fallback to friendly message or rule-based if none available."""
     order = []
     if PREFERRED_AI == "auto":
-        order = ["openrouter","openai","gemini","huggingface"]
+        order = ["openai","gemini","huggingface"]
     else:
-        order = [PREFERRED_AI] + [p for p in ["openrouter","openai","gemini","huggingface"] if p != PREFERRED_AI]
+        order = [PREFERRED_AI] + [p for p in ["openai","gemini","huggingface"] if p != PREFERRED_AI]
 
     errors = []
     for provider in order:
         try:
-            if provider == "openrouter" and OPENROUTER_API_KEY:
-                return await call_openrouter_answer(question)
             if provider == "openai" and OPENAI_API_KEY and _HAS_OPENAI:
                 return await call_openai_answer(question)
             if provider == "gemini" and GEMINI_API_KEY and _HAS_GEMINI:
@@ -227,7 +206,7 @@ async def ai_answer_question(question: str) -> str:
                 "Vui lòng thử lại sau hoặc cấu hình API key. Nếu cần, hệ thống sẽ cung cấp lời khuyên cơ bản.")
 
     # final fallback (no providers configured)
-    return "Chưa có API AI nào được cấu hình. Vui lòng đặt OPENAI_API_KEY hoặc HUGGINGFACE_API_TOKEN hoặc OPENROUTER_API_KEY"
+    return "Chưa có API AI nào được cấu hình. Vui lòng đặt OPENAI_API_KEY hoặc HUGGINGFACE_API_TOKEN hoặc GEMINI_API_KEY"
 
 # ================ ThingsBoard telemetry push (async) ================
 async def send_to_thingsboard(data: dict):
@@ -242,7 +221,7 @@ async def send_to_thingsboard(data: dict):
 # ================ ROUTES ================
 @app.get("/")
 async def root():
-    return {"status":"running","ai": {"preferred": PREFERRED_AI, "openrouter": bool(OPENROUTER_API_KEY), "openai": bool(OPENAI_API_KEY and _HAS_OPENAI), "hf": bool(HUGGINGFACE_API_TOKEN), "gemini": bool(GEMINI_API_KEY and _HAS_GEMINI)}}
+    return {"status":"running","ai": {"preferred": PREFERRED_AI, "openai": bool(OPENAI_API_KEY and _HAS_OPENAI), "hf": bool(HUGGINGFACE_API_TOKEN), "gemini": bool(GEMINI_API_KEY and _HAS_GEMINI)}}
 
 @app.post("/esp32-data")
 async def receive_data(data: SensorData):
