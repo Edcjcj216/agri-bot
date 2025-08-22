@@ -366,8 +366,9 @@ def update_bias_and_correct(next_hours, observed_temp):
 # ================== LLM (OpenRouter / Gemini) INTEGRATION ==================
 
 def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_MODEL, max_tokens: int = 400, temperature: float = 0.0):
+    """Call OpenRouter and return a dict with detailed result for robust handling."""
     if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured in environment")
+        return {"ok": False, "error": "OPENROUTER_API_KEY_not_set"}
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -384,16 +385,35 @@ def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_M
         "temperature": temperature
     }
 
-    r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=20)
+    except Exception as e:
+        logger.warning(f"LLM network error: {e}")
+        return {"ok": False, "error": "network_error", "detail": str(e)}
+
+    status = r.status_code
+    body_text = ""
+    try:
+        body_text = r.text
+    except Exception:
+        body_text = "<unreadable body>"
+
+    if status != 200:
+        logger.warning(f"LLM HTTP {status}: {body_text[:1000]}")
+        return {"ok": False, "error": "http_error", "status": status, "body": body_text}
+
+    try:
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"LLM returned non-JSON: {e}; body: {body_text[:2000]}")
+        return {"ok": False, "error": "non_json_response", "status": status, "body": body_text}
 
     try:
         content = data["choices"][0]["message"]["content"]
     except Exception:
         content = json.dumps(data)
-    return content
 
+    return {"ok": True, "content": content, "raw": data}
 
 def extract_json_like(text: str):
     if not text:
@@ -604,26 +624,34 @@ def receive_data(data: SensorData):
                 f"Observed: temp={data.temperature}C, hum={data.humidity}%. Bias={bias}. "
                 f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}. Return JSON only."
             )
-            resp_text = call_openrouter_llm(system_prompt, user_prompt)
-            try:
-                llm_json = extract_json_like(resp_text)
-                llm_advice = llm_json
-                # If LLM returned structured advice, prefer it (but don't remove original keys)
-                if isinstance(llm_json, dict):
-                    if llm_json.get("advice"):
-                        merged["advice"] = llm_json.get("advice")
-                    # map optional fields into existing telemetry keys when sensible
-                    if llm_json.get("actions"):
-                        # join actions into advice_care for visibility (keeps existing key names)
-                        merged["advice_care"] = " | ".join(llm_json.get("actions"))
-                    if llm_json.get("priority"):
-                        merged["advice_note"] = f"priority: {llm_json.get('priority')}"
-            except Exception:
-                # LLM returned non-JSON; store raw text
-                llm_advice = {"raw": resp_text}
+
+            resp = call_openrouter_llm(system_prompt, user_prompt)
+            if not resp.get("ok"):
+                # store detailed error info for telemetry + log
+                llm_advice = {
+                    "error": resp.get("error"),
+                    "status": resp.get("status"),
+                    "body": (resp.get("body") or resp.get("detail"))
+                }
+                logger.warning(f"LLM call failed detail: {llm_advice}")
+            else:
+                resp_text = resp.get("content")
+                try:
+                    llm_json = extract_json_like(resp_text)
+                    llm_advice = llm_json
+                    # If LLM returned structured advice, prefer it (but don't remove original keys)
+                    if isinstance(llm_json, dict):
+                        if llm_json.get("advice"):
+                            merged["advice"] = llm_json.get("advice")
+                        if llm_json.get("actions"):
+                            merged["advice_care"] = " | ".join(llm_json.get("actions"))
+                        if llm_json.get("priority"):
+                            merged["advice_note"] = f"priority: {llm_json.get('priority')}"
+                except Exception:
+                    # LLM returned non-JSON; store raw text
+                    llm_advice = {"raw": resp_text}
         except Exception as e:
-            logger.warning(f"LLM call failed: {e}")
-            # fallback: keep rule-based advice but record the error
+            logger.warning(f"LLM call unexpected error: {e}")
             llm_advice = {"error": "llm_failed", "reason": str(e)}
     else:
         logger.info("OPENROUTER_API_KEY not set; skipping LLM call (set env to enable)")
@@ -677,19 +705,29 @@ async def auto_loop():
                         f"Auto-sim sample: temp={sample['temperature']}C, hum={sample['humidity']}%. "
                         f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}. Return JSON only."
                     )
-                    resp_text = call_openrouter_llm(system_prompt, user_prompt)
-                    try:
-                        llm_json = extract_json_like(resp_text)
-                        llm_advice = llm_json
-                        if isinstance(llm_json, dict) and llm_json.get("advice"):
-                            merged["advice"] = llm_json.get("advice")
-                            if llm_json.get("actions"):
-                                merged["advice_care"] = " | ".join(llm_json.get("actions"))
-                    except Exception:
-                        llm_advice = {"raw": resp_text}
+
+                    resp = call_openrouter_llm(system_prompt, user_prompt)
+                    if not resp.get("ok"):
+                        llm_advice = {
+                            "error": resp.get("error"),
+                            "status": resp.get("status"),
+                            "body": (resp.get("body") or resp.get("detail"))
+                        }
+                        logger.warning(f"LLM call failed (auto-loop) detail: {llm_advice}")
+                    else:
+                        resp_text = resp.get("content")
+                        try:
+                            llm_json = extract_json_like(resp_text)
+                            llm_advice = llm_json
+                            if isinstance(llm_json, dict) and llm_json.get("advice"):
+                                merged["advice"] = llm_json.get("advice")
+                                if llm_json.get("actions"):
+                                    merged["advice_care"] = " | ".join(llm_json.get("actions"))
+                        except Exception:
+                            llm_advice = {"raw": resp_text}
                 except Exception as e:
                     logger.warning(f"LLM call failed in auto-loop: {e}")
-                    llm_advice = {"error": "llm_failed"}
+                    llm_advice = {"error": "llm_failed", "reason": str(e)}
             merged["llm_advice"] = llm_advice
 
             weather["next_hours"] = corrected_next_hours
