@@ -8,11 +8,10 @@ from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 from pathlib import Path
 import pprint
-import random
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN")  # Demo device token
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN")  # PHẢI là token DEMO device
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -24,6 +23,7 @@ app = FastAPI()
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# File tạm lưu payload ThingsBoard
 LOG_FILE = Path("/tmp/tb_payloads.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -82,7 +82,7 @@ async def get_ai_advice(prompt: str) -> str:
             return await fn(prompt)
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng."
+    return "Xin lỗi, hệ thống AI không khả dụng."
 
 # ================== THINGSBOARD ==================
 def push_to_tb(data: dict):
@@ -137,31 +137,7 @@ async def tb_webhook(req: Request):
 def root():
     return {"status": "running"}
 
-# ================== AUTO SIMULATE ESP32 PAYLOAD ==================
-def generate_fake_sensor():
-    return {
-        "shared": {
-            "hoi": random.choice([
-                "cách trồng rau muống",
-                "tưới nước cho cà chua",
-                "bón phân cho lúa"
-            ]),
-            "crop": random.choice(["rau muống", "cà chua", "lúa"]),
-            "location": "Hồ Chí Minh",
-            "temperature": round(random.uniform(24, 32), 1),
-            "humidity": round(random.uniform(60, 90), 1),
-            "battery": round(random.uniform(3.5, 4.2), 2)
-        }
-    }
-
-def send_fake_payload():
-    payload = generate_fake_sensor()
-    logging.info("📤 Auto-sending fake ESP32 payload:")
-    logging.info(pprint.pformat(payload, width=120))
-    log_payload_to_file(payload)
-    try:
-        requests.post(f"http://localhost:10000/tb-webhook", json=payload, timeout=10)
-    except Exception as e:
-        logging.error(f"❌ Failed auto-send payload: {e}")
-
-scheduler.add_job(send_fake_payload, "interval", minutes=5)
+@app.on_event("startup")
+def init():
+    logging.info("🚀 Agri-Bot AI debug mode started, waiting for ThingsBoard...")
+    logging.info(f"📂 Payload log file: {LOG_FILE}")
