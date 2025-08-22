@@ -133,3 +133,9 @@ def root():
 @app.on_event("startup")
 def init():
     logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
+
+# ============= RENDER ENTRYPOINT ==============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))  # Render cấp PORT động
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
