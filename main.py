@@ -11,7 +11,7 @@ import pprint
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN")  # phải là token device thật
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -35,11 +35,7 @@ async def ask_openai(prompt: str) -> str:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 200},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -50,16 +46,8 @@ async def ask_openrouter(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "HTTP-Referer": "https://github.com/your/repo",
-                "X-Title": "Agri-Bot",
-            },
-            json={
-                "model": "openai/gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "HTTP-Referer": "https://github.com/your/repo", "X-Title": "Agri-Bot"},
+            json={"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 200},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -94,11 +82,15 @@ async def get_ai_advice(prompt: str) -> str:
             return await fn(prompt)
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau hoặc cấu hình API key."
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng."
 
 # ================== THINGSBOARD ==================
 def push_to_tb(data: dict):
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+    tb_token = os.getenv("TB_DEMO_TOKEN")
+    if not tb_token:
+        logging.error("❌ ThingsBoard token chưa được cấu hình!")
+        return
+    url = f"{TB_URL}/{tb_token}/telemetry"
     data["_ts"] = int(datetime.utcnow().timestamp() * 1000)
     try:
         r = requests.post(url, json=data, timeout=10)
@@ -108,7 +100,6 @@ def push_to_tb(data: dict):
         logging.error(f"❌ Failed to push telemetry: {e}")
 
 def log_payload_to_file(payload: dict):
-    """Lưu payload ThingsBoard vào file tạm /tmp/tb_payloads.log"""
     timestamp = datetime.utcnow().isoformat()
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
@@ -119,28 +110,28 @@ def log_payload_to_file(payload: dict):
 # ================== ENDPOINTS ==================
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
-    body = await req.json()
-    logging.info("📩 Got TB webhook payload:")
-    logging.info(pprint.pformat(body, width=120))
-    log_payload_to_file(body)  # lưu payload vào file tạm
+    try:
+        body = await req.json()
+        logging.info("📩 Got TB webhook payload:")
+        logging.info(pprint.pformat(body, width=120))
+        log_payload_to_file(body)
 
-    shared = body.get("shared", {})
-    hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
-    crop = shared.get("crop", "cây trồng")
-    location = shared.get("location", "Hồ Chí Minh")
+        shared = body.get("shared", {})
+        hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
+        crop = shared.get("crop", "cây trồng")
+        location = shared.get("location", "Hồ Chí Minh")
 
-    prompt = f"""
-Người dùng hỏi: {hoi}
-Cây trồng: {crop}
-Vị trí: {location}
+        prompt = f"Người dùng hỏi: {hoi}\nCây trồng: {crop}\nVị trí: {location}\nHãy trả lời ngắn gọn, thực tế, dễ hiểu."
 
-Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-Chỉ cần đưa ra 1 đoạn văn duy nhất.
-"""
+        advice_text = await get_ai_advice(prompt)
 
-    advice_text = await get_ai_advice(prompt)
-    push_to_tb({"advice_text": advice_text})
-    return {"status": "ok", "advice_text": advice_text}
+        push_to_tb({"advice_text": advice_text})
+
+        return {"status": "ok", "advice_text": advice_text}
+
+    except Exception as e:
+        logging.error(f"❌ Error handling webhook: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
 
 @app.get("/")
 def root():
