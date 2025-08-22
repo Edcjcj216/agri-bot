@@ -11,7 +11,7 @@ import pprint
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN")  # phải là token device thật
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN")  # Phải là token device thật
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
