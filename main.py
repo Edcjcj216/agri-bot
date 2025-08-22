@@ -1,4 +1,3 @@
-# (START OF FILE)
 import os
 import time
 import json
@@ -35,8 +34,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-pro")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Only call LLM after we have at least this many history samples
-LLM_CALL_MIN_HISTORY = int(os.getenv("LLM_CALL_MIN_HISTORY", 3))
+# You can tune this if you want to require more history before LLM is meaningful
+LLM_CALL_MIN_HISTORY = int(os.getenv("LLM_CALL_MIN_HISTORY", 1))
 
 # Bias correction settings (kept in-memory and persisted in SQLite)
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
@@ -110,7 +109,10 @@ def init_db():
     except Exception as e:
         logger.warning(f"Failed to init bias DB: {e}")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def load_history_from_db():
@@ -128,7 +130,10 @@ def load_history_from_db():
     except Exception as e:
         logger.warning(f"Failed to load bias history from DB: {e}")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def insert_history_to_db(api_temp, observed_temp):
@@ -144,7 +149,10 @@ def insert_history_to_db(api_temp, observed_temp):
     except Exception as e:
         logger.warning(f"Failed to insert bias history to DB: {e}")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # -------------------------------------------------------------------------
 
@@ -336,8 +344,12 @@ def update_bias_and_correct(next_hours, observed_temp):
         except Exception:
             pass
 
-    diffs = [obs - api for api, obs in bias_history if api is not None and obs are not None] if bias_history else []
-    # fallback safe compute
+    # compute diffs safely
+    if bias_history:
+        diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
+    else:
+        diffs = []
+
     if diffs:
         bias = round(sum(diffs) / len(diffs), 1)
     else:
@@ -697,8 +709,6 @@ async def startup():
     asyncio.create_task(auto_loop())
 
 # ================== NOTES ==================
-# - Run with: uvicorn fastapi_thingsboard_persistent:app --reload
+# - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - To enable LLM (Gemini via OpenRouter), set OPENROUTER_API_KEY in your Render environment.
-# - This version persists bias history in SQLite (BIAS_DB_FILE) and only calls LLM after
-#   LLM_CALL_MIN_HISTORY samples to reduce cost.
-# (END OF FILE)
+# - This version persists bias history in SQLite (BIAS_DB_FILE) and calls LLM when OPENROUTER_API_KEY is set.
