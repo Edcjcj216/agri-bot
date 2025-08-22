@@ -147,17 +147,22 @@ def send_to_thingsboard(data: dict):
 
 # ================== HELPERS ==================
 def merge_weather_and_hours(existing_data=None):
-    """Merge weather forecast + current hour + 6 giờ tiếp theo"""
+    """Merge weather forecast + current hour + 4 giờ tiếp theo, làm tròn giờ theo phút >30"""
     if existing_data is None:
         existing_data = {}
     weather_data = get_weather_forecast()
-    # Giờ VN hiện tại
+
     now = datetime.now() + timedelta(hours=7)
-    hours_dict = {"current_hour": now.strftime("%H:%M")}
-    for i in range(1,7):
-        next_hour = now + timedelta(hours=i)
-        hours_dict[f"{i}_gio_tiep_theo"] = next_hour.strftime("%H:%M")
-    # Merge tất cả
+    # Làm tròn giờ
+    hour_rounded = now.hour + 1 if now.minute > 30 else now.hour
+    hour_rounded %= 24
+    hours_dict = {"hour_0": f"{hour_rounded:02d}:00"}
+
+    # 4 giờ tiếp theo
+    for i in range(1,5):
+        next_hour = (hour_rounded + i) % 24
+        hours_dict[f"hour_{i}"] = f"{next_hour:02d}:00"
+
     return {**existing_data, **weather_data, **hours_dict}
 
 # ================== ROUTES ==================
