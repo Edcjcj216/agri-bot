@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import json
@@ -511,7 +510,8 @@ def send_to_thingsboard(data: dict):
 def merge_weather_and_hours(existing_data=None):
     """
     Merge weather forecast into telemetry but DO NOT overwrite telemetry keys with None.
-    Only set keys when we have real values.
+    Use local rounded hour labels for hour_0..hour_6 so labels always reflect current local time,
+    while temperatures/humidities are taken from weather['next_hours'].
     """
     if existing_data is None:
         existing_data = {}
@@ -568,23 +568,23 @@ def merge_weather_and_hours(existing_data=None):
     if weather.get("humidity_yesterday") is not None:
         flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
 
-    # hours: set only when we have values
+    # Build hour labels from current local time (rounded): hour_0 is current rounded hour, hour_1 next hour, ...
+    # Rounding rule: if minute > 30 -> round up to next hour, else use current hour
+    hour_rounded = now.hour + 1 if now.minute > 30 else now.hour
+    hour_labels = []
+    for i in range(0, 7):
+        next_h = (hour_rounded + i) % 24
+        hour_labels.append(f"{next_h:02d}:00")
+
+    # hours: set label from hour_labels, set values (temp/hum/desc) from weather.next_hours if present
     for idx in range(0, 7):
+        # set time label from local rounding (always set)
+        flattened[f"hour_{idx}"] = hour_labels[idx]
+
         h = None
         if idx < len(weather.get("next_hours", [])):
             h = weather["next_hours"][idx]
 
-        # time label (hour_0, hour_1, ...)
-        if h and h.get("time"):
-            try:
-                t = datetime.fromisoformat(h.get("time"))
-                time_label = t.strftime("%H:%M")
-            except Exception:
-                time_label = h.get("time")
-            if time_label is not None:
-                flattened[f"hour_{idx}"] = time_label
-
-        # temperature, humidity, weather desc
         temp = h.get("temperature") if h else None
         hum = h.get("humidity") if h else None
         desc = h.get("weather_desc") if h else None
@@ -672,7 +672,6 @@ def receive_data(data: SensorData):
                 f"Observed: temp={data.temperature}C, hum={data.humidity}%. Bias={bias}. "
                 f"Corrected next_hours: {json.dumps(corrected_next_hours, ensure_ascii=False)}. Return JSON only."
             )
-
             resp = call_openrouter_llm(system_prompt, user_prompt)
             if not resp.get("ok"):
                 llm_advice = {
