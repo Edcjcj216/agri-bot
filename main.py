@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import requests
 import httpx
@@ -17,7 +16,6 @@ DEEPAI_KEY = os.getenv("DEEPAI_API_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
-OWM_KEY = os.getenv("OWM_API_KEY")  # nếu cần thời tiết
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
@@ -60,18 +58,14 @@ async def ask_openrouter(prompt: str) -> str:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
 
-async def ask_hf(prompt: str) -> str:
-    if not HF_KEY:
-        raise ValueError("Missing HUGGINGFACE_API_TOKEN")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
-            headers={"Authorization": f"Bearer {HF_KEY}"},
-            json={"inputs": prompt},
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data[0]["generated_text"].strip()
+async def ask_cohere(prompt: str) -> str:
+    if not cohere_client:
+        raise ValueError("Missing COHERE_API_KEY")
+    loop = asyncio.get_event_loop()
+    def call_cohere():
+        response = cohere_client.generate(model="xlarge", prompt=prompt, max_tokens=200)
+        return response.generations[0].text.strip()
+    return await loop.run_in_executor(None, call_cohere)
 
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_KEY:
@@ -84,15 +78,6 @@ async def ask_gemini(prompt: str) -> str:
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-async def ask_cohere(prompt: str) -> str:
-    if not cohere_client:
-        raise ValueError("Missing COHERE_API_KEY")
-    loop = asyncio.get_event_loop()
-    def call_cohere():
-        response = cohere_client.generate(model="xlarge", prompt=prompt, max_tokens=200)
-        return response.generations[0].text.strip()
-    return await loop.run_in_executor(None, call_cohere)
-
 async def ask_deepai(prompt: str) -> str:
     if not DEEPAI_KEY:
         raise ValueError("Missing DEEPAI_API_KEY")
@@ -102,20 +87,17 @@ async def ask_deepai(prompt: str) -> str:
             headers={"api-key": DEEPAI_KEY},
             data={"text": prompt},
         )
-        if r.status_code == 429:
-            await asyncio.sleep(60)
-            return await ask_deepai(prompt)
         r.raise_for_status()
         return r.json().get("output", "").strip()
 
 # ================== AI ADVICE FALLBACK ==================
 async def get_ai_advice(prompt: str) -> str:
-    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_hf, ask_cohere, ask_deepai]:
+    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_cohere, ask_deepai]:
         try:
             return await fn(prompt)
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau."
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng."
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
@@ -136,19 +118,18 @@ async def tb_webhook(req: Request):
     logging.info(f"📩 Got TB webhook: {body}")
     
     shared = body.get("shared", {})
-    hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
-    crop = shared.get("crop", "cây trồng")
-    location = shared.get("location", "Hồ Chí Minh")
+    hoi = shared.get("hoi", "")
+    crop = shared.get("crop", "")
+    location = shared.get("location", "")
     
     prompt = f"""
-    Người dùng hỏi: {hoi}
-    Cây trồng: {crop}
-    Vị trí: {location}
+Người dùng hỏi: {hoi}
+Cây trồng: {crop}
+Vị trí: {location}
 
-    Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-    Chỉ cần đưa ra 1 đoạn văn duy nhất.
-    """
-
+Hãy trả lời NGAY lập tức, ngắn gọn, thực tế, dễ hiểu cho nông dân. 
+Chỉ cần 1 đoạn văn duy nhất, KHÔNG hỏi lại hay yêu cầu thêm thông tin.
+"""
     advice_text = await get_ai_advice(prompt)
     push_to_tb({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
@@ -177,7 +158,6 @@ scheduler.add_job(scheduled_push, 'interval', minutes=5)
 @app.on_event("startup")
 async def init():
     logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
-    # Push 1 lần ngay khi start
     try:
         await scheduled_push_async()
     except Exception as e:
