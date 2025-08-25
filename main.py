@@ -7,7 +7,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tb-webhook")
 
-THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Access token của device
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")
 THINGSBOARD_URL = f"https://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
 
 app = FastAPI()
@@ -21,17 +21,31 @@ async def tb_webhook(request: Request):
     data = await request.json()
     logger.info(f"Webhook data: {data}")
 
-    question = data.get("hoi")
+    # Tìm "hoi" ở bất kỳ đâu trong payload
+    question = find_key(data, "hoi")
+
     if not question:
-        # không có key hoi
         await push_telemetry({"status": "no question"})
         return {"status": "no question"}
 
-    # ở đây thay bằng AI call thực tế nếu muốn
     advice_text = f"Trả lời: {question}"
-
     await push_telemetry({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
+
+def find_key(data, key):
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k == key:
+                return v
+            result = find_key(v, key)
+            if result is not None:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = find_key(item, key)
+            if result is not None:
+                return result
+    return None
 
 async def push_telemetry(payload: dict):
     async with httpx.AsyncClient() as client:
