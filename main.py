@@ -1,78 +1,92 @@
 import os
 import logging
-from fastapi import FastAPI, Request
-import httpx
 from datetime import datetime
+import httpx
+from fastapi import FastAPI, Request
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="INFO:tb-webhook:%(message)s")
 logger = logging.getLogger("tb-webhook")
 
 app = FastAPI()
 
-TB_URL = os.getenv("TB_URL", "https://thingsboard.cloud")
-DEVICE_TOKEN = os.getenv("DEVICE_TOKEN")   # lấy token TB device
-GEMINI_KEY = os.getenv("GEMINI_KEY")       # key Gemini API
+# Lấy token & API key từ environment (Render Env Vars)
+DEVICE_TOKEN = os.getenv("DEVICE_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+
+if not DEVICE_TOKEN:
+    logger.warning("DEVICE_TOKEN chưa được cấu hình!")
+if not GEMINI_KEY:
+    logger.warning("GEMINI_KEY chưa được cấu hình!")
+
 
 @app.on_event("startup")
 async def startup_event():
-    # Gửi ping lên ThingsBoard để biết server đang sống
-    async with httpx.AsyncClient() as client:
-        payload = {"startup_ping": datetime.utcnow().isoformat()}
-        url = f"{TB_URL}/api/v1/{DEVICE_TOKEN}/telemetry"
-        try:
-            r = await client.post(url, json=payload)
-            logger.info(f"Pushed telemetry: {payload} | Status {r.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to push startup ping: {e}")
+    logger.info("Starting server...")
+    # Gửi ping khi server khởi động để dễ kiểm tra trên ThingsBoard
+    await push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
+
 
 @app.get("/")
-async def root():
+async def health_check():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-@app.post("/tb-webhook")
-async def tb_webhook(request: Request):
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Nhận Shared Attributes từ Rule Chain.
+    Expect JSON như:
+    {
+      "hoi": "xin chào bạn"
+    }
+    """
     data = await request.json()
-    logger.info(f"Received webhook: {data}")
+    logger.info(f"Webhook received: {data}")
 
-    # Lấy câu hỏi từ payload
-    question = data.get("hoi")
-    if not question:
-        # Gửi telemetry báo không có câu hỏi
+    hoi = data.get("hoi")
+    if not hoi:
         await push_telemetry({"status": "no question"})
-        return {"status": "no question"}
+        return {"msg": "no question"}
 
-    # Gọi Gemini API
-    advice_text = await ask_gemini(question)
-    logger.info(f"Gemini answer: {advice_text}")
+    # Gọi Gemini để sinh câu trả lời
+    advice = await get_gemini_advice(hoi)
 
-    # Đẩy câu trả lời lên ThingsBoard telemetry
-    await push_telemetry({"advice_text": advice_text})
-    return {"status": "ok", "answer": advice_text}
+    # Gửi kết quả lên ThingsBoard qua telemetry
+    await push_telemetry({"advice_text": advice})
+    return {"advice": advice}
 
 
-async def ask_gemini(question: str) -> str:
+async def get_gemini_advice(question: str) -> str:
+    """
+    Gọi Google Gemini API sinh câu trả lời từ văn bản.
+    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_KEY}"
-    body = {
+    payload = {
         "contents": [
-            {"parts": [{"text": question}]}
+            {"parts": [{"text": f"Trả lời ngắn gọn: {question}"}]}
         ]
     }
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, json=body)
-            r.raise_for_status()
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.post(url, json=payload)
+            res.raise_for_status()
+            data = res.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            logger.info(f"Gemini response: {text}")
+            return text
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
-        return "AI service error"
+        return "Không thể sinh câu trả lời ngay lúc này."
 
 
 async def push_telemetry(payload: dict):
-    url = f"{TB_URL}/api/v1/{DEVICE_TOKEN}/telemetry"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.post(url, json=payload)
-            logger.info(f"Pushed telemetry: {payload} | Status {r.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to push telemetry: {e}")
+    """
+    Gửi dữ liệu telemetry lên ThingsBoard.
+    """
+    url = f"https://thingsboard.cloud/api/v1/{DEVICE_TOKEN}/telemetry"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(url, json=payload)
+            logger.info(f"Pushed telemetry: {payload} | Status {res.status_code}")
+    except Exception as e:
+        logger.error(f"Telemetry push error: {e}")
