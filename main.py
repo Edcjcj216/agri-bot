@@ -69,7 +69,7 @@ WEATHER_CODE_MAP = {
     2: "Có mây",
     3: "Nhiều mây",
     45: "Sương mù",
-    48: "Sương mù (đóng băng rất hiếm ở VN)",
+    48: "Sương mù (rất hiếm ở VN)",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
     55: "Mưa phùn dày",
@@ -80,18 +80,18 @@ WEATHER_CODE_MAP = {
     65: "Mưa to",
     66: "Mưa lạnh nhẹ",
     67: "Mưa lạnh to",
-    71: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
-    73: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
-    75: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
-    77: "Giông (có thể kèm hiện tượng hiếm)",
+    71: "Hiếm (không xảy ra ở VN)",
+    73: "Hiếm (không xảy ra ở VN)",
+    75: "Hiếm (không xảy ra ở VN)",
+    77: "Giông/Trận mạnh (hiếm)",
     80: "Mưa rào nhẹ",
     81: "Mưa rào vừa",
     82: "Mưa rào mạnh",
-    85: "Hiếm (tuyết, không thường gặp ở VN)",
-    86: "Hiếm (tuyết, không thường gặp ở VN)",
+    85: "Hiếm (không xảy ra ở VN)",
+    86: "Hiếm (không xảy ra ở VN)",
     95: "Giông nhẹ hoặc vừa",
-    96: "Giông (có thể kèm mưa đá — rất hiếm ở VN)",
-    99: "Giông (có thể kèm mưa đá — rất hiếm ở VN)"
+    96: "Giông mạnh (rất hiếm ở VN)",
+    99: "Giông mạnh (rất hiếm ở VN)"
 }
 
 weather_cache = {"ts": 0, "data": {}}
@@ -616,19 +616,17 @@ def get_advice(temp, humi, upcoming_weather=None):
         advice_text = llm_json.get("advice") or ""
         priority = llm_json.get("priority") or "low"
         actions = llm_json.get("actions") or []
-
-        # If actions is a single string, split on newline/comma/semicolon safely
         if isinstance(actions, str):
+            # sometimes LLM returns a string list; try to split by lines or common separators (newline, comma, semicolon)
             try:
-                # IMPORTANT: regex contains \n (newline) — keep as single-line raw string r"[\n,;]+"
-                actions = [a.strip() for a in re.split(r"[\n,;]+", actions) if a.strip()]
+                actions = [a.strip() for a in re.split(r"[
+,;]+", actions) if a.strip()]
             except Exception:
                 # fallback: keep whole string as single action
                 actions = [actions.strip()] if actions.strip() else []
-
         reason = llm_json.get("reason") or ""
 
-        advice_care = " | ".join(actions) if actions else (reason or "")
+        advice_care = " | ".join(actions) if actions else (llm_json.get("reason") or "")
 
         return {
             "advice": advice_text or " | ".join(nutrition + ["Quan sát thực tế và điều chỉnh"]),
