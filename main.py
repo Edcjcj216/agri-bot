@@ -14,7 +14,6 @@ TB_TOKEN = os.getenv("TB_TOKEN")
 COHERE_KEY = os.getenv("COHERE_API_KEY")
 DEEPAI_KEY = os.getenv("DEEPAI_API_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
@@ -29,43 +28,18 @@ cohere_client = CohereClient(COHERE_KEY) if COHERE_KEY else None
 last_telemetry = {}
 
 # ================== AI PROVIDER FUNCTIONS ==================
-async def ask_openai(prompt: str) -> str:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise ValueError("Missing OPENAI_API_KEY")
+async def ask_hf(prompt: str) -> str:
+    if not HF_KEY:
+        raise ValueError("Missing HUGGINGFACE_API_TOKEN")
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "gpt-4o-mini",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 200},
+            "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
+            headers={"Authorization": f"Bearer {HF_KEY}"},
+            json={"inputs": prompt},
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-async def ask_openrouter(prompt: str) -> str:
-    if not OPENROUTER_KEY:
-        raise ValueError("Missing OPENROUTER_API_KEY")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-            json={"model": "openai/gpt-4o-mini",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 200},
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-async def ask_cohere(prompt: str) -> str:
-    if not cohere_client:
-        raise ValueError("Missing COHERE_API_KEY")
-    loop = asyncio.get_event_loop()
-    def call_cohere():
-        response = cohere_client.generate(model="xlarge", prompt=prompt, max_tokens=200)
-        return response.generations[0].text.strip()
-    return await loop.run_in_executor(None, call_cohere)
+        data = r.json()
+        return data[0]["generated_text"].strip()
 
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_KEY:
@@ -77,6 +51,15 @@ async def ask_gemini(prompt: str) -> str:
         )
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+async def ask_cohere(prompt: str) -> str:
+    if not cohere_client:
+        raise ValueError("Missing COHERE_API_KEY")
+    loop = asyncio.get_event_loop()
+    def call_cohere():
+        response = cohere_client.generate(model="xlarge", prompt=prompt, max_tokens=200)
+        return response.generations[0].text.strip()
+    return await loop.run_in_executor(None, call_cohere)
 
 async def ask_deepai(prompt: str) -> str:
     if not DEEPAI_KEY:
@@ -92,7 +75,7 @@ async def ask_deepai(prompt: str) -> str:
 
 # ================== AI ADVICE FALLBACK ==================
 async def get_ai_advice(prompt: str) -> str:
-    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_cohere, ask_deepai]:
+    for fn in [ask_gemini, ask_cohere, ask_deepai, ask_hf]:
         try:
             return await fn(prompt)
         except Exception as e:
@@ -122,13 +105,14 @@ async def tb_webhook(req: Request):
     crop = shared.get("crop", "")
     location = shared.get("location", "")
     
+    # Prompt chỉ trả lời trực tiếp câu hỏi vừa gửi
     prompt = f"""
 Người dùng hỏi: {hoi}
 Cây trồng: {crop}
 Vị trí: {location}
 
 Hãy trả lời NGAY lập tức, ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-Chỉ cần 1 đoạn văn duy nhất, KHÔNG hỏi lại hay yêu cầu thêm thông tin.
+Chỉ 1 đoạn văn duy nhất, KHÔNG hỏi lại hay yêu cầu thêm thông tin.
 """
     advice_text = await get_ai_advice(prompt)
     push_to_tb({"advice_text": advice_text})
