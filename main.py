@@ -74,7 +74,7 @@ async def ask_deepai(prompt: str) -> str:
         return r.json().get("output", "").strip()
 
 # ================== AI ADVICE STRICT ==================
-async def get_ai_advice_strict(prompt: str) -> str:
+async def get_ai_advice_strict(prompt: str, hoi: str) -> str:
     for fn in [ask_gemini, ask_cohere, ask_deepai, ask_hf]:
         try:
             resp = await fn(prompt)
@@ -82,8 +82,8 @@ async def get_ai_advice_strict(prompt: str) -> str:
                 return resp.strip()
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    # Nếu tất cả provider fail, trả lời cố định dựa trên câu hỏi
-    return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời: '{prompt.strip()}'"
+    # Nếu tất cả provider fail, trả fallback ngắn gọn
+    return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời câu hỏi: '{hoi}'"
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
@@ -108,15 +108,16 @@ async def tb_webhook(req: Request):
 
     logging.info(f"💬 Câu hỏi nhận được: {hoi}")
 
+    # Prompt ngắn gọn bắt buộc
     prompt = f"""
 Người dùng hỏi: {hoi}
 Cây trồng: {crop}
 Vị trí: {location}
 
-Hãy trả lời NGAY lập tức, ngắn gọn, thực tế, dễ hiểu cho nông dân. 
-Chỉ 1 đoạn văn duy nhất, KHÔNG hỏi lại hay yêu cầu thêm thông tin.
+Hãy trả lời NGAY lập tức, **chỉ 1 đoạn văn**, **ngắn gọn**, **thực tế**, **dễ hiểu cho nông dân**.
+KHÔNG đưa thông tin tổng quan, KHÔNG hỏi lại, KHÔNG thêm hướng dẫn đọc báo hay tài liệu.
 """
-    advice_text = await get_ai_advice_strict(prompt)
+    advice_text = await get_ai_advice_strict(prompt, hoi)
     push_to_tb({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
 
@@ -131,7 +132,7 @@ def get_last_push():
 # ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD ==================
 async def scheduled_push_async():
     prompt = "Cập nhật lời khuyên nông nghiệp tự động"
-    advice_text = await get_ai_advice_strict(prompt)
+    advice_text = await get_ai_advice_strict(prompt, "Cập nhật lời khuyên nông nghiệp")
     push_to_tb({"advice_text": advice_text})
     logging.info("⏱️ Scheduled push completed.")
 
