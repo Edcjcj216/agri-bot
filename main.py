@@ -619,8 +619,7 @@ def get_advice(temp, humi, upcoming_weather=None):
         if isinstance(actions, str):
             # sometimes LLM returns a string list; try to split by lines or common separators (newline, comma, semicolon)
             try:
-                actions = [a.strip() for a in re.split(r"[
-,;]+", actions) if a.strip()]
+                actions = [a.strip() for a in re.split(r"[\n,;]+", actions) if a.strip()]
             except Exception:
                 # fallback: keep whole string as single action
                 actions = [actions.strip()] if actions.strip() else []
