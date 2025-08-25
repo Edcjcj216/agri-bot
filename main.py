@@ -3,38 +3,42 @@ import json
 import logging
 import requests
 import httpx
+import asyncio
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
+from cohere import Client as CohereClient
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+TB_TOKEN = os.getenv("TB_TOKEN")
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+COHERE_KEY = os.getenv("COHERE_API_KEY")
+DEEPAI_KEY = os.getenv("DEEPAI_API_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-
-OWM_KEY = os.getenv("OWM_API_KEY")  # để nguyên phần thời tiết
+OWM_KEY = os.getenv("OWM_API_KEY")  # nếu cần tích hợp thời tiết
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# ============= AI CLIENTS ==============
+# ================== INIT AI CLIENT ==================
+cohere_client = CohereClient(COHERE_KEY) if COHERE_KEY else None
+
+# ================== AI PROVIDER FUNCTIONS ==================
 async def ask_openai(prompt: str) -> str:
-    if not OPENAI_KEY:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
         raise ValueError("Missing OPENAI_API_KEY")
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 200},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -45,16 +49,10 @@ async def ask_openrouter(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "HTTP-Referer": "https://github.com/your/repo",
-                "X-Title": "Agri-Bot",
-            },
-            json={
-                "model": "openai/gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-            },
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            json={"model": "openai/gpt-4o-mini",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 200},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -83,15 +81,40 @@ async def ask_gemini(prompt: str) -> str:
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
+async def ask_cohere(prompt: str) -> str:
+    if not cohere_client:
+        raise ValueError("Missing COHERE_API_KEY")
+    loop = asyncio.get_event_loop()
+    def call_cohere():
+        response = cohere_client.generate(model="xlarge", prompt=prompt, max_tokens=200)
+        return response.generations[0].text.strip()
+    return await loop.run_in_executor(None, call_cohere)
+
+async def ask_deepai(prompt: str) -> str:
+    if not DEEPAI_KEY:
+        raise ValueError("Missing DEEPAI_API_KEY")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.deepai.org/api/text-generator",
+            headers={"api-key": DEEPAI_KEY},
+            data={"text": prompt},
+        )
+        if r.status_code == 429:
+            await asyncio.sleep(60)
+            return await ask_deepai(prompt)
+        r.raise_for_status()
+        return r.json().get("output", "").strip()
+
+# ================== AI ADVICE FALLBACK ==================
 async def get_ai_advice(prompt: str) -> str:
-    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_hf]:
+    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_hf, ask_cohere, ask_deepai]:
         try:
             return await fn(prompt)
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau hoặc cấu hình API key."
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau."
 
-# ============= THINGSBOARD ==============
+# ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
@@ -101,17 +124,17 @@ def push_to_tb(data: dict):
     except Exception as e:
         logging.error(f"❌ Failed to push telemetry: {e}")
 
-# ============= ENDPOINTS ==============
+# ================== FASTAPI ENDPOINTS ==================
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
     body = await req.json()
     logging.info(f"📩 Got TB webhook: {body}")
-	
+    
     shared = body.get("shared", {})
     hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
     crop = shared.get("crop", "cây trồng")
     location = shared.get("location", "Hồ Chí Minh")
-
+    
     prompt = f"""
     Người dùng hỏi: {hoi}
     Cây trồng: {crop}
@@ -129,7 +152,21 @@ async def tb_webhook(req: Request):
 def root():
     return {"status": "running"}
 
-# ============= STARTUP ==============
+# ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD ==================
+def scheduled_push():
+    prompt = "Cập nhật lời khuyên nông nghiệp tự động"
+    advice_text = asyncio.run(get_ai_advice(prompt))
+    push_to_tb({"advice_text": advice_text})
+    logging.info("⏱️ Scheduled push completed.")
+
+scheduler.add_job(scheduled_push, 'interval', minutes=5)
+
+# ================== STARTUP ==================
 @app.on_event("startup")
 def init():
     logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
+    # Push 1 lần ngay khi start
+    try:
+        asyncio.run(scheduled_push())
+    except Exception as e:
+        logging.error(f"❌ Initial push failed: {e}")
