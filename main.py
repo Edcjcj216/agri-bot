@@ -82,7 +82,7 @@ async def get_ai_advice_strict(prompt: str, hoi: str) -> str:
                 return resp.strip()
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    # Nếu tất cả provider fail, trả fallback ngắn gọn
+    # Fallback tối ưu: ngắn gọn, không hỏi ngược
     return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời câu hỏi: '{hoi}'"
 
 # ================== PUSH THINGSBOARD ==================
@@ -114,8 +114,8 @@ Người dùng hỏi: {hoi}
 Cây trồng: {crop}
 Vị trí: {location}
 
-Hãy trả lời NGAY lập tức, **chỉ 1 đoạn văn**, **ngắn gọn**, **thực tế**, **dễ hiểu cho nông dân**.
-KHÔNG đưa thông tin tổng quan, KHÔNG hỏi lại, KHÔNG thêm hướng dẫn đọc báo hay tài liệu.
+Hãy trả lời NGAY lập tức, **1 đoạn văn ngắn gọn**, **thực tế**, **dễ hiểu cho nông dân**.
+KHÔNG tổng quan, KHÔNG hỏi lại, KHÔNG dẫn link hay tài liệu.
 """
     advice_text = await get_ai_advice_strict(prompt, hoi)
     push_to_tb({"advice_text": advice_text})
