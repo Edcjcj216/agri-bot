@@ -616,17 +616,19 @@ def get_advice(temp, humi, upcoming_weather=None):
         advice_text = llm_json.get("advice") or ""
         priority = llm_json.get("priority") or "low"
         actions = llm_json.get("actions") or []
+
+        # If actions is a single string, split on newline/comma/semicolon safely
         if isinstance(actions, str):
-            # sometimes LLM returns a string list; try to split by lines or common separators (newline, comma, semicolon)
             try:
-                actions = [a.strip() for a in re.split(r"[
-,;]+", actions) if a.strip()]
+                # IMPORTANT: regex contains \n (newline) — keep as single-line raw string r"[\n,;]+"
+                actions = [a.strip() for a in re.split(r"[\n,;]+", actions) if a.strip()]
             except Exception:
                 # fallback: keep whole string as single action
                 actions = [actions.strip()] if actions.strip() else []
+
         reason = llm_json.get("reason") or ""
 
-        advice_care = " | ".join(actions) if actions else (llm_json.get("reason") or "")
+        advice_care = " | ".join(actions) if actions else (reason or "")
 
         return {
             "advice": advice_text or " | ".join(nutrition + ["Quan sát thực tế và điều chỉnh"]),
