@@ -73,14 +73,17 @@ async def ask_deepai(prompt: str) -> str:
         r.raise_for_status()
         return r.json().get("output", "").strip()
 
-# ================== AI ADVICE FALLBACK ==================
-async def get_ai_advice(prompt: str) -> str:
+# ================== AI ADVICE STRICT ==================
+async def get_ai_advice_strict(prompt: str) -> str:
     for fn in [ask_gemini, ask_cohere, ask_deepai, ask_hf]:
         try:
-            return await fn(prompt)
+            resp = await fn(prompt)
+            if resp.strip():  # Chỉ trả nếu có nội dung
+                return resp.strip()
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return "Xin lỗi, hiện tại hệ thống AI không khả dụng."
+    # Nếu tất cả provider fail, trả lời cố định dựa trên câu hỏi
+    return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời: '{prompt.strip()}'"
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
@@ -98,14 +101,13 @@ def push_to_tb(data: dict):
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
     body = await req.json()
-    logging.info(f"📩 Got TB webhook: {body}")
-    
     shared = body.get("shared", {})
     hoi = shared.get("hoi", "")
     crop = shared.get("crop", "")
     location = shared.get("location", "")
-    
-    # Prompt chỉ trả lời trực tiếp câu hỏi vừa gửi
+
+    logging.info(f"💬 Câu hỏi nhận được: {hoi}")
+
     prompt = f"""
 Người dùng hỏi: {hoi}
 Cây trồng: {crop}
@@ -114,7 +116,7 @@ Vị trí: {location}
 Hãy trả lời NGAY lập tức, ngắn gọn, thực tế, dễ hiểu cho nông dân. 
 Chỉ 1 đoạn văn duy nhất, KHÔNG hỏi lại hay yêu cầu thêm thông tin.
 """
-    advice_text = await get_ai_advice(prompt)
+    advice_text = await get_ai_advice_strict(prompt)
     push_to_tb({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
 
@@ -129,7 +131,7 @@ def get_last_push():
 # ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD ==================
 async def scheduled_push_async():
     prompt = "Cập nhật lời khuyên nông nghiệp tự động"
-    advice_text = await get_ai_advice(prompt)
+    advice_text = await get_ai_advice_strict(prompt)
     push_to_tb({"advice_text": advice_text})
     logging.info("⏱️ Scheduled push completed.")
 
