@@ -5,7 +5,7 @@ import requests
 import httpx
 import asyncio
 from fastapi import FastAPI, Request
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from cohere import Client as CohereClient
 
 # ================== CONFIG ==================
@@ -17,15 +17,18 @@ DEEPAI_KEY = os.getenv("DEEPAI_API_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
-OWM_KEY = os.getenv("OWM_API_KEY")  # nếu cần tích hợp thời tiết
+OWM_KEY = os.getenv("OWM_API_KEY")  # nếu cần thời tiết
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
-scheduler = BackgroundScheduler()
+scheduler = AsyncIOScheduler()
 scheduler.start()
 
 # ================== INIT AI CLIENT ==================
 cohere_client = CohereClient(COHERE_KEY) if COHERE_KEY else None
+
+# ================== LAST TELEMETRY ==================
+last_telemetry = {}
 
 # ================== AI PROVIDER FUNCTIONS ==================
 async def ask_openai(prompt: str) -> str:
@@ -116,11 +119,13 @@ async def get_ai_advice(prompt: str) -> str:
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
+    global last_telemetry
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
         r = requests.post(url, json=data, timeout=10)
         r.raise_for_status()
         logging.info(f"✅ Sent to ThingsBoard: {data}")
+        last_telemetry = data
     except Exception as e:
         logging.error(f"❌ Failed to push telemetry: {e}")
 
@@ -152,21 +157,28 @@ async def tb_webhook(req: Request):
 def root():
     return {"status": "running"}
 
+@app.get("/last-push")
+def get_last_push():
+    return {"last_telemetry": last_telemetry}
+
 # ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD ==================
-def scheduled_push():
+async def scheduled_push_async():
     prompt = "Cập nhật lời khuyên nông nghiệp tự động"
-    advice_text = asyncio.run(get_ai_advice(prompt))
+    advice_text = await get_ai_advice(prompt)
     push_to_tb({"advice_text": advice_text})
     logging.info("⏱️ Scheduled push completed.")
+
+def scheduled_push():
+    asyncio.create_task(scheduled_push_async())
 
 scheduler.add_job(scheduled_push, 'interval', minutes=5)
 
 # ================== STARTUP ==================
 @app.on_event("startup")
-def init():
+async def init():
     logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
     # Push 1 lần ngay khi start
     try:
-        asyncio.run(scheduled_push())
+        await scheduled_push_async()
     except Exception as e:
         logging.error(f"❌ Initial push failed: {e}")
