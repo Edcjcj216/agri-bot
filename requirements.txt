@@ -1,7 +1,9 @@
 fastapi
-uvicorn[standard]    # recommended (includes 'httptools', 'uvloop' when available)
+uvicorn[standard]        # includes 'httptools', 'uvloop'
 requests
 httpx
 apscheduler
 pydantic
 geopy
+cohere
+python-dotenv           # nếu muốn load .env local (Render không cần)
