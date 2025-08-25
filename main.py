@@ -84,73 +84,19 @@ async def get_ai_advice_strict(prompt: str, hoi: str) -> str:
             logging.warning(f"AI provider failed: {e}")
     return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời câu hỏi: '{hoi}'"
 
+# ================== HELPER: LIMIT OUTPUT 1-3 CÂU ==================
+def limit_to_3_sentences(text: str) -> str:
+    sentences = text.replace("\n", " ").split(". ")
+    limited = ". ".join(sentences[:3]).strip()
+    if not limited.endswith("."):
+        limited += "."
+    return limited
+
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
     global last_telemetry
-    # Ép output 1–3 câu
     advice_text = data.get("advice_text", "")
-    advice_text = " ".join(advice_text.replace("\n", " ").split(". ")[:3]).strip()
-    if not advice_text.endswith("."):
-        advice_text += "."
+    advice_text = limit_to_3_sentences(advice_text)
     data["advice_text"] = advice_text
 
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-    try:
-        r = requests.post(url, json=data, timeout=10)
-        r.raise_for_status()
-        logging.info(f"✅ Sent to ThingsBoard: {data}")
-        last_telemetry = data
-    except Exception as e:
-        logging.error(f"❌ Failed to push telemetry: {e}")
-
-# ================== FASTAPI ENDPOINTS ==================
-@app.post("/tb-webhook")
-async def tb_webhook(req: Request):
-    body = await req.json()
-    shared = body.get("shared", {})
-    hoi = shared.get("hoi", "")
-    crop = shared.get("crop", "")
-    location = shared.get("location", "")
-
-    logging.info(f"💬 Câu hỏi nhận được: {hoi}")
-
-    prompt = f"""
-Người dùng hỏi: {hoi}
-Cây trồng: {crop}
-Vị trí: {location}
-
-Hãy trả lời NGAY lập tức, **1 đoạn văn ngắn gọn**, **thực tế**, **dễ hiểu cho nông dân**.
-KHÔNG tổng quan, KHÔNG hỏi lại, KHÔNG dẫn link hay tài liệu.
-"""
-    advice_text = await get_ai_advice_strict(prompt, hoi)
-    push_to_tb({"advice_text": advice_text})
-    return {"status": "ok", "advice_text": advice_text}
-
-@app.get("/")
-def root():
-    return {"status": "running"}
-
-@app.get("/last-push")
-def get_last_push():
-    return {"last_telemetry": last_telemetry}
-
-# ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD ==================
-async def scheduled_push_async():
-    prompt = "Cập nhật lời khuyên nông nghiệp tự động"
-    advice_text = await get_ai_advice_strict(prompt, "Cập nhật lời khuyên nông nghiệp")
-    push_to_tb({"advice_text": advice_text})
-    logging.info("⏱️ Scheduled push completed.")
-
-def scheduled_push():
-    asyncio.create_task(scheduled_push_async())
-
-scheduler.add_job(scheduled_push, 'interval', minutes=5)
-
-# ================== STARTUP ==================
-@app.on_event("startup")
-async def init():
-    logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
-    try:
-        await scheduled_push_async()
-    except Exception as e:
-        logging.error(f"❌ Initial push failed: {e}")
+    url = f"{TB
