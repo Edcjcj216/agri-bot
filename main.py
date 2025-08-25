@@ -62,13 +62,14 @@ class SensorData(BaseModel):
     battery: float | None = None
 
 # ================== WEATHER ==================
+# Adjusted weather code map: avoid explicit "mưa đá" label to reduce false alarms in VN.
 WEATHER_CODE_MAP = {
     0: "Trời quang",
     1: "Trời quang nhẹ",
     2: "Có mây",
     3: "Nhiều mây",
     45: "Sương mù",
-    48: "Sương mù đóng băng",
+    48: "Sương mù (đóng băng rất hiếm ở VN)",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
     55: "Mưa phùn dày",
@@ -79,18 +80,18 @@ WEATHER_CODE_MAP = {
     65: "Mưa to",
     66: "Mưa lạnh nhẹ",
     67: "Mưa lạnh to",
-    71: "Tuyết nhẹ",
-    73: "Tuyết vừa",
-    75: "Tuyết dày",
-    77: "Mưa tuyết/Trận băng",
+    71: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
+    73: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
+    75: "Hiếm (điều kiện có tuyết, không thường gặp ở VN)",
+    77: "Giông (có thể kèm hiện tượng hiếm)",
     80: "Mưa rào nhẹ",
     81: "Mưa rào vừa",
     82: "Mưa rào mạnh",
-    85: "Tuyết rơi nhẹ",
-    86: "Tuyết rơi mạnh",
+    85: "Hiếm (tuyết, không thường gặp ở VN)",
+    86: "Hiếm (tuyết, không thường gặp ở VN)",
     95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ",
-    99: "Giông kèm mưa đá mạnh"
+    96: "Giông (có thể kèm mưa đá — rất hiếm ở VN)",
+    99: "Giông (có thể kèm mưa đá — rất hiếm ở VN)"
 }
 
 weather_cache = {"ts": 0, "data": {}}
@@ -177,18 +178,51 @@ def _mean(lst):
     return round(sum(lst) / len(lst), 1) if lst else None
 
 
+def _current_hour_str_rounded():
+    """Return local ISO hour string rounded the same way merge_weather_and_hours uses.
+    Rounding rule: if minute > 30 -> round up to next hour, else use current hour.
+    This avoids mismatches between label generation and the hour index used to pick api temps.
+    """
+    now = _now_local()
+    base = now.replace(minute=0, second=0, microsecond=0)
+    if now.minute > 30:
+        base = base + timedelta(hours=1)
+    return base.strftime("%Y-%m-%dT%H:00")
+
+
 def _find_hour_index(hour_times, target_hour_str):
+    """Find the index in hour_times closest to target_hour_str. Returns 0 if not found.
+    This is more robust than exact string match and tolerates timezone formatting differences.
+    """
     if not hour_times:
         return None
+    # exact match first
     if target_hour_str in hour_times:
         return hour_times.index(target_hour_str)
+    # try parsing ISO datetimes and find nearest
     try:
-        parsed = [datetime.fromisoformat(t) for t in hour_times]
+        parsed = []
+        for t in hour_times:
+            try:
+                parsed.append(datetime.fromisoformat(t))
+            except Exception:
+                parsed.append(None)
         target = datetime.fromisoformat(target_hour_str)
-        diffs = [abs((p - target).total_seconds()) for p in parsed]
-        return int(min(range(len(diffs)), key=lambda i: diffs[i]))
+        diffs = [abs((p - target).total_seconds()) if p is not None else float('inf') for p in parsed]
+        best = int(min(range(len(diffs)), key=lambda i: diffs[i]))
+        return best
     except Exception:
         return 0
+
+
+def _find_closest_index_in_next_hours(next_hours, target_hour_str):
+    """Given next_hours (list of dicts with 'time'), find index closest to target_hour_str."""
+    if not next_hours:
+        return None
+    times = [h.get("time") for h in next_hours if h.get("time")]
+    if not times:
+        return 0
+    return _find_hour_index(times, target_hour_str)
 
 
 def _call_open_meteo(params):
@@ -298,11 +332,12 @@ def get_weather_forecast():
                 weather_tomorrow.update(target)
 
     hour_times = hourly.get("time", [])
-    current_hour_str = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
+    # Use the same rounding rule as merge_weather_and_hours
+    current_hour_str = _current_hour_str_rounded()
     idx = _find_hour_index(hour_times, current_hour_str) or 0
 
     next_hours = []
-    # *** CHANGE: build 7 hours (0..6) to match hour_0..hour_6 on ThingsBoard ***
+    # build 7 hours (0..6) to match hour_0..hour_6 on ThingsBoard
     for offset in range(0, 7):
         i = idx + offset
         if i >= len(hour_times):
@@ -314,7 +349,7 @@ def get_weather_forecast():
             "weather_code": safe_get(hourly.get("weathercode", []), i),
             "weather_desc": WEATHER_CODE_MAP.get(safe_get(hourly.get("weathercode", []), i), "?"),
             "precipitation": safe_get(hourly.get("precipitation", []), i),
-            "precip_probability": safe_get(hourly.get("precipitation_probability", []), i),
+            "precip_probability": safe_get(hourly.get("precipitation_probability" , []), i),
             "windspeed": safe_get(hourly.get("windspeed_10m", []), i),
             "winddir": safe_get(hourly.get("winddirection_10m", []), i)
         }
@@ -338,12 +373,30 @@ def get_weather_forecast():
 # ================== BIAS CORRECTION ==================
 
 def update_bias_and_correct(next_hours, observed_temp):
-    """Update bias history with (api_now, observed_temp) and return bias + corrected next_hours."""
+    """Update bias history with (api_now, observed_temp) and return bias + corrected next_hours.
+
+    Changes made:
+    - find api_now by matching the same rounded local hour used in merge_weather_and_hours
+      (avoids off-by-one-hour label mismatch that caused large apparent bias).
+    - compute bias using an exponential moving average (EMA) over diffs to be robust to outliers.
+    - clamp the applied bias to a reasonable range (default ±5°C) to avoid wild corrections.
+    """
     global bias_history
     if not next_hours:
         return 0.0, next_hours
 
-    api_now = next_hours[0].get("temperature")
+    # find the api temperature that corresponds to the current rounded hour
+    api_now = None
+    try:
+        target_hour_str = _current_hour_str_rounded()
+        idx = _find_closest_index_in_next_hours(next_hours, target_hour_str)
+        if idx is None:
+            idx = 0
+        if 0 <= idx < len(next_hours):
+            api_now = next_hours[idx].get("temperature")
+    except Exception:
+        api_now = next_hours[0].get("temperature") if next_hours else None
+
     if api_now is not None and observed_temp is not None:
         try:
             bias_history.append((api_now, observed_temp))
@@ -351,17 +404,25 @@ def update_bias_and_correct(next_hours, observed_temp):
         except Exception:
             pass
 
-    # compute diffs safely
-    if bias_history:
-        diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
-    else:
-        diffs = []
+    # compute diffs safely (chronological order)
+    diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
 
     if diffs:
-        bias = round(sum(diffs) / len(diffs), 1)
+        # use EMA to be robust: recent samples weighted more
+        alpha = 0.3
+        ema = diffs[0]
+        for d in diffs[1:]:
+            ema = ema * (1 - alpha) + d * alpha
+        bias = round(ema, 1)
+        # clamp to reasonable bounds to avoid absurd corrections (e.g., sensor or API glitch)
+        max_clamp = float(os.getenv("BIAS_MAX_CLAMP", 5.0))
+        if abs(bias) > max_clamp:
+            logger.warning(f"Computed bias {bias} exceeds clamp {max_clamp}; clamping")
+            bias = round(math.copysign(max_clamp, bias), 1)
     else:
         bias = 0.0
 
+    # apply correction
     for h in next_hours:
         if h.get("temperature") is not None:
             h["temperature_corrected"] = round(h["temperature"] + bias, 1)
@@ -431,6 +492,7 @@ def call_openrouter_llm(system_prompt: str, user_prompt: str, model: str = LLM_M
 
     return {"ok": True, "content": content, "raw": data}
 
+
 def extract_json_like(text: str):
     if not text:
         raise ValueError("Empty text")
@@ -448,7 +510,10 @@ def extract_json_like(text: str):
 
 # ================== AI HELPER (rule-based)
 
-def get_advice(temp, humi, upcoming_weather=None):
+def get_advice_rule(temp, humi, upcoming_weather=None):
+    """Original rule-based advice kept as a safe fallback.
+    Returns the same shape as previous: advice, advice_nutrition, advice_care, advice_note, prediction
+    """
     nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
     care = []
 
@@ -495,6 +560,81 @@ def get_advice(temp, humi, upcoming_weather=None):
         "advice_note": "Quan sát thực tế và điều chỉnh",
         "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
     }
+
+
+def get_advice(temp, humi, upcoming_weather=None):
+    """Primary advice function: try LLM (OpenRouter/Gemini) first, fall back to rule-based if LLM not available or fails.
+
+    Expected LLM JSON response (Vietnamese):
+    {
+      "advice": "<short advice>",
+      "priority": "low|medium|high",
+      "actions": ["action1", "action2", ...],
+      "reason": "<short reason>"
+    }
+
+    The returned dict keeps previous telemetry keys so ThingsBoard dashboards don't need changes.
+    """
+    # default nutrition strings kept for telemetry even when LLM used
+    nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
+
+    # If no API key or LLM in backoff, use rule-based immediately
+    if not OPENROUTER_API_KEY or time.time() < llm_disabled_until:
+        return get_advice_rule(temp, humi, upcoming_weather)
+
+    # Build prompts (Vietnamese) and call LLM
+    system_prompt = (
+        "Bạn là một chuyên gia nông nghiệp ở Việt Nam, hiểu khí hậu nhiệt đới. "
+        "Trả về CHỈ MỘT đối tượng JSON (không kèm chú giải nào khác) với các trường: "
+        "advice (string ngắn, tiếng Việt), priority (low/medium/high), actions (mảng string các hành động cụ thể, tiếng Việt), reason (giải thích ngắn)."
+    )
+
+    # include upcoming_weather as compact JSON to give context (may be empty list)
+    try:
+        upcoming_json = json.dumps(upcoming_weather or [], ensure_ascii=False)
+    except Exception:
+        upcoming_json = "[]"
+
+    user_prompt = (
+        f"Observed: temp={temp}C, hum={humi}%. Upcoming_hours: {upcoming_json}. "
+        "Trả về JSON theo yêu cầu."
+    )
+
+    resp = call_openrouter_llm(system_prompt, user_prompt, temperature=0.0, max_tokens=300)
+    if not resp.get("ok"):
+        # fallback when LLM fails or is disabled
+        logger.warning(f"LLM advice failed or skipped: {resp.get('error')}")
+        return get_advice_rule(temp, humi, upcoming_weather)
+
+    # try parse LLM response to JSON
+    try:
+        llm_json = extract_json_like(resp.get("content", ""))
+        if not isinstance(llm_json, dict):
+            raise ValueError("LLM returned non-dict JSON")
+
+        # normalize fields
+        advice_text = llm_json.get("advice") or ""
+        priority = llm_json.get("priority") or "low"
+        actions = llm_json.get("actions") or []
+        if isinstance(actions, str):
+            # sometimes LLM returns a string list; try to split by lines or commas
+            actions = [a.strip() for a in re.split(r"[
+,;]+", actions) if a.strip()]
+        reason = llm_json.get("reason") or ""
+
+        advice_care = " | ".join(actions) if actions else (llm_json.get("reason") or "")
+
+        return {
+            "advice": advice_text or " | ".join(nutrition + ["Quan sát thực tế và điều chỉnh"]),
+            "advice_nutrition": " | ".join(nutrition),
+            "advice_care": advice_care,
+            "advice_note": f"priority: {priority}" if priority else "",
+            "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%",
+        }
+    except Exception as e:
+        logger.warning(f"Failed to parse LLM advice: {e}; raw: {resp.get('content')}")
+        # final fallback to rule-based
+        return get_advice_rule(temp, humi, upcoming_weather)
 
 # ================== THINGSBOARD ==================
 
@@ -572,7 +712,10 @@ def merge_weather_and_hours(existing_data=None):
 
     # Build hour labels from current local time (rounded): hour_0 is current rounded hour, hour_1 next hour, ...
     # Rounding rule: if minute > 30 -> round up to next hour, else use current hour
-    hour_rounded = now.hour + 1 if now.minute > 30 else now.hour
+    hour_rounded_dt = _now_local().replace(minute=0, second=0, microsecond=0)
+    if _now_local().minute > 30:
+        hour_rounded_dt = hour_rounded_dt + timedelta(hours=1)
+    hour_rounded = hour_rounded_dt.hour
     hour_labels = []
     for i in range(0, 7):
         next_h = (hour_rounded + i) % 24
@@ -848,4 +991,5 @@ async def startup():
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - To enable LLM (Gemini via OpenRouter), set OPENROUTER_API_KEY in your Render environment.
 # - This version persists bias history in SQLite (BIAS_DB_FILE), protects telemetry keys from being overwritten by None,
-#   uses a safer Open-Meteo fallback if detailed params fail, builds 7 hourly slots, and temporary disables LLM on HTTP 402 to avoid spam.
+#   uses a safer Open-Meteo fallback if detailed params fail, builds 7 hourly slots, aligns rounding rules between
+#   prediction selection and hour labels, avoids alarming "mưa đá" wording, uses EMA for bias and clamps corrections.
