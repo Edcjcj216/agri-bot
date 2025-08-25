@@ -7,3 +7,4 @@ pydantic
 geopy
 cohere
 python-dotenv           # nếu muốn load .env local (Render không cần)
+google-generativeai
