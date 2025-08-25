@@ -128,7 +128,7 @@ def get_last_push():
 
 # ================== SCHEDULER PUSH ==================
 async def scheduled_push_async():
-    prompt = "Cập nhật tổng quan nông nghiệp tự động ngắn gọn, 1–3 câu."
+    prompt = "Cập nhật tổng quan nông nghiệp tự động cực ngắn, 1–3 câu."
     advice_text = await get_ai_advice(prompt)
     push_to_tb({"advice_text": advice_text})
     logging.info("⏱️ Scheduled push completed.")
