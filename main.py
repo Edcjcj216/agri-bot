@@ -4,46 +4,46 @@ from datetime import datetime
 from fastapi import FastAPI, Request
 import httpx
 
-# ====== CONFIG ======
+# ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN")        # Device Access Token trên ThingsBoard
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # API key của Gemini
+TB_TOKEN = os.getenv("TB_TOKEN")  # Device access token trên ThingsBoard
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Key Gemini AI
 
-# ====== LOGGING ======
+# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hoi-bot")
+logger = logging.getLogger("tb-webhook")
 
-# ====== FASTAPI APP ======
+# ================== APP ==================
 app = FastAPI()
 
-# ====== PUSH LÊN THINGSBOARD ======
+# ================== THINGSBOARD PUSH ==================
 def push_telemetry(payload: dict):
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
         with httpx.Client(timeout=10) as client:
             resp = client.post(url, json=payload)
-        logger.info(f"Telemetry pushed: {payload}, status={resp.status_code}")
+        logger.info(f"Pushed telemetry: {payload} | Status {resp.status_code}")
     except Exception as e:
-        logger.error(f"Error push telemetry: {e}")
+        logger.error(f"Error pushing telemetry: {e}")
 
-# ====== GỌI GEMINI ======
+# ================== AI CALL ==================
 def generate_ai_reply(question: str) -> str:
-    if not GEMINI_API_KEY:
-        return f"(mock) Bạn hỏi: {question}"
     try:
+        if not GEMINI_API_KEY:
+            return f"(No GEMINI_API_KEY) Bạn hỏi: {question}"
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel("gemini-1.5-flash")
         resp = model.generate_content(question)
         return resp.text.strip()
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "(error khi gọi AI)"
+        logger.error(f"AI generation error: {e}")
+        return f"(Error) Bạn hỏi: {question}"
 
-# ====== ROUTES ======
+# ================== ROUTES ==================
 @app.get("/")
-def health():
-    return {"status": "ok", "message": "server chạy tốt"}
+def health_check():
+    return {"status": "ok", "message": "Server running"}
 
 @app.post("/tb-webhook")
 async def tb_webhook(req: Request):
@@ -51,19 +51,22 @@ async def tb_webhook(req: Request):
     shared = data.get("shared", {})
     hoi = shared.get("hoi", "")
 
-    logger.info(f"Nhận shared.hoi = {hoi}")
+    logger.info(f"Received question: {hoi}")
 
-    if not hoi:
-        return {"status": "no question"}
+    # 1. Sinh câu trả lời bằng AI
+    answer = generate_ai_reply(hoi)
 
-    # Gọi AI trả lời
-    tra_loi = generate_ai_reply(hoi)
-
-    # Lưu telemetry lên ThingsBoard
+    # 2. Đẩy lên ThingsBoard telemetry
     push_telemetry({
         "hoi": hoi,
-        "tra_loi": tra_loi,
+        "answer": answer,
         "time": datetime.utcnow().isoformat()
     })
 
-    return {"status": "ok", "hoi": hoi, "tra_loi": tra_loi}
+    return {"status": "ok", "answer": answer}
+
+# ================== STARTUP ==================
+@app.on_event("startup")
+def startup_event():
+    logger.info("Starting server...")
+    push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
