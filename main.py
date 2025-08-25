@@ -1,142 +1,135 @@
 import os
 import json
 import logging
-from datetime import datetime
 import requests
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # ================== CONFIG ==================
-OWM_API_KEY = os.getenv("OWM_API_KEY")
-LAT = os.getenv("LAT", "10.8781")
-LON = os.getenv("LON", "106.7594")
+TB_URL = "https://thingsboard.cloud/api/v1"
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
+HF_KEY = os.getenv("HUGGINGFACE_API_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-TB_URL = os.getenv("TB_URL", "https://thingsboard.cloud/api/v1")
-TB_TOKEN = os.getenv("TB_TOKEN")
+OWM_KEY = os.getenv("OWM_API_KEY")  # để nguyên phần thời tiết
 
-CROP = "Rau muống"
-
+logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 scheduler = BackgroundScheduler()
+scheduler.start()
 
-# ================== FUNCTIONS ==================
+# ============= AI CLIENTS ==============
+async def ask_openai(prompt: str) -> str:
+    if not OPENAI_KEY:
+        raise ValueError("Missing OPENAI_API_KEY")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 200,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
 
-def fetch_weather():
-    """Fetch hourly weather from OpenWeather free endpoint."""
-    try:
-        url = f"https://api.openweathermap.org/data/2.5/onecall?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&units=metric&exclude=minutely,daily,alerts"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        hourly = data.get("hourly", [])[:7]  # next 7 hours
-        weather = []
-        for i, h in enumerate(hourly):
-            weather.append({
-                f"hour_{i}": datetime.utcfromtimestamp(h["dt"]).strftime("%H:%M"),
-                f"hour_{i}_temperature": h["temp"],
-                f"hour_{i}_humidity": h["humidity"],
-                f"hour_{i}_weather_desc": h["weather"][0]["description"]
-            })
-        return weather
-    except Exception as e:
-        logger.error(f"[ERROR] Error fetching OpenWeather: {e}")
-        return None
+async def ask_openrouter(prompt: str) -> str:
+    if not OPENROUTER_KEY:
+        raise ValueError("Missing OPENROUTER_API_KEY")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "HTTP-Referer": "https://github.com/your/repo",
+                "X-Title": "Agri-Bot",
+            },
+            json={
+                "model": "openai/gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 200,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
 
-def fetch_ai_advice(weather_data):
-    """Call Gemini/OpenRouter AI to generate advice."""
-    prompt = f"Crop: {CROP}\nWeather data: {json.dumps(weather_data)}\nProvide advice (nutrition, care, note)."
-    headers_gemini = {"Authorization": f"Bearer {GEMINI_API_KEY}"} if GEMINI_API_KEY else {}
-    headers_or = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"} if OPENROUTER_API_KEY else {}
-    
-    # Try Gemini
-    if GEMINI_API_KEY:
+async def ask_hf(prompt: str) -> str:
+    if not HF_KEY:
+        raise ValueError("Missing HUGGINGFACE_API_TOKEN")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
+            headers={"Authorization": f"Bearer {HF_KEY}"},
+            json={"inputs": prompt},
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data[0]["generated_text"].strip()
+
+async def ask_gemini(prompt: str) -> str:
+    if not GEMINI_KEY:
+        raise ValueError("Missing GEMINI_API_KEY")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+        )
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+async def get_ai_advice(prompt: str) -> str:
+    for fn in [ask_openai, ask_openrouter, ask_gemini, ask_hf]:
         try:
-            r = httpx.post("https://api.gemini.com/v1/generate", json={"prompt": prompt}, headers=headers_gemini, timeout=10)
-            r.raise_for_status()
-            result = r.json().get("text")
-            if result:
-                return parse_ai_advice(result)
+            return await fn(prompt)
         except Exception as e:
-            logger.warning(f"[WARNING] Gemini API failed: {e}")
-    
-    # Try OpenRouter
-    if OPENROUTER_API_KEY:
-        try:
-            r = httpx.post("https://openrouter.ai/api/v1/chat/completions",
-                           json={"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}]},
-                           headers=headers_or, timeout=10)
-            r.raise_for_status()
-            choices = r.json().get("choices", [])
-            if choices:
-                return parse_ai_advice(choices[0]["message"]["content"])
-        except Exception as e:
-            logger.warning(f"[WARNING] OpenRouter API failed: {e}")
+            logging.warning(f"AI provider failed: {e}")
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng. Vui lòng thử lại sau hoặc cấu hình API key."
 
-    return {"advice": "No AI advice available", "advice_care": "", "advice_nutrition": "", "advice_note": ""}
-
-def parse_ai_advice(text):
-    """Split AI advice into sections."""
-    return {
-        "advice": text,
-        "advice_care": text,
-        "advice_nutrition": text,
-        "advice_note": ""
-    }
-
-def push_telemetry(payload):
-    """Push payload to ThingsBoard."""
+# ============= THINGSBOARD ==============
+def push_to_tb(data: dict):
+    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
-        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-        headers = {"Content-Type": "application/json"}
-        logger.info(f"[INFO] Pushing telemetry: {payload}")
-        r = requests.post(url, headers=headers, json=payload, timeout=10)
-        logger.info(f"[INFO] Response status: {r.status_code}, body: {r.text}")
+        r = requests.post(url, json=data, timeout=10)
+        r.raise_for_status()
+        logging.info(f"✅ Sent to ThingsBoard: {data}")
     except Exception as e:
-        logger.error(f"[ERROR] ThingsBoard push failed: {e}")
+        logging.error(f"❌ Failed to push telemetry: {e}")
 
-def job():
-    """Scheduled job to fetch weather, AI advice, and push telemetry."""
-    weather_data = fetch_weather()
-    if not weather_data:
-        logger.error("[ERROR] Skipping job due to weather fetch failure")
-        return
+# ============= ENDPOINTS ==============
+@app.post("/tb-webhook")
+async def tb_webhook(req: Request):
+    body = await req.json()
+    logging.info(f"📩 Got TB webhook: {body}")
+	
+    shared = body.get("shared", {})
+    hoi = shared.get("hoi", "Hãy đưa ra lời khuyên nông nghiệp.")
+    crop = shared.get("crop", "cây trồng")
+    location = shared.get("location", "Hồ Chí Minh")
 
-    ai_advice = fetch_ai_advice(weather_data)
-    payload = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "location": f"Lat {LAT}, Lon {LON}",
-        "crop": CROP,
-        "battery": 4.2,
-    }
+    prompt = f"""
+    Người dùng hỏi: {hoi}
+    Cây trồng: {crop}
+    Vị trí: {location}
 
-    # Flatten hourly weather
-    for h in weather_data:
-        payload.update(h)
+    Hãy trả lời ngắn gọn, thực tế, dễ hiểu cho nông dân. 
+    Chỉ cần đưa ra 1 đoạn văn duy nhất.
+    """
 
-    payload.update(ai_advice)
-    push_telemetry(payload)
-
-# ================== STARTUP ==================
-
-@app.on_event("startup")
-def startup_event():
-    logger.info("[INFO] Starting app...")
-    # Push startup ping
-    push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
-    # Add scheduler job every 15 min
-    scheduler.add_job(job, 'interval', minutes=15, next_run_time=datetime.utcnow())
-    scheduler.start()
-
-# ================== HEALTH CHECK ==================
+    advice_text = await get_ai_advice(prompt)
+    push_to_tb({"advice_text": advice_text})
+    return {"status": "ok", "advice_text": advice_text}
 
 @app.get("/")
-def read_root():
-    return {"status": "ok"}
+def root():
+    return {"status": "running"}
 
+# ============= STARTUP ==============
+@app.on_event("startup")
+def init():
+    logging.info("🚀 Agri-Bot AI service started, waiting for ThingsBoard...")
