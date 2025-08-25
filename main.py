@@ -9,7 +9,7 @@ from cohere import Client as CohereClient
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN")
+TB_TOKEN = os.getenv("TB_TOKEN")  # ThingsBoard device token
 
 COHERE_KEY = os.getenv("COHERE_API_KEY")
 DEEPAI_KEY = os.getenv("DEEPAI_API_KEY")
@@ -21,11 +21,14 @@ app = FastAPI()
 scheduler = AsyncIOScheduler()
 scheduler.start()
 
-# ================== INIT AI CLIENT ==================
 cohere_client = CohereClient(COHERE_KEY) if COHERE_KEY else None
-
-# ================== LAST TELEMETRY ==================
 last_telemetry = {}
+
+# ================== HELPER ==================
+def limit_to_3_sentences(text: str) -> str:
+    sentences = text.replace("\n", " ").split(".")
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return ". ".join(sentences[:3]) + ("." if sentences else "")
 
 # ================== AI PROVIDER FUNCTIONS ==================
 async def ask_hf(prompt: str) -> str:
@@ -73,32 +76,20 @@ async def ask_deepai(prompt: str) -> str:
         r.raise_for_status()
         return r.json().get("output", "").strip()
 
-# ================== AI ADVICE STRICT ==================
-async def get_ai_advice_strict(prompt: str, hoi: str) -> str:
+# ================== GET AI ADVICE ==================
+async def get_ai_advice(prompt: str) -> str:
     for fn in [ask_gemini, ask_cohere, ask_deepai, ask_hf]:
         try:
-            resp = await fn(prompt)
-            if resp.strip():
-                return resp.strip()
+            result = await fn(prompt)
+            if result:
+                return limit_to_3_sentences(result)
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời câu hỏi: '{hoi}'"
-
-# ================== HELPER: LIMIT OUTPUT 1-3 CÂU ==================
-def limit_to_3_sentences(text: str) -> str:
-    sentences = text.replace("\n", " ").split(". ")
-    limited = ". ".join(sentences[:3]).strip()
-    if not limited.endswith("."):
-        limited += "."
-    return limited
+    return "Xin lỗi, hiện tại hệ thống AI không khả dụng."
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
     global last_telemetry
-    advice_text = data.get("advice_text", "")
-    advice_text = limit_to_3_sentences(advice_text)
-    data["advice_text"] = advice_text
-
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
         r = requests.post(url, json=data, timeout=10)
@@ -116,21 +107,14 @@ async def tb_webhook(req: Request):
     hoi = shared.get("hoi", "").strip()
     crop = shared.get("crop", "")
     location = shared.get("location", "")
-
     logging.info(f"💬 Câu hỏi nhận được: {hoi}")
+
     if not hoi:
-        return {"status": "error", "message": "Chưa gửi câu hỏi (hoi)"}
+        advice_text = "Xin hãy gửi câu hỏi cụ thể để nhận lời khuyên nông nghiệp."
+    else:
+        prompt = f"Người dùng hỏi: {hoi}. Cây trồng: {crop}. Vị trí: {location}. Hãy trả lời NGAY lập tức, ngắn gọn, thực tế, 1–3 câu, dễ hiểu cho nông dân. KHÔNG hỏi lại."
+        advice_text = await get_ai_advice(prompt)
 
-    prompt = f"""
-Người dùng hỏi: {hoi}
-Cây trồng: {crop}
-Vị trí: {location}
-
-Trả lời NGAY câu hỏi trên, 1 đoạn duy nhất 1–3 câu, ngắn gọn, thực tế, dễ hiểu cho nông dân.
-KHÔNG hỏi lại, KHÔNG tổng quan, KHÔNG dẫn link hay tài liệu.
-"""
-    advice_text = await get_ai_advice_strict(prompt, hoi)
-    advice_text = limit_to_3_sentences(advice_text)
     push_to_tb({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
 
@@ -142,10 +126,10 @@ def root():
 def get_last_push():
     return {"last_telemetry": last_telemetry}
 
-# ================== SCHEDULER 5 PHÚT PUSH THINGSBOARD (TỔNG QUAN NGẮN) ==================
+# ================== SCHEDULER PUSH ==================
 async def scheduled_push_async():
-    prompt = "Hãy cung cấp 1 đoạn ngắn gọn (1-3 câu) cập nhật lời khuyên nông nghiệp tự động, thực tế."
-    advice_text = await get_ai_advice_strict(prompt, "Cập nhật lời khuyên nông nghiệp")
+    prompt = "Cập nhật tổng quan nông nghiệp tự động ngắn gọn, 1–3 câu."
+    advice_text = await get_ai_advice(prompt)
     push_to_tb({"advice_text": advice_text})
     logging.info("⏱️ Scheduled push completed.")
 
