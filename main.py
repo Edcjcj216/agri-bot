@@ -1,119 +1,142 @@
 import os
+import json
 import logging
 from datetime import datetime
+import requests
 import httpx
 from fastapi import FastAPI
 from apscheduler.schedulers.background import BackgroundScheduler
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # ================== CONFIG ==================
-TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN", "")
-OWM_API_KEY = os.getenv("OWM_API_KEY", "")
+OWM_API_KEY = os.getenv("OWM_API_KEY")
 LAT = os.getenv("LAT", "10.8781")
 LON = os.getenv("LON", "106.7594")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# ================== LOGGING ==================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+TB_URL = os.getenv("TB_URL", "https://thingsboard.cloud/api/v1")
+TB_TOKEN = os.getenv("TB_TOKEN")
 
-# ================== APP ==================
+CROP = "Rau muống"
+
 app = FastAPI()
+scheduler = BackgroundScheduler()
 
-# ================== THINGSBOARD ==================
-def push_telemetry(payload: dict):
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-    try:
-        logging.info(f"[INFO] Pushing telemetry: {payload}")
-        response = httpx.post(url, json=payload)
-        logging.info(f"[INFO] Response status: {response.status_code}, body: {response.text}")
-    except Exception as e:
-        logging.error(f"[ERROR] Failed to push telemetry: {e}")
+# ================== FUNCTIONS ==================
 
-# ================== FETCH OPENWEATHER ==================
-def fetch_openweather():
-    url = f"https://api.openweathermap.org/data/2.5/onecall?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&units=metric&exclude=minutely,daily,alerts"
+def fetch_weather():
+    """Fetch hourly weather from OpenWeather free endpoint."""
     try:
-        r = httpx.get(url, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        url = f"https://api.openweathermap.org/data/2.5/onecall?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&units=metric&exclude=minutely,daily,alerts"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        hourly = data.get("hourly", [])[:7]  # next 7 hours
+        weather = []
+        for i, h in enumerate(hourly):
+            weather.append({
+                f"hour_{i}": datetime.utcfromtimestamp(h["dt"]).strftime("%H:%M"),
+                f"hour_{i}_temperature": h["temp"],
+                f"hour_{i}_humidity": h["humidity"],
+                f"hour_{i}_weather_desc": h["weather"][0]["description"]
+            })
+        return weather
     except Exception as e:
-        logging.error(f"[ERROR] Error fetching OpenWeather: {e}")
+        logger.error(f"[ERROR] Error fetching OpenWeather: {e}")
         return None
 
-# ================== CALL AI ==================
-def generate_ai_advice(openweather_data):
-    prompt = f"""
-    Dựa trên dữ liệu thời tiết sau: {openweather_data}, đưa ra dự báo nông nghiệp cho rau muống:
-    - Advice dinh dưỡng
-    - Advice chăm sóc
-    - Note quan sát
-    """
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
-    data = {"prompt": prompt, "max_tokens": 300}
-    try:
-        r = httpx.post("https://api.openrouter.ai/v1/completions", json=data, headers=headers, timeout=20)
-        r.raise_for_status()
-        result = r.json()
-        # Tùy API Gemini/OpenRouter, parse output ở đây
-        advice_text = result.get("choices", [{}])[0].get("text", "Không có dữ liệu")
-        # split thành care/nutrition/note giả sử có ký tự phân cách
-        advice_parts = advice_text.split("|")
-        return {
-            "advice": advice_text,
-            "advice_nutrition": advice_parts[0] if len(advice_parts) > 0 else "",
-            "advice_care": advice_parts[1] if len(advice_parts) > 1 else "",
-            "advice_note": advice_parts[2] if len(advice_parts) > 2 else ""
-        }
-    except Exception as e:
-        logging.error(f"[ERROR] AI advice generation failed: {e}")
-        return {
-            "advice": "AI error",
-            "advice_nutrition": "",
-            "advice_care": "",
-            "advice_note": ""
-        }
+def fetch_ai_advice(weather_data):
+    """Call Gemini/OpenRouter AI to generate advice."""
+    prompt = f"Crop: {CROP}\nWeather data: {json.dumps(weather_data)}\nProvide advice (nutrition, care, note)."
+    headers_gemini = {"Authorization": f"Bearer {GEMINI_API_KEY}"} if GEMINI_API_KEY else {}
+    headers_or = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"} if OPENROUTER_API_KEY else {}
+    
+    # Try Gemini
+    if GEMINI_API_KEY:
+        try:
+            r = httpx.post("https://api.gemini.com/v1/generate", json={"prompt": prompt}, headers=headers_gemini, timeout=10)
+            r.raise_for_status()
+            result = r.json().get("text")
+            if result:
+                return parse_ai_advice(result)
+        except Exception as e:
+            logger.warning(f"[WARNING] Gemini API failed: {e}")
+    
+    # Try OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            r = httpx.post("https://openrouter.ai/api/v1/chat/completions",
+                           json={"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}]},
+                           headers=headers_or, timeout=10)
+            r.raise_for_status()
+            choices = r.json().get("choices", [])
+            if choices:
+                return parse_ai_advice(choices[0]["message"]["content"])
+        except Exception as e:
+            logger.warning(f"[WARNING] OpenRouter API failed: {e}")
 
-# ================== JOB ==================
+    return {"advice": "No AI advice available", "advice_care": "", "advice_nutrition": "", "advice_note": ""}
+
+def parse_ai_advice(text):
+    """Split AI advice into sections."""
+    return {
+        "advice": text,
+        "advice_care": text,
+        "advice_nutrition": text,
+        "advice_note": ""
+    }
+
+def push_telemetry(payload):
+    """Push payload to ThingsBoard."""
+    try:
+        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+        headers = {"Content-Type": "application/json"}
+        logger.info(f"[INFO] Pushing telemetry: {payload}")
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        logger.info(f"[INFO] Response status: {r.status_code}, body: {r.text}")
+    except Exception as e:
+        logger.error(f"[ERROR] ThingsBoard push failed: {e}")
+
 def job():
-    logging.info("[INFO] Running scheduled job...")
-    weather_data = fetch_openweather()
+    """Scheduled job to fetch weather, AI advice, and push telemetry."""
+    weather_data = fetch_weather()
     if not weather_data:
-        logging.error("[ERROR] Skipping job due to weather fetch failure")
+        logger.error("[ERROR] Skipping job due to weather fetch failure")
         return
 
-    # Prepare telemetry
-    telemetry = {}
-    # giờ hiện tại
-    now_hour = datetime.now().hour
-    current_weather = weather_data["hourly"][0]
-    telemetry.update({
-        "temperature": current_weather["temp"],
-        "humidity": current_weather["humidity"],
-        "weather_today_desc": weather_data["current"]["weather"][0]["description"],
+    ai_advice = fetch_ai_advice(weather_data)
+    payload = {
+        "timestamp": datetime.utcnow().isoformat(),
         "location": f"Lat {LAT}, Lon {LON}",
-    })
+        "crop": CROP,
+        "battery": 4.2,
+    }
 
-    # AI advice
-    ai_advice = generate_ai_advice(weather_data)
-    telemetry.update(ai_advice)
+    # Flatten hourly weather
+    for h in weather_data:
+        payload.update(h)
 
-    # Push
-    push_telemetry(telemetry)
+    payload.update(ai_advice)
+    push_telemetry(payload)
 
 # ================== STARTUP ==================
+
 @app.on_event("startup")
 def startup_event():
-    logging.info("[INFO] Starting app...")
+    logger.info("[INFO] Starting app...")
+    # Push startup ping
     push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
-
-    # Scheduler
-    scheduler = BackgroundScheduler()
+    # Add scheduler job every 15 min
     scheduler.add_job(job, 'interval', minutes=15, next_run_time=datetime.utcnow())
     scheduler.start()
 
-# ================== ROOT ==================
+# ================== HEALTH CHECK ==================
+
 @app.get("/")
-def root():
+def read_root():
     return {"status": "ok"}
+
