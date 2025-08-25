@@ -78,16 +78,22 @@ async def get_ai_advice_strict(prompt: str, hoi: str) -> str:
     for fn in [ask_gemini, ask_cohere, ask_deepai, ask_hf]:
         try:
             resp = await fn(prompt)
-            if resp.strip():  # Chỉ trả nếu có nội dung
+            if resp.strip():
                 return resp.strip()
         except Exception as e:
             logging.warning(f"AI provider failed: {e}")
-    # Fallback tối ưu: ngắn gọn, không hỏi ngược
     return f"Xin lỗi, hiện tại hệ thống AI không khả dụng để trả lời câu hỏi: '{hoi}'"
 
 # ================== PUSH THINGSBOARD ==================
 def push_to_tb(data: dict):
     global last_telemetry
+    # Ép output 1–3 câu
+    advice_text = data.get("advice_text", "")
+    advice_text = " ".join(advice_text.replace("\n", " ").split(". ")[:3]).strip()
+    if not advice_text.endswith("."):
+        advice_text += "."
+    data["advice_text"] = advice_text
+
     url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
         r = requests.post(url, json=data, timeout=10)
@@ -108,7 +114,6 @@ async def tb_webhook(req: Request):
 
     logging.info(f"💬 Câu hỏi nhận được: {hoi}")
 
-    # Prompt ngắn gọn bắt buộc
     prompt = f"""
 Người dùng hỏi: {hoi}
 Cây trồng: {crop}
