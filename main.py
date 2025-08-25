@@ -113,7 +113,7 @@ def push_to_tb(data: dict):
 async def tb_webhook(req: Request):
     body = await req.json()
     shared = body.get("shared", {})
-    hoi = shared.get("hoi", "")
+    hoi = shared.get("hoi", "").strip()
     crop = shared.get("crop", "")
     location = shared.get("location", "")
 
@@ -126,10 +126,11 @@ Người dùng hỏi: {hoi}
 Cây trồng: {crop}
 Vị trí: {location}
 
-Hãy trả lời NGAY lập tức, 1 đoạn văn ngắn gọn, thực tế, dễ hiểu cho nông dân.
-KHÔNG tổng quan, KHÔNG hỏi lại, KHÔNG dẫn link hay tài liệu.
+Trả lời NGAY câu hỏi trên, 1 đoạn duy nhất 1–3 câu, ngắn gọn, thực tế, dễ hiểu cho nông dân.
+KHÔNG hỏi lại, KHÔNG tổng quan, KHÔNG dẫn link hay tài liệu.
 """
     advice_text = await get_ai_advice_strict(prompt, hoi)
+    advice_text = limit_to_3_sentences(advice_text)
     push_to_tb({"advice_text": advice_text})
     return {"status": "ok", "advice_text": advice_text}
 
