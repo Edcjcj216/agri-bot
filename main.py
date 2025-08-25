@@ -1,72 +1,59 @@
 import os
 import logging
-from datetime import datetime
 from fastapi import FastAPI, Request
 import httpx
+import uvicorn
 
-# ================== CONFIG ==================
-TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_TOKEN")  # Device access token trên ThingsBoard
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Key Gemini AI
-
-# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tb-webhook")
 
-# ================== APP ==================
+THINGSBOARD_URL = "https://thingsboard.cloud/api/v1"
+THINGSBOARD_TOKEN = os.getenv("THINGSBOARD_TOKEN")  # Device Access Token
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
 app = FastAPI()
 
-# ================== THINGSBOARD PUSH ==================
-def push_telemetry(payload: dict):
-    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.post(url, json=payload)
-        logger.info(f"Pushed telemetry: {payload} | Status {resp.status_code}")
-    except Exception as e:
-        logger.error(f"Error pushing telemetry: {e}")
-
-# ================== AI CALL ==================
-def generate_ai_reply(question: str) -> str:
-    try:
-        if not GEMINI_API_KEY:
-            return f"(No GEMINI_API_KEY) Bạn hỏi: {question}"
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_content(question)
-        return resp.text.strip()
-    except Exception as e:
-        logger.error(f"AI generation error: {e}")
-        return f"(Error) Bạn hỏi: {question}"
-
-# ================== ROUTES ==================
 @app.get("/")
-def health_check():
-    return {"status": "ok", "message": "Server running"}
+async def root():
+    return {"status": "ok"}
 
 @app.post("/tb-webhook")
-async def tb_webhook(req: Request):
-    data = await req.json()
-    shared = data.get("shared", {})
-    hoi = shared.get("hoi", "")
+async def tb_webhook(request: Request):
+    data = await request.json()
+    logger.info(f"Received webhook: {data}")
 
-    logger.info(f"Received question: {hoi}")
+    hoi = data.get("shared", {}).get("hoi")
+    if not hoi:
+        return {"error": "No 'hoi' in shared attributes"}
 
-    # 1. Sinh câu trả lời bằng AI
-    answer = generate_ai_reply(hoi)
+    # gọi Gemini API sinh câu trả lời
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_KEY}"
+    payload = {
+        "contents": [
+            {"parts": [{"text": hoi}]}
+        ]
+    }
 
-    # 2. Đẩy lên ThingsBoard telemetry
-    push_telemetry({
-        "hoi": hoi,
-        "answer": answer,
-        "time": datetime.utcnow().isoformat()
-    })
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        gemini_data = r.json()
+        logger.info(f"Gemini response: {gemini_data}")
 
-    return {"status": "ok", "answer": answer}
+    try:
+        answer = gemini_data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        answer = "Xin lỗi, tôi chưa trả lời được."
 
-# ================== STARTUP ==================
-@app.on_event("startup")
-def startup_event():
+    # gửi trả lời lên ThingsBoard telemetry
+    telemetry_url = f"{THINGSBOARD_URL}/{THINGSBOARD_TOKEN}/telemetry"
+    async with httpx.AsyncClient() as client:
+        res = await client.post(telemetry_url, json={"answer": answer})
+        logger.info(f"Pushed telemetry: {{'answer': '{answer}'}} | Status {res.status_code}")
+
+    return {"answer": answer}
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
     logger.info("Starting server...")
-    push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
+    uvicorn.run(app, host="0.0.0.0", port=port)
