@@ -8,85 +8,126 @@ from datetime import datetime
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
 TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "your_weatherapi_key_here")
+LAT = 10.7769   # Hồ Chí Minh
+LON = 106.7009
+FORECAST_BIAS = 0  # giờ offset nếu cần chỉnh lệch dự báo
 
-# Lấy key từ biến môi trường OWM_API_KEY (dùng cho WeatherAPI)
-WEATHERAPI_KEY = os.getenv("OWM_API_KEY", "your_weatherapi_key_here")
-
-if WEATHERAPI_KEY == "your_weatherapi_key_here":
-    logging.warning("[WARN] WEATHERAPI_KEY chưa được set trong Render env (OWM_API_KEY).")
-else:
-    logging.info(f"[OK] WEATHERAPI_KEY đã load từ OWM_API_KEY (length={len(WEATHERAPI_KEY)})")
-
-LAT, LON = 10.7769, 106.7009  # HCM City
-DEVICE_TOKEN = TB_TOKEN
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
 
 # ================== FASTAPI ==================
 app = FastAPI()
+last_push_data = {}
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "time": datetime.utcnow()}
+# ================== WEATHER MAPPING ==================
+def map_weather_to_vn(condition_text: str, daily_max: float = None) -> str:
+    text = condition_text.lower()
 
-@app.head("/")
-async def head_root():
-    return {}
+    # Override Nắng nóng
+    if daily_max is not None and daily_max >= 35:
+        return "Nắng nóng"
 
-# ================== WEATHER JOB ==================
+    # Override Mưa bão
+    if "torrential rain" in text or "heavy rain with thunder" in text:
+        return "Mưa bão"
+
+    mapping = {
+        "sunny": "Có nắng",
+        "clear": "Trời quang",
+        "partly cloudy": "Nắng nhẹ",
+        "cloudy": "Nhiều mây",
+        "overcast": "Âm u",
+        "mist": "Sương mù",
+        "fog": "Sương mù",
+        "light rain": "Mưa nhẹ",
+        "patchy light rain": "Mưa nhẹ",
+        "patchy rain possible": "Mưa nhẹ",
+        "moderate rain": "Mưa vừa",
+        "moderate rain at times": "Mưa vừa",
+        "heavy rain": "Mưa to",
+        "heavy rain at times": "Mưa to",
+        "rain shower": "Mưa rào",
+        "light rain shower": "Mưa rào",
+        "showers": "Mưa rào",
+        "thunder": "Dông",
+        "thunderstorm": "Mưa giông",
+        "patchy light rain with thunder": "Mưa giông",
+        "moderate or heavy rain with thunder": "Mưa giông",
+    }
+
+    for key, val in mapping.items():
+        if key in text:
+            return val
+
+    return "Không xác định"
+
+# ================== WEATHER FETCH ==================
 def fetch_weather():
-    url = (
-        f"http://api.weatherapi.com/v1/forecast.json"
-        f"?key={WEATHERAPI_KEY}&q={LAT},{LON}&days=1&aqi=no&alerts=no&lang=vi"
-    )
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={LAT},{LON}&days=1&aqi=no&alerts=no"
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
 
-        current = data.get("current", {})
-        forecast_today = data.get("forecast", {}).get("forecastday", [{}])[0].get("day", {})
+        current = data["current"]
+        forecast_day = data["forecast"]["forecastday"][0]
+        daily_max = forecast_day["day"]["maxtemp_c"]
 
         telemetry = {
-            "temperature": current.get("temp_c"),
-            "humidity": current.get("humidity"),
-            "prediction": f"Nhiệt độ {current.get('temp_c')}°C, độ ẩm {current.get('humidity')}%",
-            "weather_today_min": forecast_today.get("mintemp_c"),
-            "weather_today_max": forecast_today.get("maxtemp_c"),
-            "weather_today_desc": forecast_today.get("condition", {}).get("text"),
-            "time": datetime.utcnow().isoformat(),
+            "temperature": current["temp_c"],
+            "humidity": current["humidity"],
+            "weather_desc": map_weather_to_vn(current["condition"]["text"], daily_max),
+            "daily_max": daily_max,
+            "_ts": int(datetime.utcnow().timestamp() * 1000),
         }
 
-        push_telemetry(telemetry)
-        logging.info(f"🌤 Pushed telemetry: {telemetry}")
+        # Thêm dự báo giờ (hour_0..hour_4)
+        for i in range(5):
+            hour = forecast_day["hour"][i + FORECAST_BIAS]
+            telemetry[f"hour_{i}temperature"] = hour["temp_c"]
+            telemetry[f"hour_{i}humidity"] = hour["humidity"]
+            telemetry[f"hour_{i}weather_desc"] = map_weather_to_vn(hour["condition"]["text"], daily_max)
+
+        return telemetry
 
     except Exception as e:
-        logging.error(f"[ERROR] Fetch WeatherAPI: {e}")
+        logger.error(f"[ERROR] Fetch WeatherAPI: {e}")
+        return None
 
-def push_telemetry(payload: dict):
+# ================== PUSH TO THINGSBOARD ==================
+def push_thingsboard(payload: dict):
+    global last_push_data
     try:
-        url = f"{TB_URL}/{DEVICE_TOKEN}/telemetry"
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        logging.info(f"✅ Sent to ThingsBoard: {payload}")
+        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        last_push_data = payload
+        logger.info(f"✅ Sent to ThingsBoard: {payload}")
     except Exception as e:
-        logging.error(f"[ERROR] Push ThingsBoard: {e}")
+        logger.error(f"[ERROR] Push ThingsBoard: {e}")
+
+# ================== JOB ==================
+def job():
+    weather = fetch_weather()
+    if weather:
+        push_thingsboard(weather)
 
 # ================== STARTUP ==================
 scheduler = BackgroundScheduler()
+scheduler.add_job(job, "interval", minutes=5)
+scheduler.start()
 
 @app.on_event("startup")
 async def startup_event():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    logger.info("🚀 Service started, pushing first telemetry...")
+    job()
 
-    logging.info("🚀 App startup")
-    logging.info("🌤 Weather job scheduler started")
+@app.get("/")
+async def root():
+    return {"status": "running", "last_push": last_push_data}
 
-    scheduler.add_job(fetch_weather, "interval", minutes=5, id="weather_job", replace_existing=True)
-    scheduler.start()
-
-    # Gửi 1 telemetry test khi khởi động
-    push_telemetry({"startup": True, "time": datetime.utcnow().isoformat()})
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    scheduler.shutdown()
+@app.get("/last-push")
+async def last_push():
+    return last_push_data
