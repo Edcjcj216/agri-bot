@@ -11,10 +11,12 @@ TB_URL = "https://thingsboard.cloud/api/v1"
 TB_TOKEN = os.getenv("TB_TOKEN")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 LOCATION = os.getenv("LOCATION", "Ho Chi Minh,VN")
-CROP = "Rau muống"
+CROP_NAME = "Rau muống"
 
-if not TB_TOKEN or not WEATHER_KEY:
-    raise RuntimeError("⚠️ Missing TB_TOKEN or WEATHER_API_KEY in environment variables!")
+if not TB_TOKEN:
+    raise RuntimeError("⚠️ Missing TB_TOKEN in environment variables!")
+if not WEATHER_KEY:
+    raise RuntimeError("⚠️ Missing WEATHER_API_KEY in environment variables!")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -23,7 +25,7 @@ logger.info(f"✅ Startup with TB_TOKEN (first 4 chars): {TB_TOKEN[:4]}****")
 # ================== APP ==================
 app = FastAPI()
 
-# ================== WEATHER MAPPING ==================
+# ================== 16 Weather Types ==================
 weather_mapping_vi = {
     "Sunny": "Nắng nhẹ / Nắng ấm",
     "Clear": "Trời quang",
@@ -35,9 +37,10 @@ weather_mapping_vi = {
     "Moderate rain": "Mưa vừa",
     "Heavy rain": "Mưa to / Mưa lớn",
     "Torrential rain shower": "Mưa rất to / Kéo dài",
+    "Patchy light rain": "Có mưa cục bộ",
+    "Patchy rain nearby": "Có mưa cục bộ",
     "Patchy light rain with thunder": "Mưa rào kèm dông / Mưa dông",
     "Moderate or heavy rain with thunder": "Mưa rào kèm dông / Mưa dông",
-    "Patchy rain nearby": "Có mưa cục bộ",
     "Thundery outbreaks possible": "Có thể có dông",
     "Fog": "Sương mù",
 }
@@ -53,51 +56,32 @@ def fetch_weather():
         r.raise_for_status()
         data = r.json()
 
-        # Dự báo 4-7 giờ tới (hourly)
-        forecast_hours = []
-        now_hour = datetime.utcnow().hour
-        for i in range(4, 8):
-            hour_idx = i
-            if hour_idx >= len(data["forecast"]["forecastday"][0]["hour"]):
-                break
-            h = data["forecast"]["forecastday"][0]["hour"][hour_idx]
-            forecast_hours.append({
-                f"hour_{i-4}_temperature": h["temp_c"],
-                f"hour_{i-4}_humidity": h["humidity"],
-                f"hour_{i-4}_weather_desc": translate_condition(h["condition"]["text"]),
-                f"hour_{i-4}_weather_desc_en": h["condition"]["text"]
-            })
+        telemetry = {"time": datetime.utcnow().isoformat(), "crop": CROP_NAME, "location": LOCATION}
 
-        # Hôm qua, hôm nay, ngày mai
-        today = data["forecast"]["forecastday"][0]["day"]
-        tomorrow = data["forecast"]["forecastday"][1]["day"]
-        yesterday_weather_desc = "Không có dữ liệu"  # WeatherAPI free không cung cấp ngày trước
-        telemetry = {
-            "time": datetime.utcnow().isoformat(),
-            "location": LOCATION,
-            "crop": CROP,
-            "temperature_today_min": today["mintemp_c"],
-            "temperature_today_max": today["maxtemp_c"],
-            "humidity_today_avg": today["avghumidity"],
-            "weather_today_desc": translate_condition(today["condition"]["text"]),
-            "weather_today_desc_en": today["condition"]["text"],
-            "temperature_tomorrow_min": tomorrow["mintemp_c"],
-            "temperature_tomorrow_max": tomorrow["maxtemp_c"],
-            "humidity_tomorrow_avg": tomorrow["avghumidity"],
-            "weather_tomorrow_desc": translate_condition(tomorrow["condition"]["text"]),
-            "weather_tomorrow_desc_en": tomorrow["condition"]["text"],
-            "temperature_yesterday_min": None,
-            "temperature_yesterday_max": None,
-            "humidity_yesterday_avg": None,
-            "weather_yesterday_desc": yesterday_weather_desc,
-            "weather_yesterday_desc_en": yesterday_weather_desc
-        }
+        # --- 4–7 giờ tới (hourly forecast) ---
+        hourly = data["forecast"]["forecastday"][0]["hour"][:7]  # giờ 0–6
+        for i, h in enumerate(hourly[4:8]):  # giờ 4–7
+            telemetry[f"hour_{i}_temperature"] = h["temp_c"]
+            telemetry[f"hour_{i}_humidity"] = h["humidity"]
+            telemetry[f"hour_{i}_weather_desc"] = translate_condition(h["condition"]["text"])
+            telemetry[f"hour_{i}_weather_desc_en"] = h["condition"]["text"]
 
-        # Gộp forecast hours
-        for h in forecast_hours:
-            telemetry.update(h)
+        # --- Hôm qua / hôm nay / ngày mai ---
+        days = [data["forecast"]["forecastday"][0]]  # hôm nay
+        if len(data["forecast"]["forecastday"]) > 1:
+            days.append(data["forecast"]["forecastday"][1])  # ngày mai
+
+        # Nếu API hỗ trợ yesterday, có thể thêm ngày hôm qua (tạm bỏ nếu API free ko có)
+        for idx, d in enumerate(days):
+            day_key = ["today", "tomorrow"][idx]
+            telemetry[f"weather_{day_key}_desc"] = translate_condition(d["day"]["condition"]["text"])
+            telemetry[f"weather_{day_key}_desc_en"] = d["day"]["condition"]["text"]
+            telemetry[f"weather_{day_key}_max"] = d["day"]["maxtemp_c"]
+            telemetry[f"weather_{day_key}_min"] = d["day"]["mintemp_c"]
+            telemetry[f"humidity_{day_key}"] = d["day"]["avghumidity"]
 
         return telemetry
+
     except Exception as e:
         logger.error(f"[ERROR] Fetch WeatherAPI: {e}")
         return None
@@ -125,6 +109,7 @@ scheduler.start()
 @app.on_event("startup")
 def startup_event():
     logger.info("🚀 Service started, pushing startup telemetry...")
+    push_thingsboard({"startup": True, "time": datetime.utcnow().isoformat()})
     job()
 
 # ================== ENDPOINTS ==================
