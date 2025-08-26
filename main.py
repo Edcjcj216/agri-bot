@@ -52,7 +52,7 @@ WEATHER_CODE_MAP = {
     51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
     61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
     80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
-    95: "Có dông", 96: "Có dông", 99: "Có dông",
+    95: "Có giông", 96: "Có giông", 99: "Có giông",
 }
 
 # ============ STATE ============
