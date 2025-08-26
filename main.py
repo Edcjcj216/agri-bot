@@ -36,8 +36,9 @@ EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
 OWM_API_KEY = os.getenv("OWM_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
-# Provider priority: default tries open-meteo first then OWM then WeatherAPI; can override with PROVIDER_PRIORITY env
-PROVIDER_PRIORITY_ENV = os.getenv("PROVIDER_PRIORITY", "").strip()
+# Control flags
+PROVIDER_PRIORITY_ENV = os.getenv("PROVIDER_PRIORITY", "").strip()  # optional override
+DISABLE_ADVICE = os.getenv("DISABLE_ADVICE", "0").strip() in ("1", "true", "True")
 
 # Bias correction settings
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
@@ -116,7 +117,6 @@ WEATHER_MAP = {
 weather_cache = {"ts": 0, "data": {}}
 
 # ----------------- SQLite persistence -----------------
-
 def init_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
@@ -151,7 +151,6 @@ def init_db():
         except Exception:
             pass
 
-
 def load_history_from_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
@@ -177,7 +176,6 @@ def load_history_from_db():
         except Exception:
             pass
 
-
 def insert_history_to_db(api_temp, observed_temp, provider: str | None = None):
     try:
         conn = sqlite3.connect(BIAS_DB_FILE, timeout=10)
@@ -201,7 +199,6 @@ def insert_history_to_db(api_temp, observed_temp, provider: str | None = None):
             pass
 
 # ----------------- Helpers -----------------
-
 def _now_local():
     if ZoneInfo is not None:
         try:
@@ -209,7 +206,6 @@ def _now_local():
         except Exception:
             return datetime.now()
     return datetime.now()
-
 
 def _normalize_text(s: str) -> str:
     if not s:
@@ -235,7 +231,6 @@ PARTIAL_MAP = [
     (r"sunny", "Nắng"),
 ]
 
-
 def translate_desc(desc_raw):
     if not desc_raw:
         return None
@@ -250,7 +245,6 @@ def translate_desc(desc_raw):
         if re.search(pat, low):
             return mapped
     return cleaned
-
 
 def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: float | None, windspeed: float | None):
     parts = []
@@ -286,7 +280,7 @@ def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: floa
     s = ", ".join(parts)
     return s[0].upper() + s[1:]
 
-
+# ---------- compute daily min/max from hourly ------------
 def _normalize_time_str(t):
     if not t:
         return None
@@ -297,7 +291,6 @@ def _normalize_time_str(t):
             return datetime.strptime(t, "%Y-%m-%d %H:%M")
         except Exception:
             return None
-
 
 def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
     temps = []
@@ -317,7 +310,6 @@ def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
         return None, None
     return round(min(temps), 1), round(max(temps), 1)
 
-
 def _to_zone(dt: datetime):
     if ZoneInfo is not None:
         tz = ZoneInfo(TIMEZONE)
@@ -328,7 +320,6 @@ def _to_zone(dt: datetime):
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).astimezone(tz)
     return dt.astimezone(tz)
-
 
 def find_closest_api_now(hourly_list):
     if not hourly_list:
@@ -367,14 +358,12 @@ def find_closest_api_now(hourly_list):
         return best.get("temperature")
     return None
 
-
 def compute_mean_abs_error_for_provider(provider: str):
     dq = bias_history_per_provider.get(provider, None)
     if not dq or len(dq) == 0:
         return None
     errors = [abs(obs - api) for api, obs in dq if api is not None and obs is not None]
     return round(sum(errors) / len(errors), 2) if errors else None
-
 
 def get_provider_order():
     possible = ["open-meteo", "owm", "weatherapi"]
@@ -388,12 +377,10 @@ def get_provider_order():
     for p in ["owm", "weatherapi"]:
         m = compute_mean_abs_error_for_provider(p)
         scores[p] = m if m is not None else float("inf")
-    # put open-meteo first by default
     ordered = ["open-meteo"] + sorted([p for p in ["owm", "weatherapi"]], key=lambda x: (scores.get(x, float("inf")), x))
     return ordered
 
 # ================== FETCHERS ==================
-
 def _requests_get_with_retry(url, params=None, timeout=REQUEST_TIMEOUT):
     try:
         r = requests.get(url, params=params, timeout=timeout)
@@ -409,9 +396,7 @@ def _requests_get_with_retry(url, params=None, timeout=REQUEST_TIMEOUT):
                 raise
         raise
 
-
 def fetch_open_meteo_with_history():
-    # Try several parameter variants to avoid the "Data corrupted" 400 from some Open-Meteo responses
     try:
         now = datetime.utcnow()
         start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -504,7 +489,6 @@ def fetch_open_meteo_with_history():
     except Exception as e:
         logger.warning(f"fetch_open_meteo_with_history error: {e}")
         return None
-
 
 def fetch_owm_with_history():
     if not OWM_API_KEY:
@@ -631,8 +615,8 @@ def fetch_owm_with_history():
         logger.warning(f"fetch_owm_with_history error: {e}")
         return None
 
-
 def fetch_weatherapi_with_history():
+    # This function remains but will not be used if WEATHER_API_KEY is not set.
     if not WEATHER_API_KEY:
         return None
     try:
@@ -762,67 +746,130 @@ def fetch_weatherapi_with_history():
         return None
 
 # ================== MAIN get_weather_forecast ==================
+def _parse_api_time_to_local(t_str):
+    if not t_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(t_str)
+    except Exception:
+        try:
+            dt = datetime.strptime(t_str, "%Y-%m-%d %H:%M")
+            dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if ZoneInfo is not None:
+        try:
+            return dt.astimezone(ZoneInfo(TIMEZONE))
+        except Exception:
+            return dt.astimezone()
+    return dt.astimezone()
+
+def align_next_hours_and_enrich(hourly_list):
+    if not hourly_list:
+        return []
+    parsed = []
+    for h in hourly_list:
+        t = h.get("time")
+        if not t:
+            continue
+        dt_local = _parse_api_time_to_local(t)
+        if dt_local is None:
+            continue
+        parsed.append((dt_local, h))
+    if not parsed:
+        return []
+    parsed.sort(key=lambda x: x[0])
+    now_local = _now_local().replace(minute=0, second=0, microsecond=0)
+    best_idx = min(range(len(parsed)), key=lambda i: abs((parsed[i][0] - now_local).total_seconds()))
+    out = []
+    for i in range(best_idx, best_idx + EXTENDED_HOURS):
+        if i >= len(parsed):
+            break
+        dt_local, h = parsed[i]
+        entry = {
+            "time": h.get("time"),
+            "time_local": dt_local.isoformat(),
+            "temperature": h.get("temperature"),
+            "humidity": h.get("humidity"),
+            "weather_desc": h.get("weather_desc"),
+            "precipitation": h.get("precipitation") if h.get("precipitation") is not None else h.get("precipitation_mm") if h.get("precipitation_mm") is not None else None,
+            "precip_probability": h.get("precip_probability") if h.get("precip_probability") is not None else h.get("precip_probability_pct") if h.get("precip_probability_pct") is not None else None,
+            "windspeed": h.get("windspeed"),
+            "winddir": h.get("winddir")
+        }
+        out.append(entry)
+    return out
+
+def build_result_from_generic(daily_list, hourly_list, source_name=""):
+    now = _now_local()
+    hums = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
+    humidity_yesterday = round(sum(hums[0:24]) / len(hums[0:24]), 1) if len(hums) >= 24 else None
+    humidity_today = round(sum(hums[24:48]) / len(hums[24:48]), 1) if len(hums) >= 48 else None
+    humidity_tomorrow = round(sum(hums[48:72]) / len(hums[48:72]), 1) if len(hums) >= 72 else None
+
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_str = now.strftime("%Y-%m-%d")
+
+    if not any(d.get("date") == yesterday_str for d in daily_list):
+        ymin, ymax = compute_daily_min_max_from_hourly(hourly_list, yesterday_str)
+        if ymin is not None or ymax is not None:
+            daily_list.insert(0, {"date": yesterday_str, "desc": None, "max": ymax, "min": ymin, "precipitation_sum": None, "windspeed_max": None})
+
+    idx_today = 0
+    for i, d in enumerate(daily_list):
+        if d.get("date") == today_str:
+            idx_today = i
+            break
+
+    def safe_get_daily(idx):
+        if 0 <= idx < len(daily_list):
+            d = daily_list[idx]
+            return {
+                "date": d.get("date"),
+                "desc": d.get("desc"),
+                "max": d.get("max"),
+                "min": d.get("min"),
+                "precipitation_sum": d.get("precipitation_sum"),
+                "windspeed_max": d.get("windspeed_max")
+            }
+        return {"date": None, "desc": None, "max": None, "min": None, "precipitation_sum": None, "windspeed_max": None}
+
+    weather_yesterday = safe_get_daily(idx_today - 1)
+    weather_today = safe_get_daily(idx_today)
+    weather_tomorrow = safe_get_daily(idx_today + 1)
+
+    aligned_next_hours = align_next_hours_and_enrich(hourly_list)
+
+    result = {
+        "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": source_name, "providers_now": {}},
+        "yesterday": weather_yesterday,
+        "today": weather_today,
+        "tomorrow": weather_tomorrow,
+        "next_hours": aligned_next_hours,
+        "humidity_yesterday": humidity_yesterday,
+        "humidity_today": humidity_today,
+        "humidity_tomorrow": humidity_tomorrow
+    }
+    return result
 
 def get_weather_forecast():
     now = _now_local()
     if time.time() - weather_cache["ts"] < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
         return weather_cache["data"]
 
-    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    today_str = now.strftime("%Y-%m-%d")
-
-    def build_result_from_generic(daily_list, hourly_list, source_name="", providers_now=None):
-        hums = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
-        humidity_yesterday = round(sum(hums[0:24]) / len(hums[0:24]), 1) if len(hums) >= 24 else None
-        humidity_today = round(sum(hums[24:48]) / len(hums[24:48]), 1) if len(hums) >= 48 else None
-        humidity_tomorrow = round(sum(hums[48:72]) / len(hums[48:72]), 1) if len(hums) >= 72 else None
-
-        if not any(d.get("date") == yesterday_str for d in daily_list):
-            ymin, ymax = compute_daily_min_max_from_hourly(hourly_list, yesterday_str)
-            if ymin is not None or ymax is not None:
-                daily_list.insert(0, {"date": yesterday_str, "desc": None, "max": ymax, "min": ymin, "precipitation_sum": None, "windspeed_max": None})
-
-        idx_today = 0
-        for i, d in enumerate(daily_list):
-            if d.get("date") == today_str:
-                idx_today = i
-                break
-
-        def safe_get_daily(idx):
-            if 0 <= idx < len(daily_list):
-                d = daily_list[idx]
-                return {
-                    "date": d.get("date"),
-                    "desc": d.get("desc"),
-                    "max": d.get("max"),
-                    "min": d.get("min"),
-                    "precipitation_sum": d.get("precipitation_sum"),
-                    "windspeed_max": d.get("windspeed_max")
-                }
-            return {"date": None, "desc": None, "max": None, "min": None, "precipitation_sum": None, "windspeed_max": None}
-
-        weather_yesterday = safe_get_daily(idx_today - 1)
-        weather_today = safe_get_daily(idx_today)
-        weather_tomorrow = safe_get_daily(idx_today + 1)
-
-        result = {
-            "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": source_name, "providers_now": providers_now or {}},
-            "yesterday": weather_yesterday,
-            "today": weather_today,
-            "tomorrow": weather_tomorrow,
-            "next_hours": hourly_list,
-            "humidity_yesterday": humidity_yesterday,
-            "humidity_today": humidity_today,
-            "humidity_tomorrow": humidity_tomorrow
-        }
-        return result
-
     provider_order = get_provider_order()
+    # remove weatherapi from order if we don't have a key
+    if not WEATHER_API_KEY:
+        provider_order = [p for p in provider_order if p != "weatherapi"]
+
     fetchers = {
         "open-meteo": fetch_open_meteo_with_history,
         "owm": fetch_owm_with_history,
-        "weatherapi": fetch_weatherapi_with_history
     }
+    if WEATHER_API_KEY:
+        fetchers["weatherapi"] = fetch_weatherapi_with_history
 
     selected_result = None
     selected_provider = None
@@ -843,14 +890,11 @@ def get_weather_forecast():
                 api_now_temp = None
 
             providers_now[p] = api_now_temp
-            try:
-                log_now = datetime.now(ZoneInfo(TIMEZONE)) if ZoneInfo else datetime.now(timezone.utc)
-            except Exception:
-                log_now = datetime.now(timezone.utc)
-            logger.info(f"provider={p} api_now={api_now_temp} (local now={log_now})")
+            logger.info(f"provider={p} api_now={api_now_temp}")
             if selected_result is None:
-                selected_result = build_result_from_generic(daily_list, hourly_list, source_name=p, providers_now=providers_now)
+                selected_result = build_result_from_generic(daily_list, hourly_list, source_name=p)
                 selected_provider = p
+                selected_result["meta"]["providers_now"] = providers_now
                 if has_yday:
                     break
         except Exception as e:
@@ -870,7 +914,6 @@ def get_weather_forecast():
     return selected_result
 
 # ================== BIAS / ADVICE / ROUTES ==================
-
 def record_provider_errors_and_compute_bias(observed_temp, weather_meta):
     providers_now = weather_meta.get("providers_now", {}) if weather_meta else {}
     chosen = weather_meta.get("chosen_provider")
@@ -894,8 +937,8 @@ def record_provider_errors_and_compute_bias(observed_temp, weather_meta):
         return bias, len(bias_history), None
     return 0.0, 0, None
 
-
 def get_advice(temp, humi, upcoming_weather=None):
+    # rule-based advice; will be skipped entirely if DISABLE_ADVICE is true
     nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
     care = []
     if temp is None:
@@ -939,7 +982,6 @@ def get_advice(temp, humi, upcoming_weather=None):
         "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
     }
 
-
 def send_to_thingsboard(data: dict):
     try:
         logger.info(f"TB ▶ sending payload (keys: {list(data.keys())})")
@@ -948,15 +990,12 @@ def send_to_thingsboard(data: dict):
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
-
 def merge_weather_and_hours(existing_data=None):
     if existing_data is None:
         existing_data = {}
     weather = get_weather_forecast()
-
     now = _now_local()
     flattened = {**existing_data}
-
     try:
         # DAILY - today
         if weather.get("today"):
@@ -1013,17 +1052,17 @@ def merge_weather_and_hours(existing_data=None):
         flattened["humidity_tomorrow"] = weather.get("humidity_tomorrow") if weather.get("humidity_tomorrow") is not None else None
         flattened["humidity_yesterday"] = weather.get("humidity_yesterday") if weather.get("humidity_yesterday") is not None else None
 
-        # hours (ensure keys exist even if missing)
-        nh = weather.get("next_hours", []) or []
+        # hours (use aligned/enriched next_hours)
+        nh = align_next_hours_and_enrich(weather.get("next_hours", []) or [])
         for idx in range(0, EXTENDED_HOURS):
             h = nh[idx] if idx < len(nh) else None
             time_label = None
-            if h and h.get("time"):
+            if h and h.get("time_local"):
                 try:
-                    t = datetime.fromisoformat(h.get("time"))
+                    t = datetime.fromisoformat(h.get("time_local"))
                     time_label = t.strftime("%H:%M")
                 except Exception:
-                    time_label = h.get("time")
+                    time_label = h.get("time_local")
             flattened[f"hour_{idx}"] = time_label
             flattened[f"hour_{idx}_temperature"] = h.get("temperature") if h else None
             flattened[f"hour_{idx}_humidity"] = h.get("humidity") if h else None
@@ -1083,17 +1122,28 @@ def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
     weather = get_weather_forecast()
     next_hours = weather.get("next_hours", [])
+
+    # record provider errors & compute bias
     bias, history_len, chosen_provider = record_provider_errors_and_compute_bias(data.temperature, weather.get("meta", {}))
-    chosen_api_now = None
-    if weather.get("meta") and weather["meta"].get("providers_now"):
-        chosen_api_now = weather["meta"]["providers_now"].get(chosen_provider)
-    if chosen_api_now is not None:
-        try:
-            bias_history.append((float(chosen_api_now), float(data.temperature)))
-            insert_history_to_db(float(chosen_api_now), float(data.temperature), provider=chosen_provider)
-        except Exception:
-            pass
-    advice_data = get_advice(data.temperature, data.humidity, upcoming_weather=next_hours)
+
+    # optionally append chosen provider pair to legacy bias_history as well
+    try:
+        if weather.get("meta") and weather["meta"].get("providers_now") and chosen_provider:
+            chosen_api_now = weather["meta"]["providers_now"].get(chosen_provider)
+            if chosen_api_now is not None:
+                bias_history.append((float(chosen_api_now), float(data.temperature)))
+                insert_history_to_db(float(chosen_api_now), float(data.temperature), provider=chosen_provider)
+    except Exception:
+        pass
+
+    # baseline (rule-based) advice, unless disabled
+    advice_data = {}
+    if not DISABLE_ADVICE:
+        advice_data = get_advice(data.temperature, data.humidity, upcoming_weather=next_hours)
+    else:
+        # keep fields empty / None to avoid telemetry errors downstream
+        advice_data = {"advice": None, "advice_nutrition": None, "advice_care": None, "advice_note": None, "prediction": None}
+
     merged = {
         **data.dict(),
         **advice_data,
@@ -1102,11 +1152,15 @@ def receive_data(data: SensorData):
         "forecast_bias": bias,
         "forecast_history_len": history_len
     }
-    merged["llm_advice"] = None
+
+    merged["llm_advice"] = None  # LLM removed
+
+    # attach hours and push
     merged = merge_weather_and_hours(existing_data=merged)
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
 
+# ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
     logger.info("Auto-loop simulator started")
     battery = 4.2
@@ -1121,10 +1175,17 @@ async def auto_loop():
             humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
+
             weather = get_weather_forecast()
             if weather.get("meta"):
                 record_provider_errors_and_compute_bias(sample["temperature"], weather.get("meta", {}))
-            advice_data = get_advice(sample["temperature"], sample["humidity"], upcoming_weather=weather.get("next_hours", []))
+
+            # advice depending on DISABLE_ADVICE
+            if not DISABLE_ADVICE:
+                advice_data = get_advice(sample["temperature"], sample["humidity"], upcoming_weather=weather.get("next_hours", []))
+            else:
+                advice_data = {"advice": None, "advice_nutrition": None, "advice_care": None, "advice_note": None, "prediction": None}
+
             merged = {
                 **sample,
                 **advice_data,
@@ -1133,7 +1194,9 @@ async def auto_loop():
                 "forecast_bias": 0.0,
                 "forecast_history_len": len(bias_history)
             }
+
             merged["llm_advice"] = None
+
             merged = merge_weather_and_hours(existing_data=merged)
             send_to_thingsboard(merged)
             tick += 1
@@ -1149,6 +1212,6 @@ async def startup():
 
 # ================== NOTES ==================
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - Ensure keys set in env if you want OWM/WeatherAPI; Open-Meteo fallback requires no key.
-# - To force provider order set PROVIDER_PRIORITY env, e.g. "open-meteo,owm,weatherapi"
-# - This file prioritizes Open-Meteo and tries parameter variants to avoid 400 Data corrupted errors.
+# - To disable advice (rule-based), set env DISABLE_ADVICE=1
+# - If you don't want WeatherAPI used, leave WEATHER_API_KEY empty; code will skip it automatically.
+# - Open-Meteo fallback requires no key and is prioritized by default.
