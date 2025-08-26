@@ -67,7 +67,7 @@ WEATHER_CODE_MAP = {
     1: "Nắng nhẹ",
     2: "Ít mây",
     3: "Nhiều mây",
-    45: "Sương muối",  # simplified label
+    45: "Sương muối",
     48: "Sương muối",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
@@ -225,6 +225,7 @@ def translate_desc(desc_raw):
     return cleaned
 
 def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: float | None, windspeed: float | None):
+    # kept but unused for short-label mode
     parts = []
     if base_phrase:
         parts.append(base_phrase)
@@ -463,7 +464,7 @@ def fetch_open_meteo():
                 "weather_desc": short_desc,
                 "weather_short": short_desc,
                 "weather_code": code,
-                # keep raw meteorological numbers as separate fields (but UI won't include them in the short phrase)
+                # keep raw meteorological numbers as separate fields (UI should not use them to build the short label)
                 "precipitation": precip,
                 "precip_probability": precip_prob,
                 "windspeed": windspeed,
@@ -510,7 +511,7 @@ def update_bias_and_correct(next_hours, observed_temp):
 
     return bias
 
-# ================== AI HELPER (removed) - STUB ==================
+# ================== ADVICE STUB (removed AI) ==================
 def get_advice(temp, humi, upcoming_weather=None):
     pred = None
     try:
@@ -572,31 +573,25 @@ def merge_weather_and_hours(existing_data=None):
 
     flattened = {**existing_data}
 
-    # DAILY - today
+    # DAILY - today (SHORT LABEL ONLY, NO RANGE)
     t = weather.get("today", {}) or {}
     if t.get("desc") is not None:
-        rng = None
-        if t.get("max") is not None and t.get("min") is not None:
-            rng = f" ({t.get('min')}–{t.get('max')}°C)"
-        flattened["weather_today_desc"] = (t.get("desc") or "") + (rng or "")
+        flattened["weather_today_desc"] = t.get("desc")
     else:
         flattened["weather_today_desc"] = None
     flattened["weather_today_max"] = t.get("max") if t.get("max") is not None else None
     flattened["weather_today_min"] = t.get("min") if t.get("min") is not None else None
 
-    # DAILY - tomorrow
+    # DAILY - tomorrow (SHORT LABEL ONLY, NO RANGE)
     tt = weather.get("tomorrow", {}) or {}
     if tt.get("desc") is not None:
-        rng = None
-        if tt.get("max") is not None and tt.get("min") is not None:
-            rng = f" ({tt.get('min')}–{tt.get('max')}°C)"
-        flattened["weather_tomorrow_desc"] = (tt.get("desc") or "") + (rng or "")
+        flattened["weather_tomorrow_desc"] = tt.get("desc")
     else:
         flattened["weather_tomorrow_desc"] = None
     flattened["weather_tomorrow_max"] = tt.get("max") if tt.get("max") is not None else None
     flattened["weather_tomorrow_min"] = tt.get("min") if tt.get("min") is not None else None
 
-    # DAILY - yesterday
+    # DAILY - yesterday (SHORT LABEL ONLY)
     ty = weather.get("yesterday", {}) or {}
     flattened["weather_yesterday_desc"] = ty.get("desc")
     flattened["weather_yesterday_max"] = ty.get("max")
@@ -615,7 +610,7 @@ def merge_weather_and_hours(existing_data=None):
             break
         next_hours.append(hourly_list[i])
 
-    # attach selected hours (hour_0 .. hour_N-1)
+    # attach selected hours (hour_0 .. hour_N-1) — weather_desc is SHORT LABEL ONLY
     for idx_h, h in enumerate(next_hours):
         time_label = None
         time_local_iso = None
@@ -635,6 +630,7 @@ def merge_weather_and_hours(existing_data=None):
             flattened[f"hour_{idx_h}"] = time_label
             flattened[f"hour_{idx_h}_time_local"] = time_local_iso
 
+        # numeric fields (kept — UI SHOULD NOT build textual description from these)
         if h.get("temperature") is not None:
             flattened[f"hour_{idx_h}_temperature"] = h.get("temperature")
         if h.get("humidity") is not None:
@@ -651,15 +647,26 @@ def merge_weather_and_hours(existing_data=None):
         if h.get("winddir") is not None:
             flattened[f"hour_{idx_h}_winddir"] = h.get("winddir")
 
-        # ensure weather_desc is only the short label (no extra numbers)
+        # --- FORCE weather_desc to be SHORT LABEL ONLY (no numbers, no extra text) ---
         short_label = None
         if h.get("weather_short"):
             short_label = h.get("weather_short")
         elif h.get("weather_code") is not None:
-            short_label = WEATHER_CODE_MAP.get(h.get("weather_code"))
+            try:
+                short_label = WEATHER_CODE_MAP.get(int(h.get("weather_code")))
+            except Exception:
+                short_label = None
         else:
-            possible = h.get("weather_desc")
-            short_label = translate_desc(possible) if possible else None
+            raw = h.get("weather_desc")
+            short_label = translate_desc(raw) if raw else None
+
+        # defensive cleanup: remove parentheses, ranges or appended phrases if any
+        if isinstance(short_label, str):
+            short_label = re.sub(r"\([^)]*\)", "", short_label).strip()
+            short_label = re.sub(r"lượng mưa.*", "", short_label, flags=re.IGNORECASE).strip()
+            short_label = re.sub(r"gió.*", "", short_label, flags=re.IGNORECASE).strip()
+            if short_label == "":
+                short_label = None
 
         flattened[f"hour_{idx_h}_weather_short"] = short_label
         flattened[f"hour_{idx_h}_weather_desc"] = short_label
