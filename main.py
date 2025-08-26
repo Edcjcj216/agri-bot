@@ -517,34 +517,58 @@ def send_to_thingsboard(data: dict):
 
 # ================== HELPERS ==================
 
+def _to_local_dt(timestr):
+    """Parse an ISO-ish time string into a timezone-aware datetime in TIMEZONE.
+    If the parsed datetime is naive, attach ZoneInfo(TIMEZONE) when available.
+    Returns None on parse failure.
+    """
+    if not timestr:
+        return None
+    # Try ISO first, then fallback to common format
+    dt = None
+    try:
+        dt = datetime.fromisoformat(timestr)
+    except Exception:
+        try:
+            dt = datetime.strptime(timestr, "%Y-%m-%d %H:%M")
+        except Exception:
+            try:
+                dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
+    # If dt is naive, attach local timezone if available
+    try:
+        if dt is not None and dt.tzinfo is None:
+            if ZoneInfo is not None:
+                dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    except Exception:
+        pass
+    return dt
+
+
 def _find_hour_index(hour_times, now_local):
     """Find index in hour_times closest to now_local (both ISO strings).
-    Returns 0 if no valid times found.
+    If hour_times contain naive timestamps, treat them as TIMEZONE local.
     """
     if not hour_times:
         return 0
+
     parsed = []
     for t in hour_times:
-        if not t:
-            parsed.append(None)
-            continue
-        try:
-            parsed.append(datetime.fromisoformat(t))
-        except Exception:
-            try:
-                parsed.append(datetime.strptime(t, "%Y-%m-%d %H:%M"))
-            except Exception:
-                parsed.append(None)
-    # compute diffs
+        parsed.append(_to_local_dt(t))
+
     diffs = []
     for p in parsed:
         if p is None:
             diffs.append(float('inf'))
-        else:
-            try:
-                diffs.append(abs((p - now_local).total_seconds()))
-            except Exception:
-                diffs.append(float('inf'))
+            continue
+        try:
+            # If now_local is timezone-aware and p is not, attach same tzinfo
+            if now_local.tzinfo is not None and p.tzinfo is None:
+                p = p.replace(tzinfo=now_local.tzinfo)
+            diffs.append(abs((p - now_local).total_seconds()))
+        except Exception:
+            diffs.append(float('inf'))
     try:
         idx = int(min(range(len(diffs)), key=lambda i: diffs[i]))
         if diffs[idx] == float('inf'):
@@ -641,11 +665,15 @@ def merge_weather_and_hours(existing_data=None):
         time_label = None
         time_local_iso = None
         if h and h.get("time"):
-            try:
-                t = datetime.fromisoformat(h.get("time"))
-                time_label = t.strftime("%H:%M")
-                time_local_iso = t.isoformat()
-            except Exception:
+            parsed = _to_local_dt(h.get("time"))
+            if parsed is not None:
+                try:
+                    time_label = parsed.strftime("%H:%M")
+                    time_local_iso = parsed.isoformat()
+                except Exception:
+                    time_label = h.get("time")
+                    time_local_iso = h.get("time")
+            else:
                 time_label = h.get("time")
                 time_local_iso = h.get("time")
         if time_label is not None:
