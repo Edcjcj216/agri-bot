@@ -1,10 +1,13 @@
 # main.py
 """
-Agri-bot main service (Open-Meteo primary)
-- Uses Open-Meteo as the primary weather provider (no API key required).
-- Removed LLM/AI calls and removed external weather providers.
-- Returns JSON on /weather and accepts /esp32-data posts for telemetry forwarding to ThingsBoard.
-- Includes mapping from weather codes + English descriptions -> Vietnamese (WEATHER_MAP + WEATHER_CODE_MAP).
+Agri-bot main service (Open-Meteo primary, no AI).
+- Uses Open-Meteo as single weather provider with robust fallback attempts
+  to handle servers that reject some hourly variables.
+- Returns yesterday/today/tomorrow and next-EXTENDED_HOURS starting from
+  the current local hour (Asia/Ho_Chi_Minh by default).
+- No external AI calls. A minimal get_advice() stub remains for compatibility.
+
+Run: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
 import os
@@ -13,6 +16,7 @@ import json
 import math
 import random
 import logging
+import re
 import requests
 import asyncio
 import sqlite3
@@ -20,9 +24,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from collections import deque
-import re
 
-# zoneinfo for local timezone handling
+# zoneinfo if available for correct local times
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -37,14 +40,14 @@ LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # seconds
 WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", 15 * 60))  # default 15 minutes
 TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+
 EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
 
 # Bias correction settings (kept in-memory and persisted in SQLite)
 MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
 bias_history = deque(maxlen=MAX_HISTORY)
 BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 12))
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -58,15 +61,14 @@ class SensorData(BaseModel):
     humidity: float
     battery: float | None = None
 
-# ================== MAPPINGS ==================
-# WMO codes -> Vietnamese (retain common codes, thunder simplified)
+# ================== WEATHER_CODE_MAP (WMO -> Vietnamese) ==================
 WEATHER_CODE_MAP = {
     0: "Nắng",
     1: "Nắng nhẹ",
     2: "Ít mây",
     3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù",
+    45: "Sương muối",  # simplified label
+    48: "Sương muối",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
     55: "Mưa phùn dày",
@@ -85,16 +87,13 @@ WEATHER_CODE_MAP = {
     99: "Có dông",
 }
 
-# English description -> Vietnamese (user-provided mapping)
+# ----------------- English -> Vietnamese mapping (additional) -----------------
 WEATHER_MAP = {
-    # Sun / clear
     "Sunny": "Nắng",
     "Clear": "Trời quang",
     "Partly cloudy": "Ít mây",
     "Cloudy": "Nhiều mây",
     "Overcast": "Âm u",
-
-    # Rain
     "Patchy light rain": "Mưa nhẹ",
     "Patchy rain nearby": "Có mưa rải rác gần đó",
     "Light rain": "Mưa nhẹ",
@@ -105,35 +104,16 @@ WEATHER_MAP = {
     "Moderate or heavy rain shower": "Mưa rào vừa hoặc to",
     "Torrential rain shower": "Mưa rất to",
     "Patchy rain possible": "Có thể có mưa",
-
-    # Thunder
     "Thundery outbreaks possible": "Có dông",
     "Patchy light rain with thunder": "Mưa dông nhẹ",
     "Moderate or heavy rain with thunder": "Mưa dông to",
-
-    # Storm / tropical
     "Storm": "Bão",
     "Tropical storm": "Áp thấp nhiệt đới",
 }
 
-PARTIAL_MAP = [
-    (r"patchy rain nearby", "Có mưa rải rác gần đó"),
-    (r"patchy.*rain", "Có mưa rải rác"),
-    (r"patchy.*drizzle", "Mưa phùn nhẹ"),
-    (r"light drizzle", "Mưa phùn nhẹ"),
-    (r"light rain shower", "Mưa rào nhẹ"),
-    (r"rain shower", "Mưa rào"),
-    (r"heavy rain", "Mưa to"),
-    (r"thunder", "Có dông"),
-    (r"storm", "Bão"),
-    (r"cloudy", "Nhiều mây"),
-    (r"partly cloudy", "Ít mây"),
-    (r"clear", "Trời quang"),
-    (r"sunny", "Nắng"),
-]
+weather_cache = {"ts": 0, "data": {}}
 
 # ----------------- SQLite persistence for bias history -----------------
-
 def init_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
@@ -144,8 +124,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_temp REAL NOT NULL,
                 observed_temp REAL NOT NULL,
-                provider TEXT,
-                ts INTEGER NOT NULL
+                ts INTEGER NOT NULL,
+                provider TEXT
             )
             """
         )
@@ -183,8 +163,8 @@ def insert_history_to_db(api_temp, observed_temp, provider="open-meteo"):
         conn = sqlite3.connect(BIAS_DB_FILE, timeout=10)
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO bias_history (api_temp, observed_temp, provider, ts) VALUES (?, ?, ?, ?)",
-            (float(api_temp), float(observed_temp), provider, int(time.time()))
+            "INSERT INTO bias_history (api_temp, observed_temp, ts, provider) VALUES (?, ?, ?, ?)",
+            (float(api_temp), float(observed_temp), int(time.time()), provider)
         )
         conn.commit()
     except Exception as e:
@@ -217,6 +197,22 @@ def _normalize_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
+PARTIAL_MAP = [
+    (r"patchy rain nearby", "Có mưa rải rác gần đó"),
+    (r"patchy.*rain", "Có mưa rải rác"),
+    (r"patchy.*drizzle", "Mưa phùn nhẹ"),
+    (r"light drizzle", "Mưa phùn nhẹ"),
+    (r"light rain shower", "Mưa rào nhẹ"),
+    (r"rain shower", "Mưa rào"),
+    (r"heavy rain", "Mưa to"),
+    (r"thunder", "Có dông"),
+    (r"storm", "Bão"),
+    (r"cloudy", "Nhiều mây"),
+    (r"partly cloudy", "Ít mây"),
+    (r"clear", "Trời quang"),
+    (r"sunny", "Nắng"),
+]
 
 
 def translate_desc(desc_raw):
@@ -273,7 +269,57 @@ def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: floa
     s = ", ".join(parts)
     return s[0].upper() + s[1:]
 
-# ---------- compute daily min/max from hourly ------------
+
+def _to_local_dt(timestr):
+    if not timestr:
+        return None
+    dt = None
+    try:
+        dt = datetime.fromisoformat(timestr)
+    except Exception:
+        try:
+            dt = datetime.strptime(timestr, "%Y-%m-%d %H:%M")
+        except Exception:
+            try:
+                dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
+    try:
+        if dt is not None and dt.tzinfo is None:
+            if ZoneInfo is not None:
+                dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    except Exception:
+        pass
+    return dt
+
+
+def _find_hour_index(hour_times, now_local):
+    if not hour_times:
+        return 0
+    parsed = []
+    for t in hour_times:
+        parsed.append(_to_local_dt(t))
+
+    diffs = []
+    for p in parsed:
+        if p is None:
+            diffs.append(float('inf'))
+            continue
+        try:
+            if now_local.tzinfo is not None and p.tzinfo is None:
+                p = p.replace(tzinfo=now_local.tzinfo)
+            diffs.append(abs((p - now_local).total_seconds()))
+        except Exception:
+            diffs.append(float('inf'))
+    try:
+        idx = int(min(range(len(diffs)), key=lambda i: diffs[i]))
+        if diffs[idx] == float('inf'):
+            return 0
+        return idx
+    except Exception:
+        return 0
+
+# ---------- compute daily min/max from hourly (used when yesterday missing) ------------
 
 def _normalize_time_str(t):
     if not t:
@@ -305,27 +351,18 @@ def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
         return None, None
     return round(min(temps), 1), round(max(temps), 1)
 
-# ================== OPEN-METEO FETCHER ==================
+# ================== OPEN-METEO FETCHER (robust) ==================
 
 def fetch_open_meteo():
-    """Robust fetcher for Open-Meteo with progressive fallbacks.
-
-    Strategy:
-    1) Try a full hourly+daily request (includes past_days) — the preferred response.
-    2) If Open-Meteo returns 400 or a parse error mentioning variables, retry with a simpler
-       hourly variable list that *omits* 'time' (server returns time automatically) and
-       omits precipitation_probability and weathercode which sometimes trigger parsing issues.
-    3) If still failing, try daily-only + current_weather (minimal) to at least provide daily info.
-    4) On any exception return empty lists and let caller use cache if available.
+    """Fetch Open-Meteo with progressive fallback strategies.
+    Returns: (daily_list, hourly_list, has_yesterday_bool, raw_json)
     """
     now = _now_local()
     yesterday = (now - timedelta(days=1)).date().isoformat()
     base = "https://api.open-meteo.com/v1/forecast"
 
-    # Full preferred variables
     daily_vars = "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
     hourly_vars_full = "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
-    # Simpler hourly (fallback) - do NOT include 'time' explicitly (API returns time array)
     hourly_vars_simple = "temperature_2m,relativehumidity_2m,precipitation,windspeed_10m,winddirection_10m"
 
     base_params = {
@@ -346,31 +383,30 @@ def fetch_open_meteo():
             params.update(extra_params)
         r = requests.get(base, params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        return r.json(), r
+        return r.json()
 
+    data = None
+    # 1) try full
     try:
-        # 1) Try full request
         try:
-            data, resp = _do_request(hourly_vars=hourly_vars_full)
+            data = _do_request(hourly_vars=hourly_vars_full)
         except requests.HTTPError as he:
-            # if 400 with variable parsing error, we will try simplified hourly
-            text = getattr(he.response, 'text', '') if isinstance(he, requests.HTTPError) else ''
+            text = getattr(he.response, 'text', '') if hasattr(he, 'response') else str(he)
             logger.warning(f"Open-Meteo returned {getattr(he.response, 'status_code', '')}: {text[:400]}")
-            # fall through to simpler request
             data = None
         except Exception as e:
             logger.warning(f"Open-Meteo full request error: {e}")
             data = None
 
-        # 2) fallback: try simpler hourly (omit weathercode/precip_prob/time)
+        # 2) fallback simplified hourly
         if not data:
             try:
-                data, resp = _do_request(hourly_vars=hourly_vars_simple)
+                data = _do_request(hourly_vars=hourly_vars_simple)
             except Exception as e2:
                 logger.warning(f"Open-Meteo simpler-hourly request failed: {e2}")
                 data = None
 
-        # 3) fallback: daily-only + current_weather
+        # 3) daily-only + current_weather
         if not data:
             try:
                 params_daily_only = dict(base_params)
@@ -411,7 +447,7 @@ def fetch_open_meteo():
                 "windspeed_max": wmx[i] if i < len(wmx) else None
             })
 
-        # parse hourly (if present)
+        # parse hourly
         hourly_list = []
         h = data.get("hourly", {})
         h_times = h.get("time", [])
@@ -426,17 +462,21 @@ def fetch_open_meteo():
         for i in range(len(h_times)):
             time_iso = h_times[i]
             code = h_code[i] if i < len(h_code) else None
+            # short (translated) description only — no extra details here
             short_desc = WEATHER_CODE_MAP.get(code) if code is not None else None
             precip = h_prec[i] if i < len(h_prec) else None
             precip_prob = h_pp[i] if i < len(h_pp) else None
             windspeed = h_wind[i] if i < len(h_wind) else None
-            nice = _nice_weather_desc(short_desc, precip, precip_prob, windspeed)
+
+            # store only the short label in weather_desc (so UI shows "Có dông", "Mưa nhẹ", etc.)
             hourly_list.append({
                 "time": time_iso,
                 "temperature": h_temp[i] if i < len(h_temp) else None,
                 "humidity": h_humi[i] if i < len(h_humi) else None,
-                "weather_desc": nice,
+                "weather_desc": short_desc,
+                "weather_short": short_desc,
                 "weather_code": code,
+                # keep raw meteorological numbers as separate fields (but UI won't include them in the short phrase)
                 "precipitation": precip,
                 "precip_probability": precip_prob,
                 "windspeed": windspeed,
@@ -444,6 +484,13 @@ def fetch_open_meteo():
             })
 
         has_yesterday = any(d.get("date") == yesterday for d in daily_list)
+        # if yesterday missing, try compute it from hourly when possible
+        if not has_yesterday and hourly_list:
+            ymin, ymax = compute_daily_min_max_from_hourly(hourly_list, yesterday)
+            if ymin is not None or ymax is not None:
+                daily_list.insert(0, {"date": yesterday, "desc": None, "max": ymax, "min": ymin, "precipitation_sum": None, "windspeed_max": None})
+                has_yesterday = True
+
         return daily_list, hourly_list, has_yesterday, data
 
     except Exception as e:
@@ -461,7 +508,7 @@ def update_bias_and_correct(next_hours, observed_temp):
     if api_now is not None and observed_temp is not None:
         try:
             bias_history.append((api_now, observed_temp))
-            insert_history_to_db(api_now, observed_temp, provider="open-meteo")
+            insert_history_to_db(api_now, observed_temp)
         except Exception:
             pass
 
@@ -477,21 +524,9 @@ def update_bias_and_correct(next_hours, observed_temp):
 
     return bias
 
-# ================== AI REMOVED ==================
-# No LLM functions or calls — service focuses on weather + rule-based advice only.
-
-# ================== AI HELPER (rule-based) - REMOVED (stub kept for compatibility)
-#
-# The original rule-based helper was removed per user request. To keep
-# compatibility with existing call sites in the code, we keep a minimal
-# stub that returns empty/placeholder advice fields so the rest of the
-# pipeline continues to work without AI/nutrition/care text.
+# ================== AI HELPER (removed) - STUB ==================
 
 def get_advice(temp, humi, upcoming_weather=None):
-    """Minimal stub: returns placeholder/empty advice structure.
-    Replace or extend this stub later if you want custom rule-based
-    guidance again.
-    """
     pred = None
     try:
         pred = f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
@@ -510,79 +545,17 @@ def get_advice(temp, humi, upcoming_weather=None):
 def send_to_thingsboard(data: dict):
     try:
         logger.info(f"TB ▶ sending payload (keys: {list(data.keys())})")
-        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
+        r = requests.post(TB_DEVICE_URL, json=data, timeout=REQUEST_TIMEOUT)
         logger.info(f"TB ◀ {r.status_code}")
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
-# ================== HELPERS ==================
-
-def _to_local_dt(timestr):
-    """Parse an ISO-ish time string into a timezone-aware datetime in TIMEZONE.
-    If the parsed datetime is naive, attach ZoneInfo(TIMEZONE) when available.
-    Returns None on parse failure.
-    """
-    if not timestr:
-        return None
-    # Try ISO first, then fallback to common format
-    dt = None
-    try:
-        dt = datetime.fromisoformat(timestr)
-    except Exception:
-        try:
-            dt = datetime.strptime(timestr, "%Y-%m-%d %H:%M")
-        except Exception:
-            try:
-                dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
-            except Exception:
-                return None
-    # If dt is naive, attach local timezone if available
-    try:
-        if dt is not None and dt.tzinfo is None:
-            if ZoneInfo is not None:
-                dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
-    except Exception:
-        pass
-    return dt
-
-
-def _find_hour_index(hour_times, now_local):
-    """Find index in hour_times closest to now_local (both ISO strings).
-    If hour_times contain naive timestamps, treat them as TIMEZONE local.
-    """
-    if not hour_times:
-        return 0
-
-    parsed = []
-    for t in hour_times:
-        parsed.append(_to_local_dt(t))
-
-    diffs = []
-    for p in parsed:
-        if p is None:
-            diffs.append(float('inf'))
-            continue
-        try:
-            # If now_local is timezone-aware and p is not, attach same tzinfo
-            if now_local.tzinfo is not None and p.tzinfo is None:
-                p = p.replace(tzinfo=now_local.tzinfo)
-            diffs.append(abs((p - now_local).total_seconds()))
-        except Exception:
-            diffs.append(float('inf'))
-    try:
-        idx = int(min(range(len(diffs)), key=lambda i: diffs[i]))
-        if diffs[idx] == float('inf'):
-            return 0
-        return idx
-    except Exception:
-        return 0
-
+# ================== MERGE HELPERS ==================
 
 def merge_weather_and_hours(existing_data=None):
     if existing_data is None:
         existing_data = {}
 
-    # fetch fresh Open-Meteo data (daily_list, hourly_list, has_yday, raw_json)
     daily_list, hourly_list, has_yday, raw = fetch_open_meteo()
 
     now = _now_local()
@@ -590,7 +563,6 @@ def merge_weather_and_hours(existing_data=None):
     today_str = now.date().isoformat()
     tomorrow_str = (now + timedelta(days=1)).date().isoformat()
 
-    # helper to find daily by date
     def find_daily_by_date(date):
         for d in daily_list:
             if d.get("date") == date:
@@ -606,7 +578,7 @@ def merge_weather_and_hours(existing_data=None):
         "raw": raw
     }
 
-    # aggregated humidity (attempt to compute from hourly_list slices)
+    # aggregated humidity
     hums = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
     if len(hums) >= 24:
         weather["humidity_yesterday"] = round(sum(hums[0:24]) / 24.0, 1)
@@ -729,7 +701,17 @@ def root():
 
 @app.get("/weather")
 def weather_endpoint():
-    return fetch_open_meteo()[3] if isinstance(fetch_open_meteo(), tuple) and len(fetch_open_meteo()) >= 4 else fetch_open_meteo()
+    return get_cached_weather()
+
+
+def get_cached_weather():
+    # use cache if fresh
+    if time.time() - weather_cache.get("ts", 0) < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
+        return weather_cache["data"]
+    res = merge_weather_and_hours(existing_data={})
+    weather_cache["data"] = res
+    weather_cache["ts"] = time.time()
+    return res
 
 @app.get("/bias")
 def bias_status():
@@ -740,14 +722,11 @@ def bias_status():
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
-    # Get weather
-    daily_list, hourly_list, has_yday, raw = fetch_open_meteo()
-    next_hours = hourly_list
+    weather = get_cached_weather()
+    next_hours = weather.get("next_hours", [])
 
-    # update bias
     bias = update_bias_and_correct(next_hours, data.temperature)
 
-    # baseline advice
     advice_data = get_advice(data.temperature, data.humidity, upcoming_weather=next_hours)
 
     merged = {
@@ -759,7 +738,8 @@ def receive_data(data: SensorData):
         "forecast_history_len": len(bias_history)
     }
 
-    # attach hours and push
+    merged["llm_advice"] = None
+
     merged = merge_weather_and_hours(existing_data=merged)
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
@@ -780,9 +760,9 @@ async def auto_loop():
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
 
-            daily_list, hourly_list, has_yday, raw = fetch_open_meteo()
-            bias = update_bias_and_correct(hourly_list, sample["temperature"])  # update only
-            advice_data = get_advice(sample["temperature"], sample["humidity"], upcoming_weather=hourly_list)
+            weather = get_cached_weather()
+            bias = update_bias_and_correct(weather.get("next_hours", []), sample["temperature"])  # update only
+            advice_data = get_advice(sample["temperature"], sample["humidity"], upcoming_weather=weather.get("next_hours", []))
 
             merged = {
                 **sample,
@@ -792,6 +772,8 @@ async def auto_loop():
                 "forecast_bias": bias,
                 "forecast_history_len": len(bias_history)
             }
+
+            merged["llm_advice"] = None
 
             merged = merge_weather_and_hours(existing_data=merged)
             send_to_thingsboard(merged)
@@ -808,5 +790,5 @@ async def startup():
 
 # ================== NOTES ==================
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - Open-Meteo is primary provider. No API key required.
-# - Adjust EXTENDED_HOURS, WEATHER_CACHE_SECONDS, LAT/LON, TIMEZONE via env if needed.
+# - This version: Open-Meteo primary, robust fallbacks, returns yesterday/today/tomorrow
+#   and next hours starting at the current local hour. No AI calls.
