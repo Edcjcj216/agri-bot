@@ -307,26 +307,37 @@ def build_compact_weather(existing_obs=None):
         else:
             start_idx = 0
 
-    for offset in range(min(EXTENDED_HOURS, 24)):
+    # Ensure we always produce EXTENDED_HOURS entries (pad if API short)
+    for offset in range(EXTENDED_HOURS):
         i = start_idx + offset
         label = f"hour_{offset}"
+
+        # if API has this index, use it; else create label/time from target_hour+offset
         if i < len(parsed) and parsed[i]:
             time_label = parsed[i].strftime("%H:%M")
-        elif i < len(h_times):
-            time_label = h_times[i]
+            temp_val = (h_temp[i] if i < len(h_temp) else None)
+            hum_val = (h_humi[i] if i < len(h_humi) else None)
+            code = None
+            try:
+                code = int(h_code[i]) if i < len(h_code) else None
+            except Exception:
+                code = None
+            weather_label = WEATHER_CODE_MAP.get(code) if code is not None else None
         else:
-            time_label = None
+            # pad using target_hour + offset
+            fallback_dt = target_hour + timedelta(hours=offset)
+            try:
+                time_label = fallback_dt.strftime("%H:%M")
+            except Exception:
+                time_label = None
+            temp_val = None
+            hum_val = None
+            weather_label = None
 
         compact[label] = time_label
-        compact[f"{label}_temperature"] = (h_temp[i] if i < len(h_temp) else None)
-        compact[f"{label}_humidity"] = (h_humi[i] if i < len(h_humi) else None)
-        # simple label only
-        code = None
-        try:
-            code = int(h_code[i]) if i < len(h_code) else None
-        except Exception:
-            code = None
-        compact[f"{label}_weather"] = WEATHER_CODE_MAP.get(code) if code is not None else None
+        compact[f"{label}_temperature"] = temp_val
+        compact[f"{label}_humidity"] = hum_val
+        compact[f"{label}_weather"] = weather_label
 
     # humidity aggregates (best-effort)
     try:
