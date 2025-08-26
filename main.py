@@ -1,142 +1,141 @@
 import os
-import time
 import logging
 import requests
 from fastapi import FastAPI
 from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 # ================== CONFIG ==================
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "your_weatherapi_key_here")
+LAT, LON = 10.7769, 106.7009  # Ho Chi Minh City
 TB_URL = "https://thingsboard.cloud/api/v1"
 TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
-LAT = 10.762622   # Hồ Chí Minh
-LON = 106.660172
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Sai số hiệu chỉnh nhiệt độ dự báo
-FORECAST_BIAS = -0.5
+POLL_INTERVAL = 300  # 5 phút
+FORECAST_BIAS = 7  # shift múi giờ dự báo
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-# ================== WEATHER CODE MAP ==================
-WEATHER_CODE_MAP = {
-    800: "Có nắng",
-    801: "Nắng nhẹ (ít mây)",
-    802: "Có mây",
-    803: "Nhiều mây",
-    804: "U ám",
-
-    500: "Mưa nhẹ",
-    501: "Mưa vừa",
-    502: "Mưa to",
-    503: "Mưa rất to",
-    504: "Mưa cực lớn",
-    520: "Mưa rào nhẹ",
-    521: "Mưa rào",
-    522: "Mưa rào to",
-    531: "Mưa rào bất thường",
-
-    200: "Có giông",
-    201: "Giông vừa",
-    202: "Giông mạnh",
-    210: "Giông",
-    211: "Giông",
-    212: "Giông mạnh",
-    221: "Giông bất thường",
-    230: "Giông kèm mưa phùn",
-    231: "Giông kèm mưa nhỏ",
-    232: "Giông kèm mưa lớn",
-
-    701: "Sương mù nhẹ",
-    741: "Sương mù",
-    771: "Gió giật"
-}
-DEFAULT_DESC = "Không xác định"
-
-# ================== FASTAPI APP ==================
 app = FastAPI()
 last_push = {}
 
-# ================== FETCH WEATHER ==================
+# ================== WEATHER CONDITION MAPPING ==================
+WEATHER_MAP = {
+    "Sunny": "Có nắng",
+    "Clear": "Có nắng",
+    "Partly cloudy": "Nắng nhẹ",
+    "Cloudy": "Có mây",
+    "Overcast": "U ám",
+    "Mist": "Sương mù",
+    "Fog": "Sương mù",
+    "Patchy rain possible": "Có mưa rào",
+    "Light rain": "Mưa nhẹ",
+    "Moderate rain": "Mưa vừa",
+    "Heavy rain": "Mưa to",
+    "Moderate or heavy rain with thunder": "Mưa giông",
+    "Thundery outbreaks possible": "Có giông",
+    "Thunderstorm": "Giông bão",
+    "Light snow": "Không xác định",
+    "Moderate snow": "Không xác định",
+    "Heavy snow": "Không xác định",
+    "Ice pellets": "Không xác định",
+    "Freezing rain": "Không xác định",
+    "Other": "Không xác định",
+}
+
+def map_condition(raw_text: str, maxtemp: float, wind: float) -> str:
+    """Map điều kiện thời tiết + override"""
+    condition = WEATHER_MAP.get(raw_text, "Không xác định")
+
+    # Override: Nắng nóng
+    if maxtemp >= 35:
+        return "Nắng nóng"
+
+    # Override: Mưa bão
+    if "mưa" in condition.lower() and wind >= 40:
+        return "Mưa bão"
+
+    return condition
+
+
+# ================== FETCH + PUSH ==================
 def fetch_weather():
     try:
-        params = {
-            "latitude": LAT,
-            "longitude": LON,
-            "hourly": ["temperature_2m", "relative_humidity_2m", "weathercode"],
-            "daily": ["temperature_2m_max", "temperature_2m_min"],
-            "timezone": "Asia/Ho_Chi_Minh"
-        }
-        r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={LAT},{LON}&days=1&aqi=no&alerts=no&lang=vi"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        logger.error(f"[ERROR] Error fetching Open-Meteo: {e}")
+        logger.error(f"[ERROR] Fetch WeatherAPI: {e}")
         return None
 
-# ================== PUSH TO THINGSBOARD ==================
-def push_to_tb():
+
+def push_to_tb(payload: dict):
+    try:
+        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+        resp = requests.post(url, json=payload, timeout=5)
+        resp.raise_for_status()
+        logger.info(f"✅ Sent to ThingsBoard: {payload}")
+    except Exception as e:
+        logger.error(f"[ERROR] Push TB: {e}")
+
+
+def job():
     global last_push
     data = fetch_weather()
     if not data:
         return
 
-    try:
-        hourly = data["hourly"]
-        daily = data["daily"]
+    current = data["current"]
+    forecast_day = data["forecast"]["forecastday"][0]["day"]
+    hours = data["forecast"]["forecastday"][0]["hour"]
 
-        telemetry = {}
-        # chỉ lấy 5 giờ tới (hour_0 -> hour_4)
-        for i in range(0, 5):
-            temp = hourly["temperature_2m"][i] + FORECAST_BIAS
-            hum = hourly["relative_humidity_2m"][i]
-            code = hourly["weathercode"][i]
-            desc = WEATHER_CODE_MAP.get(code, DEFAULT_DESC)
-            telemetry[f"hour_{i}temperature"] = round(temp, 1)
-            telemetry[f"hour_{i}humidity"] = hum
-            telemetry[f"hour_{i}weather_desc"] = desc
+    maxtemp = forecast_day["maxtemp_c"]
+    wind = current["wind_kph"]
 
-        # daily max/min
-        daily_max = daily["temperature_2m_max"][0] + FORECAST_BIAS
-        daily_min = daily["temperature_2m_min"][0] + FORECAST_BIAS
-        telemetry["daily_max"] = round(daily_max, 1)
-        telemetry["daily_min"] = round(daily_min, 1)
+    condition_text = map_condition(current["condition"]["text"], maxtemp, wind)
 
-        # override nếu nắng nóng
-        if daily_max >= 35:
-            telemetry["daily_weather_desc"] = "Nắng nóng"
-        else:
-            first_code = hourly["weathercode"][0]
-            telemetry["daily_weather_desc"] = WEATHER_CODE_MAP.get(first_code, DEFAULT_DESC)
+    payload = {
+        "temperature": current["temp_c"],
+        "humidity": current["humidity"],
+        "weather_desc": condition_text,
+        "daily_max": maxtemp,
+        "daily_min": forecast_day["mintemp_c"],
+        "last_update": datetime.utcnow().isoformat()
+    }
 
-        # timestamp
-        telemetry["_ts"] = int(time.time() * 1000)
+    # Add next 4 hours forecast
+    now_hour = datetime.utcnow().hour + FORECAST_BIAS
+    for i in range(5):
+        idx = (now_hour + i) % 24
+        if idx < len(hours):
+            h = hours[idx]
+            payload[f"hour_{i}_temperature"] = h["temp_c"]
+            payload[f"hour_{i}_humidity"] = h["humidity"]
+            payload[f"hour_{i}_weather_desc"] = map_condition(
+                h["condition"]["text"], forecast_day["maxtemp_c"], h["wind_kph"]
+            )
 
-        # gửi lên ThingsBoard
-        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-        r = requests.post(url, json=telemetry, timeout=10)
-        r.raise_for_status()
-        last_push = telemetry
-        logger.info(f"✅ Sent to ThingsBoard: {telemetry}")
-    except Exception as e:
-        logger.error(f"[ERROR] push_to_tb: {e}")
+    last_push = payload
+    push_to_tb(payload)
 
-# ================== SCHEDULER ==================
-scheduler = BackgroundScheduler()
-scheduler.add_job(push_to_tb, "interval", minutes=5)
-scheduler.start()
 
-# ================== FASTAPI ENDPOINTS ==================
+# ================== STARTUP ==================
+@app.on_event("startup")
+def startup_event():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(job, "interval", seconds=POLL_INTERVAL)
+    scheduler.start()
+    logger.info("🌤 Weather job scheduler started")
+    job()  # chạy ngay lần đầu
+
+
 @app.get("/")
 def root():
-    return {"status": "ok", "last_push_keys": list(last_push.keys())}
+    return {"status": "ok", "msg": "WeatherAPI → ThingsBoard bridge"}
+
 
 @app.get("/last-push")
 def get_last_push():
     return last_push
-
-# ================== STARTUP EVENT ==================
-@app.on_event("startup")
-def startup_event():
-    logger.info("🚀 Service started, sending first telemetry...")
-    push_to_tb()
