@@ -1,92 +1,188 @@
 import os
+import time
+import json
 import logging
-from datetime import datetime
-import httpx
-from fastapi import FastAPI, Request
+import requests
+import asyncio
+from fastapi import FastAPI
+from pydantic import BaseModel
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.INFO, format="INFO:tb-webhook:%(message)s")
-logger = logging.getLogger("tb-webhook")
+# ================== CONFIG ==================
+TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "sgkxcrqntuki8gu1oj8u")
+TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
+LAT = float(os.getenv("LAT", "10.79"))
+LON = float(os.getenv("LON", "106.70"))
+AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # giây
+
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ================== FASTAPI ==================
 app = FastAPI()
 
-# Lấy token & API key từ environment (Render Env Vars)
-DEVICE_TOKEN = os.getenv("DEVICE_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+class SensorData(BaseModel):
+    temperature: float
+    humidity: float
+    battery: float | None = None
 
-if not DEVICE_TOKEN:
-    logger.warning("DEVICE_TOKEN chưa được cấu hình!")
-if not GEMINI_KEY:
-    logger.warning("GEMINI_KEY chưa được cấu hình!")
+# ================== WEATHER ==================
+WEATHER_CODE_MAP = {
+    0: "Trời quang", 1: "Trời quang nhẹ", 2: "Có mây", 3: "Nhiều mây",
+    45: "Sương mù", 48: "Sương mù đóng băng", 51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa",
+    55: "Mưa phùn dày", 61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
+    71: "Tuyết nhẹ", 73: "Tuyết vừa", 75: "Tuyết dày", 80: "Mưa rào nhẹ",
+    81: "Mưa rào vừa", 82: "Mưa rào mạnh", 95: "Giông nhẹ hoặc vừa",
+    96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá mạnh"
+}
 
+weather_cache = {"ts": 0, "data": {}}
+
+def get_weather_forecast():
+    now = datetime.now()
+    if time.time() - weather_cache["ts"] < 900:  # cache 15 phút
+        return weather_cache["data"]
+
+    try:
+        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": LAT,
+            "longitude": LON,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+            "hourly": "temperature_2m,relativehumidity_2m,weathercode",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "start_date": start_date,
+            "end_date": end_date
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        daily = data.get("daily", {})
+        hourly = data.get("hourly", {})
+
+        def mean(lst):
+            return round(sum(lst)/len(lst),1) if lst else 0
+
+        # Hôm qua
+        weather_yesterday = {
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
+            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
+            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
+        }
+        # Hôm nay
+        weather_today = {
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
+            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
+            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
+        }
+        # Ngày mai
+        weather_tomorrow = {
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
+            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
+            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
+        }
+
+        # 7 mốc giờ: hour_0 → hour_6, tách ra 3 key riêng
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        hums = hourly.get("relativehumidity_2m", [])
+        codes = hourly.get("weathercode", [])
+        hours_data = {}
+        for i in range(7):
+            hours_data[f"hour_{i}_temperature"] = round(temps[i],1) if i < len(temps) else 0
+            hours_data[f"hour_{i}_humidity"] = round(hums[i],1) if i < len(hums) else 0
+            hours_data[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(codes[i], "?") if i < len(codes) else "?"
+
+        result = {**weather_yesterday, **weather_today, **weather_tomorrow, **hours_data}
+        weather_cache["data"] = result
+        weather_cache["ts"] = time.time()
+        return result
+    except Exception as e:
+        logger.warning(f"Weather API error: {e}")
+        fallback = {"weather_yesterday_desc":"?","weather_yesterday_max":0,"weather_yesterday_min":0,"humidity_yesterday":0,
+                    "weather_today_desc":"?","weather_today_max":0,"weather_today_min":0,"humidity_today":0,
+                    "weather_tomorrow_desc":"?","weather_tomorrow_max":0,"weather_tomorrow_min":0,"humidity_tomorrow":0}
+        for i in range(7):
+            fallback[f"hour_{i}_temperature"] = 0
+            fallback[f"hour_{i}_humidity"] = 0
+            fallback[f"hour_{i}_weather_desc"] = "?"
+        return fallback
+
+# ================== AI HELPER ==================
+def get_advice(temp, humi):
+    nutrition = ["Ưu tiên Kali (K)","Cân bằng NPK","Bón phân hữu cơ"]
+    care = []
+    if temp >=35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
+    elif temp >=30: care.append("Tưới đủ nước, theo dõi thường xuyên")
+    elif temp <=15: care.append("Giữ ấm, tránh sương muối")
+    else: care.append("Nhiệt độ bình thường")
+    if humi <=40: care.append("Độ ẩm thấp: tăng tưới")
+    elif humi <=60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
+    elif humi >=85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
+    else: care.append("Độ ẩm ổn định cho rau muống")
+    return {
+        "advice": " | ".join(nutrition + care + ["Quan sát cây trồng và điều chỉnh thực tế"]),
+        "advice_nutrition": " | ".join(nutrition),
+        "advice_care": " | ".join(care),
+        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
+        "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
+    }
+
+# ================== THINGSBOARD ==================
+def send_to_thingsboard(data: dict):
+    try:
+        logger.info(f"TB ▶ {json.dumps(data, ensure_ascii=False)}")
+        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
+        logger.info(f"TB ◀ {r.status_code}")
+    except Exception as e:
+        logger.error(f"ThingsBoard push error: {e}")
+
+# ================== ROUTES ==================
+@app.get("/")
+def root():
+    return {"status":"running","demo_token":TB_DEMO_TOKEN[:4]+"***"}
+
+@app.post("/esp32-data")
+def receive_data(data: SensorData):
+    logger.info(f"ESP32 ▶ {data.dict()}")
+    advice_data = get_advice(data.temperature,data.humidity)
+    weather_data = get_weather_forecast()
+    merged = {
+        **data.dict(),
+        **advice_data,
+        **weather_data,
+        "location":"An Phú, Hồ Chí Minh",
+        "crop":"Rau muống"
+    }
+    send_to_thingsboard(merged)
+    return {"received": data.dict(), "pushed": merged}
+
+# ================== AUTO LOOP ==================
+async def auto_loop():
+    while True:
+        try:
+            sample = {"temperature":30.1,"humidity":69.2}
+            advice_data = get_advice(sample["temperature"],sample["humidity"])
+            weather_data = get_weather_forecast()
+            merged = {
+                **sample,
+                **advice_data,
+                **weather_data,
+                "location":"An Phú, Hồ Chí Minh",
+                "crop":"Rau muống"
+            }
+            send_to_thingsboard(merged)
+        except Exception as e:
+            logger.error(f"AUTO loop error: {e}")
+        await asyncio.sleep(AUTO_LOOP_INTERVAL)
 
 @app.on_event("startup")
-async def startup_event():
-    logger.info("Starting server...")
-    # Gửi ping khi server khởi động để dễ kiểm tra trên ThingsBoard
-    await push_telemetry({"startup_ping": datetime.utcnow().isoformat()})
-
-
-@app.get("/")
-async def health_check():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    """
-    Nhận Shared Attributes từ Rule Chain.
-    Expect JSON như:
-    {
-      "hoi": "xin chào bạn"
-    }
-    """
-    data = await request.json()
-    logger.info(f"Webhook received: {data}")
-
-    hoi = data.get("hoi")
-    if not hoi:
-        await push_telemetry({"status": "no question"})
-        return {"msg": "no question"}
-
-    # Gọi Gemini để sinh câu trả lời
-    advice = await get_gemini_advice(hoi)
-
-    # Gửi kết quả lên ThingsBoard qua telemetry
-    await push_telemetry({"advice_text": advice})
-    return {"advice": advice}
-
-
-async def get_gemini_advice(question: str) -> str:
-    """
-    Gọi Google Gemini API sinh câu trả lời từ văn bản.
-    """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_KEY}"
-    payload = {
-        "contents": [
-            {"parts": [{"text": f"Trả lời ngắn gọn: {question}"}]}
-        ]
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post(url, json=payload)
-            res.raise_for_status()
-            data = res.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            logger.info(f"Gemini response: {text}")
-            return text
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        return "Không thể sinh câu trả lời ngay lúc này."
-
-
-async def push_telemetry(payload: dict):
-    """
-    Gửi dữ liệu telemetry lên ThingsBoard.
-    """
-    url = f"https://thingsboard.cloud/api/v1/{DEVICE_TOKEN}/telemetry"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(url, json=payload)
-            logger.info(f"Pushed telemetry: {payload} | Status {res.status_code}")
-    except Exception as e:
-        logger.error(f"Telemetry push error: {e}")
+async def start_auto_loop():
+    asyncio.create_task(auto_loop())  
