@@ -1,4 +1,4 @@
-# main.py - Open-Meteo only, minimal keys, hour_0 = next hour (ceil unless minute==0)
+# main.py - Open-Meteo only, compact telemetry, hour_0 = current hour if exactly :00:00 else ceil to next hour
 import os
 import time
 import logging
@@ -46,7 +46,6 @@ class SensorData(BaseModel):
     battery: float | None = None
 
 # ============ WEATHER CODE MAP (Open-Meteo WMO codes -> Vietnamese short labels) ============
-# NOTE: removed code 48 (sương muối) as requested and changed "Có dông" -> "Có giông"
 WEATHER_CODE_MAP = {
     0: "Nắng", 1: "Nắng nhẹ", 2: "Ít mây", 3: "Nhiều mây",
     45: "Sương mù",
@@ -124,7 +123,6 @@ def _now_local():
             return datetime.now()
     return datetime.now()
 
-
 def _parse_iso_local(s):
     if not s:
         return None
@@ -135,7 +133,6 @@ def _parse_iso_local(s):
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
         except Exception:
             return None
-    # ensure timezone awareness consistent with TIMEZONE
     if dt.tzinfo is None and ZoneInfo is not None:
         try:
             return dt.replace(tzinfo=ZoneInfo(TIMEZONE))
@@ -143,66 +140,49 @@ def _parse_iso_local(s):
             return dt
     return dt
 
-# ============ Open-Meteo fetcher (robust/retries) ============
-def fetch_open_meteo():
-    """Try progressive requests to Open-Meteo: full set -> drop precipitation_probability -> minimal hourly.
-    This handles occasional provider errors complaining about an invalid hourly variable list.
-    """
-    url = "https://api.open-meteo.com/v1/forecast"
+# ============ Open-Meteo fetcher with simple retry variants ============
+def _call_open_meteo(params):
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as he:
+        # bubble up for caller to decide
+        raise
 
-    attempts = []
-    attempts.append({
+def fetch_open_meteo():
+    base_params = {
+        "latitude": LAT,
+        "longitude": LON,
         "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
         "hourly": "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m",
         "past_days": 1,
         "forecast_days": 3,
         "timezone": TIMEZONE,
-        "timeformat": "iso8601",
-    })
-
-    # attempt 2: drop precipitation_probability (sometimes unavailable in combined model)
-    attempts.append({
-        "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
-        "hourly": "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m",
-        "past_days": 1,
-        "forecast_days": 3,
-        "timezone": TIMEZONE,
-        "timeformat": "iso8601",
-    })
-
-    # attempt 3: minimal hourly
-    attempts.append({
-        "hourly": "time,temperature_2m,relativehumidity_2m,weathercode",
-        "past_days": 1,
-        "forecast_days": 3,
-        "timezone": TIMEZONE,
-        "timeformat": "iso8601",
-    })
-
-    headers = {"User-Agent": "agri-bot/1.0 (+https://example.com)"}
-
-    for params in attempts:
+        "timeformat": "iso8601"
+    }
+    # try full set first
+    try:
+        return _call_open_meteo(base_params)
+    except Exception as e_full:
+        logger.warning(f"Open-Meteo returned error (full hourly). Will retry simpler hourly: {e_full}")
+        # try simpler hourly without precipitation_probability
+        params2 = dict(base_params)
+        params2["hourly"] = "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m"
         try:
-            full_params = {**params, "latitude": LAT, "longitude": LON}
-            r = requests.get(url, params=full_params, timeout=REQUEST_TIMEOUT, headers=headers)
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except Exception:
-                    logger.warning("Open-Meteo returned non-json despite 200")
-                    continue
-            else:
-                # log server message (avoid huge bodies)
-                body = (r.text or "")[:800]
-                logger.warning(f"Open-Meteo returned {r.status_code}: {body}")
-                # if 400 -> try next attempt
-                continue
-        except requests.RequestException as e:
-            logger.warning(f"Open-Meteo request error: {e}")
-            continue
-    return None
+            return _call_open_meteo(params2)
+        except Exception as e_simple:
+            logger.warning(f"Open-Meteo retry (no precip_prob) failed: {e_simple}")
+            # try minimal hourly (time,temperature,relativehumidity,weathercode)
+            params3 = dict(base_params)
+            params3["hourly"] = "time,temperature_2m,relativehumidity_2m,weathercode"
+            try:
+                return _call_open_meteo(params3)
+            except Exception as e_min:
+                logger.warning(f"Open-Meteo minimal retry failed: {e_min}")
+                return None
 
-# ============ Build compact payload (hour_0 logic: if minute==0 use current hour, else next hour) ============
+# ============ Build compact payload (hour_0 rules) ============
 def build_compact_weather(existing_obs=None):
     existing_obs = existing_obs or {}
     now = _now_local()
@@ -232,14 +212,25 @@ def build_compact_weather(existing_obs=None):
     }
 
     if not data:
+        # fill minimal hour keys to avoid dashboard gaps
+        for offset in range(EXTENDED_HOURS):
+            compact[f"hour_{offset}"] = None
+            compact[f"hour_{offset}_temperature"] = None
+            compact[f"hour_{offset}_humidity"] = None
+            compact[f"hour_{offset}_weather"] = None
+        compact.update({
+            "weather_yesterday_desc": None, "weather_yesterday_max": None, "weather_yesterday_min": None, "weather_yesterday_date": None,
+            "weather_today_desc": None, "weather_today_max": None, "weather_today_min": None,
+            "weather_tomorrow_desc": None, "weather_tomorrow_max": None, "weather_tomorrow_min": None,
+        })
         return compact
 
     # DAILY
     daily = data.get("daily", {})
-    d_times = daily.get("time", [])
-    d_codes = daily.get("weathercode", [])
-    d_max = daily.get("temperature_2m_max", [])
-    d_min = daily.get("temperature_2m_min", [])
+    d_times = daily.get("time", []) or []
+    d_codes = daily.get("weathercode", []) or []
+    d_max = daily.get("temperature_2m_max", []) or []
+    d_min = daily.get("temperature_2m_min", []) or []
 
     today_str = now.date().isoformat()
     idx_today = 0
@@ -276,38 +267,41 @@ def build_compact_weather(existing_obs=None):
     compact["weather_tomorrow_max"] = tm.get("max")
     compact["weather_tomorrow_min"] = tm.get("min")
 
-    # HOURLY: hour_0 rule: if now.minute == 0 -> use current hour; else next full hour
+    # HOURLY
     hourly = data.get("hourly", {})
-    h_times = hourly.get("time", [])
-    h_temp = hourly.get("temperature_2m", [])
-    h_humi = hourly.get("relativehumidity_2m", [])
-    h_code = hourly.get("weathercode", [])
+    h_times = hourly.get("time", []) or []
+    h_temp = hourly.get("temperature_2m", []) or []
+    h_humi = hourly.get("relativehumidity_2m", []) or []
+    h_code = hourly.get("weathercode", []) or []
 
-    parsed = [_parse_iso_local(t) for t in h_times]
+    parsed = [_parse_iso_local(tt) for tt in h_times]
 
-    if now.minute == 0:
-        now_rounded = now.replace(minute=0, second=0, microsecond=0)
+    # RULE: if now is exactly on the hour (minute==0 and second==0) -> hour_0 = this hour,
+    # else hour_0 = next full hour (ceil)
+    if now.minute == 0 and now.second == 0:
+        target_hour = now.replace(minute=0, second=0, microsecond=0)
     else:
-        now_rounded = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        target_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
 
     start_idx = None
     for i, p in enumerate(parsed):
         if p is None:
             continue
         try:
-            if p >= now_rounded:
+            if p >= target_hour:
                 start_idx = i
                 break
         except Exception:
             continue
 
     if start_idx is None:
+        # choose closest
         diffs = []
         for i, p in enumerate(parsed):
             if p is None:
                 continue
             try:
-                diffs.append((abs((p - now_rounded).total_seconds()), i))
+                diffs.append((abs((p - target_hour).total_seconds()), i))
             except Exception:
                 continue
         if diffs:
@@ -318,13 +312,18 @@ def build_compact_weather(existing_obs=None):
 
     for offset in range(min(EXTENDED_HOURS, 24)):
         i = start_idx + offset
-        if i >= len(h_times):
-            break
         label = f"hour_{offset}"
-        time_label = parsed[i].strftime("%H:%M") if parsed[i] else h_times[i]
+        if i < len(parsed) and parsed[i]:
+            time_label = parsed[i].strftime("%H:%M")
+        elif i < len(h_times):
+            time_label = h_times[i]
+        else:
+            time_label = None
+
         compact[label] = time_label
         compact[f"{label}_temperature"] = (h_temp[i] if i < len(h_temp) else None)
         compact[f"{label}_humidity"] = (h_humi[i] if i < len(h_humi) else None)
+        # simple label only
         code = None
         try:
             code = int(h_code[i]) if i < len(h_code) else None
@@ -332,9 +331,9 @@ def build_compact_weather(existing_obs=None):
             code = None
         compact[f"{label}_weather"] = WEATHER_CODE_MAP.get(code) if code is not None else None
 
-    # humidity aggregates safe
+    # humidity aggregates (best-effort)
     try:
-        hums = [h for h in h_humi if h is not None]
+        hums = [float(h) for h in h_humi if h is not None]
         if len(hums) >= 24:
             compact["humidity_yesterday"] = round(sum(hums[0:24]) / 24.0, 1)
         if len(hums) >= 48:
@@ -371,7 +370,7 @@ def send_to_thingsboard(data: dict):
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
-# ============ Routes ============
+# ============ ROUTES ============
 @app.get("/")
 def root():
     return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4] + "***", "extended_hours": EXTENDED_HOURS}
@@ -388,26 +387,31 @@ def bias_status():
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
-    weather_compact = build_compact_weather(existing_obs=data.dict())
-
-    # update bias (but do NOT create *_corrected keys)
-    # build next_hours list for bias function - use hour_N_temperature keys
+    logger.info(f"ESP32 ▶ received sensor data")
+    # Build and push compact payload
+    merged_baseline = {
+        "temperature": data.temperature,
+        "humidity": data.humidity,
+        "battery": data.battery,
+        "location": "An Phú, Hồ Chí Minh",
+        "crop": "Rau muống",
+    }
+    weather = build_compact_weather(existing_obs=merged_baseline)
     next_hours = []
-    for i in range(EXTENDED_HOURS):
-        key = f"hour_{i}"
-        if key in weather_compact:
-            next_hours.append({
-                "time": weather_compact.get(key),
-                "temperature": weather_compact.get(f"{key}_temperature")
-            })
-
+    for offset in range(EXTENDED_HOURS):
+        key = f"hour_{offset}_temperature"
+        if key in weather:
+            next_hours.append({"temperature": weather.get(key)})
     bias = update_bias_and_correct(next_hours, data.temperature)
+    weather["forecast_bias"] = bias
+    weather["forecast_history_len"] = len(bias_history)
+    # keep observed fields explicit
+    weather["temperature"] = data.temperature
+    weather["humidity"] = data.humidity
+    weather["battery"] = data.battery
 
-    merged = {**data.dict(), **weather_compact, "forecast_bias": bias, "forecast_history_len": len(bias_history)}
-
-    send_to_thingsboard(merged)
-    return {"received": data.dict(), "pushed": merged}
+    send_to_thingsboard(weather)
+    return {"received": data.dict(), "pushed_keys": list(weather.keys())}
 
 # ============ AUTO LOOP (simulator) ============
 async def auto_loop():
@@ -423,19 +427,19 @@ async def auto_loop():
             humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
-
-            merged = build_compact_weather(existing_obs=sample)
-            # update bias with sample
+            weather = build_compact_weather(existing_obs=sample)
             next_hours = []
-            for i in range(EXTENDED_HOURS):
-                key = f"hour_{i}"
-                if key in merged:
-                    next_hours.append({"time": merged.get(key), "temperature": merged.get(f"{key}_temperature")})
+            for offset in range(EXTENDED_HOURS):
+                tkey = f"hour_{offset}_temperature"
+                if tkey in weather:
+                    next_hours.append({"temperature": weather.get(tkey)})
             bias = update_bias_and_correct(next_hours, sample["temperature"])
-            merged["forecast_bias"] = bias
-            merged["forecast_history_len"] = len(bias_history)
-
-            send_to_thingsboard(merged)
+            weather["forecast_bias"] = bias
+            weather["forecast_history_len"] = len(bias_history)
+            weather["temperature"] = sample["temperature"]
+            weather["humidity"] = sample["humidity"]
+            weather["battery"] = sample["battery"]
+            send_to_thingsboard(weather)
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
         await asyncio.sleep(AUTO_LOOP_INTERVAL)
@@ -446,8 +450,7 @@ async def startup():
     load_history_from_db()
     asyncio.create_task(auto_loop())
 
-# ============ NOTES ============
-# - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - This version: Open-Meteo only, robust retries (drops problematic hourly vars if provider errors),
-#   hour_0 rule: if minute==0 use current hour; otherwise use next full hour.
-# - Removed AI helper / LLM. Compact telemetry keys only.
+# Notes:
+# - Use only Open-Meteo (no API key required for non-commercial free use in many cases).
+# - hour_0 rule: if the service time is exactly HH:00:00 then hour_0 = HH:00; otherwise hour_0 = next full hour (ceil).
+# - The code ensures keys exist even when remote API fails so ThingsBoard dashboard won't lose fields.
