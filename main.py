@@ -17,6 +17,7 @@ if not TB_TOKEN:
 if not WEATHER_KEY:
     raise RuntimeError("⚠️ Missing WEATHER_API_KEY in environment variables!")
 
+# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 logger.info(f"✅ Startup with TB_TOKEN (first 4 chars): {TB_TOKEN[:4]}****")
@@ -24,7 +25,7 @@ logger.info(f"✅ Startup with TB_TOKEN (first 4 chars): {TB_TOKEN[:4]}****")
 # ================== APP ==================
 app = FastAPI()
 
-# ================== WEATHER MAPPING TIẾNG VIỆT ==================
+# ================== WEATHER MAPPING ==================
 weather_mapping = {
     "Sunny": "Nắng",
     "Clear": "Trời quang",
@@ -42,7 +43,10 @@ weather_mapping = {
     "Moderate or heavy rain with thunder": "Mưa to kèm dông",
     "Fog": "Sương mù",
     "Patchy rain nearby": "Có mưa cục bộ",
-    "Patchy light rain": "Mưa nhẹ cục bộ",
+    "Patchy light rain": "Mưa nhẹ",
+    "Light drizzle": "Mưa phùn nhẹ",
+    "Heavy drizzle": "Mưa phùn nặng",
+    "Thunderstorm": "Dông",
 }
 
 def translate_condition(cond: str) -> str:
@@ -68,21 +72,47 @@ def fetch_weather():
             "wind_kph": data["current"]["wind_kph"],
             "wind_gust_kph": data["current"]["gust_kph"],
             "weather_desc": translate_condition(data["current"]["condition"]["text"]),
-            "weather_today_desc": translate_condition(data["forecast"]["forecastday"][0]["day"]["condition"]["text"]),
-            "weather_today_max": data["forecast"]["forecastday"][0]["day"]["maxtemp_c"],
-            "weather_today_min": data["forecast"]["forecastday"][0]["day"]["mintemp_c"],
-            "weather_tomorrow_desc": translate_condition(data["forecast"]["forecastday"][1]["day"]["condition"]["text"]),
-            "weather_tomorrow_max": data["forecast"]["forecastday"][1]["day"]["maxtemp_c"],
-            "weather_tomorrow_min": data["forecast"]["forecastday"][1]["day"]["mintemp_c"],
+            "weather_desc_en": data["current"]["condition"]["text"],
         }
 
-        # Dự báo 4-6 giờ tới
+        # 4-7 giờ tới
         for i, hour_data in enumerate(data["forecast"]["forecastday"][0]["hour"][:7]):
             telemetry[f"hour_{i}_temperature"] = hour_data["temp_c"]
             telemetry[f"hour_{i}_humidity"] = hour_data["humidity"]
             telemetry[f"hour_{i}_weather_desc"] = translate_condition(hour_data["condition"]["text"])
+            telemetry[f"hour_{i}_weather_desc_en"] = hour_data["condition"]["text"]
+
+        # Hôm qua
+        yesterday = data["forecast"]["forecastday"][0]
+        telemetry.update({
+            "weather_yesterday_desc": translate_condition(yesterday["day"]["condition"]["text"]),
+            "weather_yesterday_max": yesterday["day"]["maxtemp_c"],
+            "weather_yesterday_min": yesterday["day"]["mintemp_c"],
+            "humidity_yesterday": yesterday["day"]["avghumidity"],
+        })
+
+        # Hôm nay
+        today = data["forecast"]["forecastday"][0]
+        telemetry.update({
+            "weather_today_desc": translate_condition(today["day"]["condition"]["text"]),
+            "weather_today_desc_en": today["day"]["condition"]["text"],
+            "weather_today_max": today["day"]["maxtemp_c"],
+            "weather_today_min": today["day"]["mintemp_c"],
+            "humidity_today": today["day"]["avghumidity"],
+        })
+
+        # Ngày mai
+        tomorrow = data["forecast"]["forecastday"][1]
+        telemetry.update({
+            "weather_tomorrow_desc": translate_condition(tomorrow["day"]["condition"]["text"]),
+            "weather_tomorrow_desc_en": tomorrow["day"]["condition"]["text"],
+            "weather_tomorrow_max": tomorrow["day"]["maxtemp_c"],
+            "weather_tomorrow_min": tomorrow["day"]["mintemp_c"],
+            "humidity_tomorrow": tomorrow["day"]["avghumidity"],
+        })
 
         return telemetry
+
     except Exception as e:
         logger.error(f"[ERROR] Fetch WeatherAPI: {e}")
         return None
@@ -106,7 +136,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(job, "interval", minutes=5)
 scheduler.start()
 
-# ================== STARTUP ACTION ==================
+# ================== STARTUP ==================
 @app.on_event("startup")
 def startup_event():
     logger.info("🚀 Service started, pushing startup telemetry...")
