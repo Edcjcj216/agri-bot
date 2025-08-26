@@ -1,269 +1,142 @@
 import os
 import time
-import json
 import logging
 import requests
-import asyncio
 from fastapi import FastAPI
-from pydantic import BaseModel
-from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ================== CONFIG ==================
-TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "sgkxcrqntuki8gu1oj8u")
-TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
+TB_URL = "https://thingsboard.cloud/api/v1"
+TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+LAT = 10.762622   # Hồ Chí Minh
+LON = 106.660172
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-LAT = float(os.getenv("LAT", "10.79"))
-LON = float(os.getenv("LON", "106.70"))
-AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # giây
+# Sai số hiệu chỉnh nhiệt độ dự báo
+FORECAST_BIAS = -0.5
 
-# Ngưỡng có thể override bằng biến môi trường
-THUNDER_PROB = int(os.getenv("THUNDER_PROB", "50"))   # xác suất mưa >= -> coi là giông
-SPREAD_PROB = int(os.getenv("SPREAD_PROB", "30"))     # mở rộng giông sang giờ kề nếu >=
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
 
-# ================== LOGGING ==================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# ================== FASTAPI ==================
-app = FastAPI()
-
-class SensorData(BaseModel):
-    temperature: float
-    humidity: float
-    battery: float | None = None
-
-# ================== WEATHER ==================
+# ================== WEATHER CODE MAP ==================
 WEATHER_CODE_MAP = {
-    0: "Có nắng",
-    1: "Nắng nhẹ",
-    2: "Có mây",
-    3: "Nhiều mây",
-    45: "Sương mù",
-    48: "Sương mù",
-    51: "Mưa phùn nhẹ",
-    53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    61: "Mưa nhẹ",
-    63: "Mưa vừa",
-    65: "Mưa to",
-    80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Có giông",
-    96: "Có giông",
-    99: "Có giông"
+    800: "Có nắng",
+    801: "Nắng nhẹ (ít mây)",
+    802: "Có mây",
+    803: "Nhiều mây",
+    804: "U ám",
+
+    500: "Mưa nhẹ",
+    501: "Mưa vừa",
+    502: "Mưa to",
+    503: "Mưa rất to",
+    504: "Mưa cực lớn",
+    520: "Mưa rào nhẹ",
+    521: "Mưa rào",
+    522: "Mưa rào to",
+    531: "Mưa rào bất thường",
+
+    200: "Có giông",
+    201: "Giông vừa",
+    202: "Giông mạnh",
+    210: "Giông",
+    211: "Giông",
+    212: "Giông mạnh",
+    221: "Giông bất thường",
+    230: "Giông kèm mưa phùn",
+    231: "Giông kèm mưa nhỏ",
+    232: "Giông kèm mưa lớn",
+
+    701: "Sương mù nhẹ",
+    741: "Sương mù",
+    771: "Gió giật"
 }
+DEFAULT_DESC = "Không xác định"
 
-weather_cache = {"ts": 0, "data": {}}
+# ================== FASTAPI APP ==================
+app = FastAPI()
+last_push = {}
 
-def get_weather_forecast():
-    now = datetime.now()
-    # cache 15 phút
-    if time.time() - weather_cache["ts"] < 900:
-        return weather_cache["data"]
-
+# ================== FETCH WEATHER ==================
+def fetch_weather():
     try:
-        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        url = "https://api.open-meteo.com/v1/forecast"
         params = {
             "latitude": LAT,
             "longitude": LON,
-            "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-            # thêm precipitation_probability vào hourly để mở rộng cảnh báo giông
-            "hourly": "temperature_2m,relativehumidity_2m,weathercode,precipitation_probability",
-            "timezone": "Asia/Ho_Chi_Minh",
-            "start_date": start_date,
-            "end_date": end_date
+            "hourly": ["temperature_2m", "relative_humidity_2m", "weathercode"],
+            "daily": ["temperature_2m_max", "temperature_2m_min"],
+            "timezone": "Asia/Ho_Chi_Minh"
         }
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
         r.raise_for_status()
-        data = r.json()
-        daily = data.get("daily", {})
-        hourly = data.get("hourly", {})
-
-        def mean(lst):
-            return round(sum(lst)/len(lst),1) if lst else 0
-
-        # Hôm qua (daily[0]), Hôm nay (daily[1]), Ngày mai (daily[2])
-        def daily_desc(index):
-            # lấy weathercode và max temp nếu có
-            code_list = daily.get("weathercode", [])
-            max_list = daily.get("temperature_2m_max", [])
-            code = code_list[index] if index < len(code_list) else None
-            max_t = max_list[index] if index < len(max_list) else None
-            desc = WEATHER_CODE_MAP.get(code, "Không xác định") if code is not None else "Không xác định"
-            # override: nếu daily max >= 35 => "Nắng nóng"
-            if isinstance(max_t, (int, float)) and max_t >= 35:
-                desc = "Nắng nóng"
-            return desc, max_t
-
-        # Hôm qua
-        yesterday_desc, yesterday_max = daily_desc(0)
-        weather_yesterday = {
-            "weather_yesterday_desc": yesterday_desc,
-            "weather_yesterday_max": yesterday_max if yesterday_max is not None else 0,
-            "weather_yesterday_min": daily.get("temperature_2m_min", [0])[0] if "temperature_2m_min" in daily else 0,
-            "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
-        }
-
-        # Hôm nay
-        today_desc, today_max = daily_desc(1)
-        weather_today = {
-            "weather_today_desc": today_desc,
-            "weather_today_max": today_max if today_max is not None else 0,
-            "weather_today_min": daily.get("temperature_2m_min", [0,0])[1] if "temperature_2m_min" in daily else 0,
-            "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
-        }
-
-        # Ngày mai
-        tomorrow_desc, tomorrow_max = daily_desc(2)
-        weather_tomorrow = {
-            "weather_tomorrow_desc": tomorrow_desc,
-            "weather_tomorrow_max": tomorrow_max if tomorrow_max is not None else 0,
-            "weather_tomorrow_min": daily.get("temperature_2m_min", [0,0,0])[2] if "temperature_2m_min" in daily else 0,
-            "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
-        }
-
-        times = hourly.get("time", [])
-        temps = hourly.get("temperature_2m", [])
-        hums = hourly.get("relativehumidity_2m", [])
-        codes = hourly.get("weathercode", [])
-        precip_probs = hourly.get("precipitation_probability", [])
-
-        # Tạo mô tả ban đầu cho nhiều giờ
-        n_hours = max(7, min(len(times), 24))
-        initial_desc = []
-        rain_codes = {51,53,55,61,63,65,80,81,82}
-        thunder_codes = {95,96,99}
-        for i in range(n_hours):
-            code_i = codes[i] if i < len(codes) else None
-            prob_i = precip_probs[i] if i < len(precip_probs) else 0
-            desc = WEATHER_CODE_MAP.get(code_i, "Không xác định") if code_i is not None else "Không xác định"
-            # Nếu weathercode báo giông hoặc xác suất mưa cao -> coi là 'Có giông'
-            if (code_i in thunder_codes) or (prob_i >= THUNDER_PROB and (code_i in rain_codes or code_i is None)):
-                desc = "Có giông"
-            initial_desc.append({"desc": desc, "prob": prob_i})
-
-        # Mở rộng cảnh báo 'Có giông' sang giờ kề nếu prob >= SPREAD_PROB
-        for i in range(len(initial_desc)):
-            if initial_desc[i]["desc"] == "Có giông":
-                j = i - 1
-                while j >= 0 and initial_desc[j]["prob"] >= SPREAD_PROB:
-                    initial_desc[j]["desc"] = "Có giông"
-                    j -= 1
-                j = i + 1
-                while j < len(initial_desc) and initial_desc[j]["prob"] >= SPREAD_PROB:
-                    initial_desc[j]["desc"] = "Có giông"
-                    j += 1
-
-        # Ghi vào hour_0..hour_6 (giữ tương thích với format cũ)
-        hours_data = {}
-        for i in range(7):
-            hours_data[f"hour_{i}_temperature"] = round(temps[i],1) if i < len(temps) else 0
-            hours_data[f"hour_{i}_humidity"] = round(hums[i],1) if i < len(hums) else 0
-            hours_data[f"hour_{i}_weather_desc"] = initial_desc[i]["desc"] if i < len(initial_desc) else "Không xác định"
-
-        result = {**weather_yesterday, **weather_today, **weather_tomorrow, **hours_data}
-        weather_cache["data"] = result
-        weather_cache["ts"] = time.time()
-        return result
-
+        return r.json()
     except Exception as e:
-        logger.warning(f"Weather API error: {e}")
-        fallback = {
-            "weather_yesterday_desc":"Không xác định","weather_yesterday_max":0,"weather_yesterday_min":0,"humidity_yesterday":0,
-            "weather_today_desc":"Không xác định","weather_today_max":0,"weather_today_min":0,"humidity_today":0,
-            "weather_tomorrow_desc":"Không xác định","weather_tomorrow_max":0,"weather_tomorrow_min":0,"humidity_tomorrow":0
-        }
-        for i in range(7):
-            fallback[f"hour_{i}_temperature"] = 0
-            fallback[f"hour_{i}_humidity"] = 0
-            fallback[f"hour_{i}_weather_desc"] = "Không xác định"
-        return fallback
+        logger.error(f"[ERROR] Error fetching Open-Meteo: {e}")
+        return None
 
-# ================== AI HELPER ==================
-def get_advice(temp, humi):
-    nutrition = ["Ưu tiên Kali (K)","Cân bằng NPK","Bón phân hữu cơ"]
-    care = []
-    if temp >=35: care.append("Tránh nắng gắt, tưới sáng sớm/chiều mát")
-    elif temp >=30: care.append("Tưới đủ nước, theo dõi thường xuyên")
-    elif temp <=15: care.append("Giữ ấm, tránh sương muối")
-    else: care.append("Nhiệt độ bình thường")
-    if humi <=40: care.append("Độ ẩm thấp: tăng tưới")
-    elif humi <=60: care.append("Độ ẩm hơi thấp: theo dõi, tưới khi cần")
-    elif humi >=85: care.append("Độ ẩm cao: tránh úng, kiểm tra thoát nước")
-    else: care.append("Độ ẩm ổn định cho rau muống")
-    return {
-        "advice": " | ".join(nutrition + care + ["Quan sát cây trồng và điều chỉnh thực tế"]),
-        "advice_nutrition": " | ".join(nutrition),
-        "advice_care": " | ".join(care),
-        "advice_note": "Quan sát cây trồng và điều chỉnh thực tế",
-        "prediction": f"Nhiệt độ {temp}°C, độ ẩm {humi}%"
-    }
+# ================== PUSH TO THINGSBOARD ==================
+def push_to_tb():
+    global last_push
+    data = fetch_weather()
+    if not data:
+        return
 
-# ================== THINGSBOARD ==================
-def send_to_thingsboard(data: dict):
     try:
-        logger.info(f"TB ▶ {json.dumps(data, ensure_ascii=False)}")
-        r = requests.post(TB_DEVICE_URL, json=data, timeout=10)
-        logger.info(f"TB ◀ {r.status_code}")
-    except Exception as e:
-        logger.error(f"ThingsBoard push error: {e}")
+        hourly = data["hourly"]
+        daily = data["daily"]
 
-# ================== ROUTES ==================
+        telemetry = {}
+        # chỉ lấy 5 giờ tới (hour_0 -> hour_4)
+        for i in range(0, 5):
+            temp = hourly["temperature_2m"][i] + FORECAST_BIAS
+            hum = hourly["relative_humidity_2m"][i]
+            code = hourly["weathercode"][i]
+            desc = WEATHER_CODE_MAP.get(code, DEFAULT_DESC)
+            telemetry[f"hour_{i}temperature"] = round(temp, 1)
+            telemetry[f"hour_{i}humidity"] = hum
+            telemetry[f"hour_{i}weather_desc"] = desc
+
+        # daily max/min
+        daily_max = daily["temperature_2m_max"][0] + FORECAST_BIAS
+        daily_min = daily["temperature_2m_min"][0] + FORECAST_BIAS
+        telemetry["daily_max"] = round(daily_max, 1)
+        telemetry["daily_min"] = round(daily_min, 1)
+
+        # override nếu nắng nóng
+        if daily_max >= 35:
+            telemetry["daily_weather_desc"] = "Nắng nóng"
+        else:
+            first_code = hourly["weathercode"][0]
+            telemetry["daily_weather_desc"] = WEATHER_CODE_MAP.get(first_code, DEFAULT_DESC)
+
+        # timestamp
+        telemetry["_ts"] = int(time.time() * 1000)
+
+        # gửi lên ThingsBoard
+        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
+        r = requests.post(url, json=telemetry, timeout=10)
+        r.raise_for_status()
+        last_push = telemetry
+        logger.info(f"✅ Sent to ThingsBoard: {telemetry}")
+    except Exception as e:
+        logger.error(f"[ERROR] push_to_tb: {e}")
+
+# ================== SCHEDULER ==================
+scheduler = BackgroundScheduler()
+scheduler.add_job(push_to_tb, "interval", minutes=5)
+scheduler.start()
+
+# ================== FASTAPI ENDPOINTS ==================
 @app.get("/")
 def root():
-    return {"status":"running","demo_token":TB_DEMO_TOKEN[:4]+"***"}
+    return {"status": "ok", "last_push_keys": list(last_push.keys())}
 
-@app.post("/esp32-data")
-def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ {data.dict()}")
-    advice_data = get_advice(data.temperature,data.humidity)
-    weather_data = get_weather_forecast()
-    merged = {
-        **data.dict(),
-        **advice_data,
-        **weather_data,
-        "location":"An Phú, Hồ Chí Minh",
-        "crop":"Rau muống"
-    }
-    send_to_thingsboard(merged)
-    return {"received": data.dict(), "pushed": merged}
+@app.get("/last-push")
+def get_last_push():
+    return last_push
 
-# ================== AUTO LOOP ==================
-async def auto_loop():
-    while True:
-        try:
-            sample = {"temperature":30.1,"humidity":69.2}
-            advice_data = get_advice(sample["temperature"],sample["humidity"])
-            weather_data = get_weather_forecast()
-            merged = {
-                **sample,
-                **advice_data,
-                **weather_data,
-                "location":"An Phú, Hồ Chí Minh",
-                "crop":"Rau muống"
-            }
-            send_to_thingsboard(merged)
-        except Exception as e:
-            logger.error(f"AUTO loop error: {e}")
-        await asyncio.sleep(AUTO_LOOP_INTERVAL)
-
-# ================== STARTUP ==================
-def send_startup_ping():
-    try:
-        payload = {"startup": True, "time": datetime.now().isoformat()}
-        logger.info(f"Startup ping ▶ {json.dumps(payload, ensure_ascii=False)}")
-        r = requests.post(TB_DEVICE_URL, json=payload, timeout=10)
-        logger.info(f"Startup ping ◀ {r.status_code}")
-    except Exception as e:
-        logger.error(f"Startup ping error: {e}")
-
+# ================== STARTUP EVENT ==================
 @app.on_event("startup")
-async def start_auto_loop():
-    logger.info("Service starting up...")
-    # gửi 1 gói ping để kiểm tra device active
-    send_startup_ping()
-    # khởi chạy auto loop nền
-    asyncio.create_task(auto_loop())
+def startup_event():
+    logger.info("🚀 Service started, sending first telemetry...")
+    push_to_tb()
