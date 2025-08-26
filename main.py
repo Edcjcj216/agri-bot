@@ -1,4 +1,4 @@
-# main.py - Open-Meteo only, compact telemetry, hour_0 = current hour if exactly :00:00 else ceil to next hour
+# main.py - Open-Meteo only, compact telemetry, hour_0 = next hour (ceil)
 import os
 import time
 import logging
@@ -142,40 +142,37 @@ def _parse_iso_local(s):
 
 # ============ Open-Meteo fetcher with simple retry variants ============
 def _call_open_meteo(params):
-    try:
-        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError as he:
-        # bubble up for caller to decide
-        raise
+    r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
 def fetch_open_meteo():
+    # NOTE: do NOT include "time" in hourly list — Open-Meteo returns time array by default and including it sometimes causes 400
     base_params = {
         "latitude": LAT,
         "longitude": LON,
         "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
-        "hourly": "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m",
+        # minimal/sane hourly set (no "time")
+        "hourly": "temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m",
         "past_days": 1,
         "forecast_days": 3,
         "timezone": TIMEZONE,
         "timeformat": "iso8601"
     }
-    # try full set first
     try:
         return _call_open_meteo(base_params)
     except Exception as e_full:
         logger.warning(f"Open-Meteo returned error (full hourly). Will retry simpler hourly: {e_full}")
         # try simpler hourly without precipitation_probability
         params2 = dict(base_params)
-        params2["hourly"] = "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m"
+        params2["hourly"] = "temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m"
         try:
             return _call_open_meteo(params2)
         except Exception as e_simple:
             logger.warning(f"Open-Meteo retry (no precip_prob) failed: {e_simple}")
-            # try minimal hourly (time,temperature,relativehumidity,weathercode)
+            # minimal hourly
             params3 = dict(base_params)
-            params3["hourly"] = "time,temperature_2m,relativehumidity_2m,weathercode"
+            params3["hourly"] = "temperature_2m,relativehumidity_2m,weathercode"
             try:
                 return _call_open_meteo(params3)
             except Exception as e_min:
@@ -388,7 +385,6 @@ def bias_status():
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ received sensor data")
-    # Build and push compact payload
     merged_baseline = {
         "temperature": data.temperature,
         "humidity": data.humidity,
@@ -405,7 +401,6 @@ def receive_data(data: SensorData):
     bias = update_bias_and_correct(next_hours, data.temperature)
     weather["forecast_bias"] = bias
     weather["forecast_history_len"] = len(bias_history)
-    # keep observed fields explicit
     weather["temperature"] = data.temperature
     weather["humidity"] = data.humidity
     weather["battery"] = data.battery
@@ -449,8 +444,3 @@ async def startup():
     init_db()
     load_history_from_db()
     asyncio.create_task(auto_loop())
-
-# Notes:
-# - Use only Open-Meteo (no API key required for non-commercial free use in many cases).
-# - hour_0 rule: if the service time is exactly HH:00:00 then hour_0 = HH:00; otherwise hour_0 = next full hour (ceil).
-# - The code ensures keys exist even when remote API fails so ThingsBoard dashboard won't lose fields.
