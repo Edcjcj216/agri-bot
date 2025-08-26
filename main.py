@@ -42,7 +42,7 @@ weather_cache = {"ts": 0, "data": {}}
 
 def get_weather_forecast():
     now = datetime.now()
-    if time.time() - weather_cache["ts"] < 900:  # cache 15 phút
+    if time.time() - weather_cache["ts"] < 900:
         return weather_cache["data"]
 
     try:
@@ -64,41 +64,39 @@ def get_weather_forecast():
         daily = data.get("daily", {})
         hourly = data.get("hourly", {})
 
-        def mean(lst):
-            return round(sum(lst)/len(lst),1) if lst else 0
+        def mean(lst): return round(sum(lst)/len(lst),1) if lst else 0
 
         # Hôm qua
         weather_yesterday = {
-            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
-            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
-            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[0], "Không rõ"),
+            "weather_yesterday_max": daily.get("temperature_2m_max",[0])[0],
+            "weather_yesterday_min": daily.get("temperature_2m_min",[0])[0],
             "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
         }
         # Hôm nay
         weather_today = {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
-            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
-            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "weather_today_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[1], "Không rõ"),
+            "weather_today_max": daily.get("temperature_2m_max",[0])[1],
+            "weather_today_min": daily.get("temperature_2m_min",[0])[1],
             "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
         }
         # Ngày mai
         weather_tomorrow = {
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
-            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
-            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily.get("weathercode",[0])[2], "Không rõ"),
+            "weather_tomorrow_max": daily.get("temperature_2m_max",[0])[2],
+            "weather_tomorrow_min": daily.get("temperature_2m_min",[0])[2],
             "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
         }
 
-        # 7 giờ: hour_0 → hour_6
+        # 4 giờ tới
         temps = hourly.get("temperature_2m", [])
         hums = hourly.get("relativehumidity_2m", [])
         codes = hourly.get("weathercode", [])
         hours_data = {}
-        for i in range(7):
+        for i in range(4):  # hour_0 → hour_3
             hours_data[f"hour_{i}_temperature"] = round(temps[i],1) if i < len(temps) else 0
             hours_data[f"hour_{i}_humidity"] = round(hums[i],1) if i < len(hums) else 0
-            code = codes[i] if i < len(codes) else 0
-            hours_data[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(code, "?")
+            hours_data[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(codes[i], "Không rõ") if i < len(codes) else "Không rõ"
 
         result = {**weather_yesterday, **weather_today, **weather_tomorrow, **hours_data}
         weather_cache["data"] = result
@@ -106,11 +104,11 @@ def get_weather_forecast():
         return result
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        fallback = {f"hour_{i}_temperature":0, f"hour_{i}_humidity":0, f"hour_{i}_weather_desc":"?" for i in range(7)}
+        fallback = {f"hour_{i}_temperature":0, f"hour_{i}_humidity":0, f"hour_{i}_weather_desc":"Không rõ" for i in range(4)}
         fallback.update({
-            "weather_yesterday_desc":"?", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0,
-            "weather_today_desc":"?", "weather_today_max":0, "weather_today_min":0, "humidity_today":0,
-            "weather_tomorrow_desc":"?", "weather_tomorrow_max":0, "weather_tomorrow_min":0, "humidity_tomorrow":0
+            "weather_yesterday_desc":"Không rõ", "weather_yesterday_max":0, "weather_yesterday_min":0, "humidity_yesterday":0,
+            "weather_today_desc":"Không rõ", "weather_today_max":0, "weather_today_min":0, "humidity_today":0,
+            "weather_tomorrow_desc":"Không rõ", "weather_tomorrow_max":0, "weather_tomorrow_min":0, "humidity_tomorrow":0
         })
         return fallback
 
@@ -145,26 +143,17 @@ def send_to_thingsboard(data: dict):
 
 # ================== HELPERS ==================
 def merge_weather_and_hours(existing_data=None):
-    """Merge weather forecast + 4 giờ tiếp theo, giờ làm tròn, tiếng Việt"""
     if existing_data is None:
         existing_data = {}
     weather_data = get_weather_forecast()
-
-    now = datetime.now()
-    hour_rounded = now.hour + 1 if now.minute > 30 else now.hour
-    hour_rounded %= 24
-
-    # 4 giờ tiếp theo
     hours_dict = {}
-    for i in range(5):  # hour_0 → hour_4
-        idx = i
-        temp = weather_data.get(f"hour_{idx}_temperature", 0)
-        hum = weather_data.get(f"hour_{idx}_humidity", 0)
-        desc = weather_data.get(f"hour_{idx}_weather_desc", "?")
+    for i in range(4):  # chỉ 4 giờ tiếp theo
+        temp = weather_data.get(f"hour_{i}_temperature", 0)
+        hum = weather_data.get(f"hour_{i}_humidity", 0)
+        desc = weather_data.get(f"hour_{i}_weather_desc", "Không rõ")
         hours_dict[f"hour_{i}_temperature"] = temp
         hours_dict[f"hour_{i}_humidity"] = hum
-        hours_dict[f"hour_{i}_weather_desc"] = desc  # luôn tiếng Việt
-
+        hours_dict[f"hour_{i}_weather_desc"] = desc
     return {**existing_data, **weather_data, **hours_dict}
 
 # ================== ROUTES ==================
