@@ -16,6 +16,10 @@ LAT = float(os.getenv("LAT", "10.79"))
 LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # giây
 
+# Ngưỡng có thể override bằng biến môi trường
+THUNDER_PROB = int(os.getenv("THUNDER_PROB", "50"))   # xác suất mưa >= -> coi là giông
+SPREAD_PROB = int(os.getenv("SPREAD_PROB", "30"))     # mở rộng giông sang giờ kề nếu >=
+
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,19 +34,32 @@ class SensorData(BaseModel):
 
 # ================== WEATHER ==================
 WEATHER_CODE_MAP = {
-    0: "Trời quang", 1: "Trời quang nhẹ", 2: "Có mây", 3: "Nhiều mây",
-    45: "Sương mù", 48: "Sương mù đóng băng", 51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa",
-    55: "Mưa phùn dày", 61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
-    71: "Tuyết nhẹ", 73: "Tuyết vừa", 75: "Tuyết dày", 80: "Mưa rào nhẹ",
-    81: "Mưa rào vừa", 82: "Mưa rào mạnh", 95: "Giông nhẹ hoặc vừa",
-    96: "Giông kèm mưa đá nhẹ", 99: "Giông kèm mưa đá mạnh"
+    0: "Có nắng",
+    1: "Nắng nhẹ",
+    2: "Có mây",
+    3: "Nhiều mây",
+    45: "Sương mù",
+    48: "Sương mù",
+    51: "Mưa phùn nhẹ",
+    53: "Mưa phùn vừa",
+    55: "Mưa phùn dày",
+    61: "Mưa nhẹ",
+    63: "Mưa vừa",
+    65: "Mưa to",
+    80: "Mưa rào nhẹ",
+    81: "Mưa rào vừa",
+    82: "Mưa rào mạnh",
+    95: "Có giông",
+    96: "Có giông",
+    99: "Có giông"
 }
 
 weather_cache = {"ts": 0, "data": {}}
 
 def get_weather_forecast():
     now = datetime.now()
-    if time.time() - weather_cache["ts"] < 900:  # cache 15 phút
+    # cache 15 phút
+    if time.time() - weather_cache["ts"] < 900:
         return weather_cache["data"]
 
     try:
@@ -53,7 +70,8 @@ def get_weather_forecast():
             "latitude": LAT,
             "longitude": LON,
             "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-            "hourly": "temperature_2m,relativehumidity_2m,weathercode",
+            # thêm precipitation_probability vào hourly để mở rộng cảnh báo giông
+            "hourly": "temperature_2m,relativehumidity_2m,weathercode,precipitation_probability",
             "timezone": "Asia/Ho_Chi_Minh",
             "start_date": start_date,
             "end_date": end_date
@@ -67,52 +85,101 @@ def get_weather_forecast():
         def mean(lst):
             return round(sum(lst)/len(lst),1) if lst else 0
 
+        # Hôm qua (daily[0]), Hôm nay (daily[1]), Ngày mai (daily[2])
+        def daily_desc(index):
+            # lấy weathercode và max temp nếu có
+            code_list = daily.get("weathercode", [])
+            max_list = daily.get("temperature_2m_max", [])
+            code = code_list[index] if index < len(code_list) else None
+            max_t = max_list[index] if index < len(max_list) else None
+            desc = WEATHER_CODE_MAP.get(code, "Không xác định") if code is not None else "Không xác định"
+            # override: nếu daily max >= 35 => "Nắng nóng"
+            if isinstance(max_t, (int, float)) and max_t >= 35:
+                desc = "Nắng nóng"
+            return desc, max_t
+
         # Hôm qua
+        yesterday_desc, yesterday_max = daily_desc(0)
         weather_yesterday = {
-            "weather_yesterday_desc": WEATHER_CODE_MAP.get(daily["weathercode"][0], "?") if "weathercode" in daily else "?",
-            "weather_yesterday_max": daily["temperature_2m_max"][0] if "temperature_2m_max" in daily else 0,
-            "weather_yesterday_min": daily["temperature_2m_min"][0] if "temperature_2m_min" in daily else 0,
+            "weather_yesterday_desc": yesterday_desc,
+            "weather_yesterday_max": yesterday_max if yesterday_max is not None else 0,
+            "weather_yesterday_min": daily.get("temperature_2m_min", [0])[0] if "temperature_2m_min" in daily else 0,
             "humidity_yesterday": mean(hourly.get("relativehumidity_2m", [])[:24])
         }
+
         # Hôm nay
+        today_desc, today_max = daily_desc(1)
         weather_today = {
-            "weather_today_desc": WEATHER_CODE_MAP.get(daily["weathercode"][1], "?") if "weathercode" in daily else "?",
-            "weather_today_max": daily["temperature_2m_max"][1] if "temperature_2m_max" in daily else 0,
-            "weather_today_min": daily["temperature_2m_min"][1] if "temperature_2m_min" in daily else 0,
+            "weather_today_desc": today_desc,
+            "weather_today_max": today_max if today_max is not None else 0,
+            "weather_today_min": daily.get("temperature_2m_min", [0,0])[1] if "temperature_2m_min" in daily else 0,
             "humidity_today": mean(hourly.get("relativehumidity_2m", [])[24:48])
         }
+
         # Ngày mai
+        tomorrow_desc, tomorrow_max = daily_desc(2)
         weather_tomorrow = {
-            "weather_tomorrow_desc": WEATHER_CODE_MAP.get(daily["weathercode"][2], "?") if "weathercode" in daily else "?",
-            "weather_tomorrow_max": daily["temperature_2m_max"][2] if "temperature_2m_max" in daily else 0,
-            "weather_tomorrow_min": daily["temperature_2m_min"][2] if "temperature_2m_min" in daily else 0,
+            "weather_tomorrow_desc": tomorrow_desc,
+            "weather_tomorrow_max": tomorrow_max if tomorrow_max is not None else 0,
+            "weather_tomorrow_min": daily.get("temperature_2m_min", [0,0,0])[2] if "temperature_2m_min" in daily else 0,
             "humidity_tomorrow": mean(hourly.get("relativehumidity_2m", [])[48:72])
         }
 
-        # 7 mốc giờ: hour_0 → hour_6, tách ra 3 key riêng
         times = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
         hums = hourly.get("relativehumidity_2m", [])
         codes = hourly.get("weathercode", [])
+        precip_probs = hourly.get("precipitation_probability", [])
+
+        # Tạo mô tả ban đầu cho nhiều giờ
+        n_hours = max(7, min(len(times), 24))
+        initial_desc = []
+        rain_codes = {51,53,55,61,63,65,80,81,82}
+        thunder_codes = {95,96,99}
+        for i in range(n_hours):
+            code_i = codes[i] if i < len(codes) else None
+            prob_i = precip_probs[i] if i < len(precip_probs) else 0
+            desc = WEATHER_CODE_MAP.get(code_i, "Không xác định") if code_i is not None else "Không xác định"
+            # Nếu weathercode báo giông hoặc xác suất mưa cao -> coi là 'Có giông'
+            if (code_i in thunder_codes) or (prob_i >= THUNDER_PROB and (code_i in rain_codes or code_i is None)):
+                desc = "Có giông"
+            initial_desc.append({"desc": desc, "prob": prob_i})
+
+        # Mở rộng cảnh báo 'Có giông' sang giờ kề nếu prob >= SPREAD_PROB
+        for i in range(len(initial_desc)):
+            if initial_desc[i]["desc"] == "Có giông":
+                j = i - 1
+                while j >= 0 and initial_desc[j]["prob"] >= SPREAD_PROB:
+                    initial_desc[j]["desc"] = "Có giông"
+                    j -= 1
+                j = i + 1
+                while j < len(initial_desc) and initial_desc[j]["prob"] >= SPREAD_PROB:
+                    initial_desc[j]["desc"] = "Có giông"
+                    j += 1
+
+        # Ghi vào hour_0..hour_6 (giữ tương thích với format cũ)
         hours_data = {}
         for i in range(7):
             hours_data[f"hour_{i}_temperature"] = round(temps[i],1) if i < len(temps) else 0
             hours_data[f"hour_{i}_humidity"] = round(hums[i],1) if i < len(hums) else 0
-            hours_data[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(codes[i], "?") if i < len(codes) else "?"
+            hours_data[f"hour_{i}_weather_desc"] = initial_desc[i]["desc"] if i < len(initial_desc) else "Không xác định"
 
         result = {**weather_yesterday, **weather_today, **weather_tomorrow, **hours_data}
         weather_cache["data"] = result
         weather_cache["ts"] = time.time()
         return result
+
     except Exception as e:
         logger.warning(f"Weather API error: {e}")
-        fallback = {"weather_yesterday_desc":"?","weather_yesterday_max":0,"weather_yesterday_min":0,"humidity_yesterday":0,
-                    "weather_today_desc":"?","weather_today_max":0,"weather_today_min":0,"humidity_today":0,
-                    "weather_tomorrow_desc":"?","weather_tomorrow_max":0,"weather_tomorrow_min":0,"humidity_tomorrow":0}
+        fallback = {
+            "weather_yesterday_desc":"Không xác định","weather_yesterday_max":0,"weather_yesterday_min":0,"humidity_yesterday":0,
+            "weather_today_desc":"Không xác định","weather_today_max":0,"weather_today_min":0,"humidity_today":0,
+            "weather_tomorrow_desc":"Không xác định","weather_tomorrow_max":0,"weather_tomorrow_min":0,"humidity_tomorrow":0
+        }
         for i in range(7):
             fallback[f"hour_{i}_temperature"] = 0
             fallback[f"hour_{i}_humidity"] = 0
-            fallback[f"hour_{i}_weather_desc"] = "?"
+            fallback[f"hour_{i}_weather_desc"] = "Không xác định"
         return fallback
 
 # ================== AI HELPER ==================
@@ -183,6 +250,20 @@ async def auto_loop():
             logger.error(f"AUTO loop error: {e}")
         await asyncio.sleep(AUTO_LOOP_INTERVAL)
 
+# ================== STARTUP ==================
+def send_startup_ping():
+    try:
+        payload = {"startup": True, "time": datetime.now().isoformat()}
+        logger.info(f"Startup ping ▶ {json.dumps(payload, ensure_ascii=False)}")
+        r = requests.post(TB_DEVICE_URL, json=payload, timeout=10)
+        logger.info(f"Startup ping ◀ {r.status_code}")
+    except Exception as e:
+        logger.error(f"Startup ping error: {e}")
+
 @app.on_event("startup")
 async def start_auto_loop():
-    asyncio.create_task(auto_loop())  
+    logger.info("Service starting up...")
+    # gửi 1 gói ping để kiểm tra device active
+    send_startup_ping()
+    # khởi chạy auto loop nền
+    asyncio.create_task(auto_loop())
