@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import requests
 from fastapi import FastAPI
@@ -7,101 +8,101 @@ from datetime import datetime
 
 # ================== CONFIG ==================
 TB_URL = "https://thingsboard.cloud/api/v1"
-TB_TOKEN = os.getenv("TB_DEMO_TOKEN", "your_tb_token_here")
+TB_TOKEN = os.getenv("TB_TOKEN")
 
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "your_weatherapi_key_here")
-LAT = 10.7769   # HCM default
-LON = 106.7009
-LOCATION_NAME = "Ho Chi Minh, VN"
-CROP = "Rau muống"
+if not TB_TOKEN:
+    raise RuntimeError("⚠️ Missing TB_TOKEN in environment variables!")
 
-# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
+logger.info(f"✅ Startup with TB_TOKEN (first 4 chars): {TB_TOKEN[:4]}****")
+
+# ================== APP ==================
+app = FastAPI()
+
+# WeatherAPI key & location
+WEATHER_KEY = os.getenv("WEATHER_KEY")
+LOCATION = os.getenv("LOCATION", "Ho Chi Minh,VN")
+
+if not WEATHER_KEY:
+    raise RuntimeError("⚠️ Missing WEATHER_KEY in environment variables!")
+
 # ================== WEATHER MAPPING ==================
-WEATHER_MAP = {
-    # Nắng / Nhiệt
+weather_mapping = {
     "Sunny": "Nắng",
     "Clear": "Trời quang",
-    "Partly cloudy": "Ít mây",
-    "Cloudy": "Nhiều mây",
-    "Overcast": "Âm u",
-
-    # Mưa
-    "Patchy light rain": "Mưa nhẹ",
+    "Partly cloudy": "Trời ít mây",
+    "Cloudy": "Có mây",
+    "Overcast": "Trời âm u",
+    "Mist": "Sương mù nhẹ",
+    "Patchy rain possible": "Có thể có mưa",
     "Light rain": "Mưa nhẹ",
     "Moderate rain": "Mưa vừa",
     "Heavy rain": "Mưa to",
-    "Moderate or heavy rain shower": "Mưa rào vừa hoặc to",
     "Torrential rain shower": "Mưa rất to",
-    "Patchy rain possible": "Có thể có mưa",
-
-    # Dông
-    "Thundery outbreaks possible": "Có dông",
-    "Patchy light rain with thunder": "Mưa dông nhẹ",
-    "Moderate or heavy rain with thunder": "Mưa dông to",
-
-    # Bão / áp thấp
-    "Storm": "Bão",
-    "Tropical storm": "Áp thấp nhiệt đới",
+    "Thundery outbreaks possible": "Có thể có dông",
+    "Patchy light rain with thunder": "Mưa nhẹ kèm dông",
+    "Moderate or heavy rain with thunder": "Mưa to kèm dông",
+    "Fog": "Sương mù",
 }
 
-# ================== FASTAPI APP ==================
-app = FastAPI()
-scheduler = BackgroundScheduler()
+def translate_condition(cond: str) -> str:
+    return weather_mapping.get(cond, cond)
 
+# ================== FUNCTIONS ==================
 def fetch_weather():
-    """Fetch weather data từ WeatherAPI"""
+    url = f"http://api.weatherapi.com/v1/current.json?key={WEATHER_KEY}&q={LOCATION}&aqi=no"
     try:
-        url = f"http://api.weatherapi.com/v1/current.json?key={WEATHER_API_KEY}&q={LAT},{LON}&aqi=no&lang=en"
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
 
-        temp = data["current"]["temp_c"]
-        hum = data["current"]["humidity"]
-        cond = data["current"]["condition"]["text"]
-        desc = WEATHER_MAP.get(cond, cond)
-
         telemetry = {
-            "temperature": temp,
-            "humidity": hum,
-            "weather_desc": desc,
-            "location": LOCATION_NAME,
-            "crop": CROP,
-            "time": datetime.utcnow().isoformat()
+            "time": datetime.utcnow().isoformat(),
+            "location": LOCATION,
+            "temperature": data["current"]["temp_c"],
+            "humidity": data["current"]["humidity"],
+            "weather_desc": translate_condition(data["current"]["condition"]["text"]),
+            "crop": "Rau muống"
         }
-
-        push_thingsboard(telemetry)
+        return telemetry
     except Exception as e:
-        logger.error(f"[ERROR] Fetch weather: {e}")
+        logger.error(f"[ERROR] Fetch WeatherAPI: {e}")
+        return None
 
 def push_thingsboard(payload: dict):
-    """Push telemetry lên ThingsBoard"""
+    url = f"{TB_URL}/{TB_TOKEN}/telemetry"
     try:
-        url = f"{TB_URL}/{TB_TOKEN}/telemetry"
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=10)
         r.raise_for_status()
-        logger.info(f"✅ Sent to ThingsBoard: {payload}")
+        logger.info(f"✅ Pushed telemetry: {payload}")
     except Exception as e:
         logger.error(f"[ERROR] Push ThingsBoard: {e}")
 
+def job():
+    telemetry = fetch_weather()
+    if telemetry:
+        push_thingsboard(telemetry)
+
+# ================== SCHEDULER ==================
+scheduler = BackgroundScheduler()
+scheduler.add_job(job, "interval", minutes=5)
+scheduler.start()
+
+# ================== STARTUP ACTION ==================
 @app.on_event("startup")
 def startup_event():
-    logger.info("🚀 Service started, sending startup telemetry...")
+    logger.info("🚀 Service started, pushing startup telemetry...")
     push_thingsboard({"startup": True, "time": datetime.utcnow().isoformat()})
-    scheduler.add_job(fetch_weather, "interval", minutes=5)
-    scheduler.start()
+    job()
 
-@app.on_event("shutdown")
-def shutdown_event():
-    scheduler.shutdown()
-
-@app.get("/")
-async def root():
-    return {"status": "WeatherAPI → ThingsBoard running"}
+# ================== ENDPOINTS ==================
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 @app.get("/last-push")
 async def last_push():
-    return {"last_push": datetime.utcnow().isoformat()}
+    telemetry = fetch_weather()
+    return telemetry
