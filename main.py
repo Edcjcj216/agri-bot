@@ -6,6 +6,7 @@ import requests
 import asyncio
 import sqlite3
 import random
+import math
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -413,7 +414,7 @@ async def auto_loop():
             hour = now.hour + now.minute / 60.0
             base = 27.0
             amplitude = 6.0
-            temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * 3.14159) + random.uniform(-0.7, 0.7)
+            temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * math.pi) + random.uniform(-0.7, 0.7)
             humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
