@@ -1,99 +1,78 @@
-import os
-import random
-import logging
-import requests
-from datetime import datetime
-from fastapi import FastAPI
-from apscheduler.schedulers.background import BackgroundScheduler
+# ===== replace WEATHER_KEY loading (supports both names) =====
+WEATHER_KEY = os.getenv("WEATHER_KEY") or os.getenv("WEATHER_API_KEY")
+if not WEATHER_KEY:
+    raise RuntimeError("⚠️ Missing WEATHER_KEY / WEATHER_API_KEY in environment variables!")
 
-# ================== CONFIG ==================
-logger = logging.getLogger("uvicorn")
-logger.setLevel(logging.INFO)
-
-TB_TOKEN = os.getenv("TB_TOKEN", "demo_tb_token")
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # Đọc đúng tên biến từ Render
-LOCATION = os.getenv("LOCATION", "Ho Chi Minh,VN")
-
-PUSH_INTERVAL = 300  # 5 phút
-CROP_NAME = "Rau muống"
-
-app = FastAPI()
-last_payload = {}
-
-# ================== WEATHER FETCH ==================
+# ===== replace fetch_weather() with this version =====
 def fetch_weather():
-    if WEATHER_KEY:
-        try:
-            resp = requests.get(
-                "https://api.openweathermap.org/data/2.5/weather",
-                params={"q": LOCATION, "appid": WEATHER_KEY, "units": "metric"}
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            telemetry = {
-                "time": datetime.utcnow().isoformat(),
-                "location": LOCATION,
-                "temperature": data["main"]["temp"],
-                "humidity": data["main"]["humidity"],
-                "weather_desc": data["weather"][0]["description"],
-                "crop": CROP_NAME,
-                "advice_text": random.choice([
-                    "Tưới nước đều đặn cho rau muống.",
-                    "Bón phân hữu cơ để rau phát triển tốt.",
-                    "Theo dõi sâu bệnh, kịp thời xử lý.",
-                    "Chọn thời điểm thu hoạch vào buổi sáng để rau tươi ngon."
-                ])
-            }
-            return telemetry
-        except Exception as e:
-            logger.error(f"Lỗi fetch weather: {e}")
-    # Fallback nếu WEATHER_KEY thiếu hoặc lỗi
-    telemetry = {
-        "time": datetime.utcnow().isoformat(),
-        "location": LOCATION,
-        "temperature": round(random.uniform(24, 32), 1),
-        "humidity": random.randint(60, 95),
-        "weather_desc": "Trời quang (test)",
-        "crop": CROP_NAME,
-        "advice_text": random.choice([
-            "Tưới nước đều đặn cho rau muống.",
-            "Bón phân hữu cơ để rau phát triển tốt.",
-            "Theo dõi sâu bệnh, kịp thời xử lý.",
-            "Chọn thời điểm thu hoạch vào buổi sáng để rau tươi ngon."
-        ])
-    }
-    logger.warning("⚠️ WEATHER_API_KEY not found → dùng dữ liệu giả định")
-    return telemetry
-
-# ================== THINGSBOARD PUSH ==================
-def push_to_thingsboard():
-    global last_payload
-    payload = fetch_weather()
-    last_payload = payload
-    if not TB_TOKEN:
-        logger.warning("⚠️ TB_TOKEN chưa cấu hình → chỉ log payload")
-        logger.info(payload)
-        return
+    """
+    Lấy dữ liệu từ WeatherAPI (forecast.json) và trả về telemetry đã chuyển sang tiếng Việt.
+    Trả về dict chứa các key giống format bạn đã push (hour_0_temperature, hour_0_weather_desc, ...).
+    """
+    url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_KEY}&q={LOCATION}&days=2&aqi=no&alerts=no"
     try:
-        url = f"https://thingsboard.cloud/api/v1/{TB_TOKEN}/telemetry"
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        logger.info(f"✅ Sent to ThingsBoard: {payload}")
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        # current
+        current = data.get("current", {})
+        cond_current = current.get("condition", {}).get("text", "")
+        telemetry = {
+            "time": datetime.utcnow().isoformat() + "Z",
+            "location": LOCATION,
+            "temperature": current.get("temp_c"),
+            "humidity": current.get("humidity"),
+            # overwrite weather_desc với tiếng Việt (giữ tên key)
+            "weather_desc": translate_condition(cond_current),
+            "crop": "Rau muống"
+        }
+
+        # build a combined hourly list: use current then forecast hours
+        hours = []
+        # add pseudo-current hour as dict similar shape
+        if current:
+            hours.append({
+                "time": current.get("last_updated"),
+                "temp_c": current.get("temp_c"),
+                "humidity": current.get("humidity"),
+                "condition": {"text": cond_current}
+            })
+        forecast_days = data.get("forecast", {}).get("forecastday", [])
+        for fd in forecast_days:
+            for h in fd.get("hour", []):
+                hours.append(h)
+
+        # fill next 0..6 hours (hour_0 .. hour_6) if available
+        for i in range(0, 7):
+            if i < len(hours):
+                h = hours[i]
+                # ensure keys exist similar to telemetry you showed
+                telemetry[f"hour_{i}_temperature"] = h.get("temp_c")
+                telemetry[f"hour_{i}_humidity"] = h.get("humidity")
+                telemetry[f"hour_{i}_weather_desc"] = translate_condition(h.get("condition", {}).get("text", ""))
+            else:
+                telemetry[f"hour_{i}_temperature"] = None
+                telemetry[f"hour_{i}_humidity"] = None
+                telemetry[f"hour_{i}_weather_desc"] = None
+
+        # today's and tomorrow's summary if present
+        if len(forecast_days) >= 1:
+            today = forecast_days[0].get("day", {})
+            telemetry["weather_today_desc"] = translate_condition(today.get("condition", {}).get("text", ""))
+            telemetry["weather_today_max"] = today.get("maxtemp_c")
+            telemetry["weather_today_min"] = today.get("mintemp_c")
+        if len(forecast_days) >= 2:
+            tom = forecast_days[1].get("day", {})
+            telemetry["weather_tomorrow_desc"] = translate_condition(tom.get("condition", {}).get("text", ""))
+            telemetry["weather_tomorrow_max"] = tom.get("maxtemp_c")
+            telemetry["weather_tomorrow_min"] = tom.get("mintemp_c")
+
+        # you can add yesterday-like fields if you keep history (optional)
+        # keep other custom fields (prediction, advice...) handled elsewhere in your code
+
+        return telemetry
+
     except Exception as e:
-        logger.error(f"Lỗi push ThingsBoard: {e}")
-
-# ================== BACKGROUND SCHEDULER ==================
-scheduler = BackgroundScheduler()
-scheduler.add_job(push_to_thingsboard, 'interval', seconds=PUSH_INTERVAL)
-scheduler.start()
-
-# ================== API ENDPOINT ==================
-@app.get("/last-push")
-def last_push():
-    return last_payload or fetch_weather()
-
-# ================== STARTUP LOG ==================
-@app.on_event("startup")
-def startup_event():
-    logger.info("🚀 Service started, first push in 5s")
-    push_to_thingsboard()
+        logger.error(f"[ERROR] Fetch WeatherAPI (forecast): {e}")
+        return None
