@@ -138,7 +138,6 @@ def init_db():
         except Exception:
             pass
 
-
 def load_history_from_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
@@ -156,7 +155,6 @@ def load_history_from_db():
             conn.close()
         except Exception:
             pass
-
 
 def insert_history_to_db(api_temp, observed_temp, provider="open-meteo"):
     try:
@@ -176,7 +174,6 @@ def insert_history_to_db(api_temp, observed_temp, provider="open-meteo"):
             pass
 
 # ----------------- Helpers -----------------
-
 def _now_local():
     if ZoneInfo is not None:
         try:
@@ -185,10 +182,8 @@ def _now_local():
             return datetime.now()
     return datetime.now()
 
-
 def _mean(lst):
     return round(sum(lst) / len(lst), 1) if lst else None
-
 
 def _normalize_text(s: str) -> str:
     if not s:
@@ -214,7 +209,6 @@ PARTIAL_MAP = [
     (r"sunny", "Nắng"),
 ]
 
-
 def translate_desc(desc_raw):
     if not desc_raw:
         return None
@@ -229,7 +223,6 @@ def translate_desc(desc_raw):
         if re.search(pat, low):
             return mapped
     return cleaned
-
 
 def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: float | None, windspeed: float | None):
     parts = []
@@ -269,7 +262,6 @@ def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: floa
     s = ", ".join(parts)
     return s[0].upper() + s[1:]
 
-
 def _to_local_dt(timestr):
     if not timestr:
         return None
@@ -291,7 +283,6 @@ def _to_local_dt(timestr):
     except Exception:
         pass
     return dt
-
 
 def _find_hour_index(hour_times, now_local):
     if not hour_times:
@@ -320,7 +311,6 @@ def _find_hour_index(hour_times, now_local):
         return 0
 
 # ---------- compute daily min/max from hourly (used when yesterday missing) ------------
-
 def _normalize_time_str(t):
     if not t:
         return None
@@ -331,7 +321,6 @@ def _normalize_time_str(t):
             return datetime.strptime(t, "%Y-%m-%d %H:%M")
         except Exception:
             return None
-
 
 def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
     temps = []
@@ -352,7 +341,6 @@ def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
     return round(min(temps), 1), round(max(temps), 1)
 
 # ================== OPEN-METEO FETCHER (robust) ==================
-
 def fetch_open_meteo():
     """Fetch Open-Meteo with progressive fallback strategies.
     Returns: (daily_list, hourly_list, has_yesterday_bool, raw_json)
@@ -363,7 +351,7 @@ def fetch_open_meteo():
 
     daily_vars = "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
     hourly_vars_full = "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
-    hourly_vars_simple = "temperature_2m,relativehumidity_2m,precipitation,windspeed_10m,winddirection_10m"
+    hourly_vars_simple = "time,temperature_2m,relativehumidity_2m,precipitation,windspeed_10m,winddirection_10m"
 
     base_params = {
         "latitude": LAT,
@@ -386,7 +374,6 @@ def fetch_open_meteo():
         return r.json()
 
     data = None
-    # 1) try full
     try:
         try:
             data = _do_request(hourly_vars=hourly_vars_full)
@@ -498,7 +485,6 @@ def fetch_open_meteo():
         return [], [], False, {}
 
 # ================== BIAS CORRECTION ==================
-
 def update_bias_and_correct(next_hours, observed_temp):
     global bias_history
     if not next_hours:
@@ -525,7 +511,6 @@ def update_bias_and_correct(next_hours, observed_temp):
     return bias
 
 # ================== AI HELPER (removed) - STUB ==================
-
 def get_advice(temp, humi, upcoming_weather=None):
     pred = None
     try:
@@ -541,7 +526,6 @@ def get_advice(temp, humi, upcoming_weather=None):
     }
 
 # ================== THINGSBOARD ==================
-
 def send_to_thingsboard(data: dict):
     try:
         logger.info(f"TB ▶ sending payload (keys: {list(data.keys())})")
@@ -551,7 +535,6 @@ def send_to_thingsboard(data: dict):
         logger.error(f"ThingsBoard push error: {e}")
 
 # ================== MERGE HELPERS ==================
-
 def merge_weather_and_hours(existing_data=None):
     if existing_data is None:
         existing_data = {}
@@ -667,9 +650,19 @@ def merge_weather_and_hours(existing_data=None):
             flattened[f"hour_{idx_h}_windspeed"] = h.get("windspeed")
         if h.get("winddir") is not None:
             flattened[f"hour_{idx_h}_winddir"] = h.get("winddir")
-        if h.get("weather_desc") is not None:
-            flattened[f"hour_{idx_h}_weather_short"] = h.get("weather_desc")
-            flattened[f"hour_{idx_h}_weather_desc"] = h.get("weather_desc")
+
+        # ensure weather_desc is only the short label (no extra numbers)
+        short_label = None
+        if h.get("weather_short"):
+            short_label = h.get("weather_short")
+        elif h.get("weather_code") is not None:
+            short_label = WEATHER_CODE_MAP.get(h.get("weather_code"))
+        else:
+            possible = h.get("weather_desc")
+            short_label = translate_desc(possible) if possible else None
+
+        flattened[f"hour_{idx_h}_weather_short"] = short_label
+        flattened[f"hour_{idx_h}_weather_desc"] = short_label
 
     # aggregated humidity fields (fallback)
     if weather.get("humidity_today") is not None:
@@ -702,7 +695,6 @@ def root():
 @app.get("/weather")
 def weather_endpoint():
     return get_cached_weather()
-
 
 def get_cached_weather():
     # use cache if fresh
