@@ -1,3 +1,4 @@
+# full main.py (updated)
 import os
 import time
 import json
@@ -93,7 +94,6 @@ WEATHER_MAP = {
 }
 
 # ----------------- SQLite persistence for bias history -----------------
-
 def init_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
@@ -153,7 +153,6 @@ def insert_history_to_db(api_temp, observed_temp):
             pass
 
 # -------------------------------------------------------------------------
-
 def _now_local():
     if ZoneInfo is not None:
         try:
@@ -215,6 +214,12 @@ def _nice_weather_desc(base_phrase: str, precip: float | None, precip_prob: floa
         return base_phrase or "Không có dữ liệu"
     s = ", ".join(parts)
     return s[0].upper() + s[1:]
+
+# Helper to translate English descriptions via WEATHER_MAP
+def translate_desc(desc_raw):
+    if not desc_raw:
+        return None
+    return WEATHER_MAP.get(desc_raw, desc_raw)
 
 # ================== WEATHER FETCHER (try OWM -> WeatherAPI -> Open-Meteo fallback) ==================
 def get_weather_forecast():
@@ -290,7 +295,7 @@ def get_weather_forecast():
                     weather = d.get("weather")
                     if weather and isinstance(weather, list) and len(weather) > 0:
                         desc_raw = weather[0].get("description")
-                        desc = WEATHER_MAP.get(desc_raw, desc_raw)
+                        desc = translate_desc(desc_raw)
                     daily_list.append({
                         "date": date,
                         "desc": desc,
@@ -307,7 +312,7 @@ def get_weather_forecast():
                     weather = h.get("weather")
                     if weather and isinstance(weather, list) and len(weather) > 0:
                         desc_raw = weather[0].get("description")
-                        desc = WEATHER_MAP.get(desc_raw, desc_raw)
+                        desc = translate_desc(desc_raw)
                     else:
                         desc = None
                     precip = 0
@@ -354,7 +359,7 @@ def get_weather_forecast():
                     date = d.get("date")
                     day = d.get("day", {})
                     desc_raw = day.get("condition", {}).get("text")
-                    desc = WEATHER_MAP.get(desc_raw, desc_raw)
+                    desc = translate_desc(desc_raw)
                     daily_list.append({
                         "date": date,
                         "desc": desc,
@@ -374,7 +379,7 @@ def get_weather_forecast():
                         except Exception:
                             pass
                         desc_raw = h.get("condition", {}).get("text")
-                        desc = WEATHER_MAP.get(desc_raw, desc_raw)
+                        desc = translate_desc(desc_raw)
                         hourly_list.append({
                             "time": t_iso,
                             "temperature": h.get("temp_c"),
@@ -457,9 +462,11 @@ def get_weather_forecast():
         daily_list = []
         if "time" in daily and daily["time"]:
             for idx in range(len(daily.get("time", []))):
+                code = safe_get(daily.get("weathercode", []), idx)
+                desc = WEATHER_CODE_MAP.get(code) if code is not None else None
                 daily_list.append({
                     "date": safe_get(daily.get("time", []), idx),
-                    "desc": WEATHER_CODE_MAP.get(safe_get(daily.get("weathercode", []), idx), None),
+                    "desc": desc,
                     "max": safe_get(daily.get("temperature_2m_max", []), idx),
                     "min": safe_get(daily.get("temperature_2m_min", []), idx),
                     "precipitation_sum": safe_get(daily.get("precipitation_sum", []), idx),
@@ -470,11 +477,14 @@ def get_weather_forecast():
         hourly_list = []
         for i in range(0, min(len(hour_times), 96)):
             t = hour_times[i]
+            code = safe_get(hourly.get("weathercode", []), i)
+            base_desc = WEATHER_CODE_MAP.get(code) if code is not None else None
+            # base_desc is Vietnamese already (from WEATHER_CODE_MAP)
             hourly_list.append({
                 "time": t,
                 "temperature": safe_get(hourly.get("temperature_2m", []), i),
                 "humidity": safe_get(hourly.get("relativehumidity_2m", []), i),
-                "weather_desc": _nice_weather_desc(WEATHER_CODE_MAP.get(safe_get(hourly.get("weathercode", []), i), None),
+                "weather_desc": _nice_weather_desc(base_desc,
                                                    safe_get(hourly.get("precipitation", []), i),
                                                    safe_get(hourly.get("precipitation_probability", []), i),
                                                    safe_get(hourly.get("windspeed_10m", []), i)),
@@ -501,7 +511,6 @@ def get_weather_forecast():
         return {"meta": {}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
 
 # ================== BIAS CORRECTION ==================
-
 def update_bias_and_correct(next_hours, observed_temp):
     global bias_history
     if not next_hours:
@@ -531,7 +540,6 @@ def update_bias_and_correct(next_hours, observed_temp):
 # LLM integration intentionally removed — this service now focuses on weather + rule-based advice only.
 
 # ================== AI HELPER (rule-based)
-
 def get_advice(temp, humi, upcoming_weather=None):
     nutrition = ["Ưu tiên Kali (K)", "Cân bằng NPK", "Bón phân hữu cơ"]
     care = []
@@ -581,7 +589,6 @@ def get_advice(temp, humi, upcoming_weather=None):
     }
 
 # ================== THINGSBOARD ==================
-
 def send_to_thingsboard(data: dict):
     try:
         logger.info(f"TB ▶ sending payload (keys: {list(data.keys())})")
@@ -591,7 +598,6 @@ def send_to_thingsboard(data: dict):
         logger.error(f"ThingsBoard push error: {e}")
 
 # ================== HELPERS ==================
-
 def merge_weather_and_hours(existing_data=None):
     if existing_data is None:
         existing_data = {}
@@ -774,4 +780,4 @@ async def startup():
 # ================== NOTES ==================
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - Ensure OWM_API_KEY and/or WEATHER_API_KEY are set in environment; Open-Meteo fallback used if others fail.
-# - This version: removed LLM, added WEATHER_MAP (English->Vietnamese) and applied it to descriptions.
+# - This version: removed LLM, added WEATHER_MAP (English->Vietnamese) and applied it to descriptions for all providers.
