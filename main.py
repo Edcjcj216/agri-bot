@@ -62,7 +62,7 @@ WEATHER_CODE_MAP = {
     80: "Mưa rào nhẹ",
     81: "Mưa rào vừa",
     82: "Mưa rào mạnh",
-    # thunder -> unify to "Có giông"
+    # thunder -> unify to "Có giông" (spelling fixed)
     95: "Có giông", 96: "Có giông", 99: "Có giông",
 }
 
