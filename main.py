@@ -424,7 +424,7 @@ def get_provider_order():
     ordered = sorted(possible, key=lambda x: (scores.get(x, float("inf")), x))
     return ordered
 
-# ================== WEATHER FETCHERS (OWM + WeatherAPI) ==================
+# ================== WEATHER FETCHERS (OWM + WeatherAPI + Open-Meteo fallback) ==================
 def fetch_owm_with_history():
     """Return (daily_list, hourly_list, has_yesterday, api_now_temp) or None"""
     if not OWM_API_KEY:
@@ -665,6 +665,85 @@ def fetch_weatherapi_with_history():
         logger.warning(f"fetch_weatherapi_with_history error: {e}")
         return None
 
+def fetch_open_meteo_with_history():
+    """Open-Meteo fallback (no API key required). Returns same shape as other fetchers."""
+    try:
+        now = datetime.utcnow()
+        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        end_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": LAT, "longitude": LON,
+            "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
+            "hourly": "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m,precipitation_probability",
+            "timezone": TIMEZONE,
+            "start_date": start_date, "end_date": end_date
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+
+        daily_list = []
+        daily = data.get("daily", {})
+        for i, d_date in enumerate(daily.get("time", [])):
+            code = None
+            try:
+                code = daily.get("weathercode", [None])[i]
+            except Exception:
+                code = None
+            desc = WEATHER_CODE_MAP.get(code) if code is not None else None
+            daily_list.append({
+                "date": d_date,
+                "desc": desc,
+                "max": daily.get("temperature_2m_max", [None])[i] if daily.get("temperature_2m_max") else None,
+                "min": daily.get("temperature_2m_min", [None])[i] if daily.get("temperature_2m_min") else None,
+                "precipitation_sum": daily.get("precipitation_sum", [None])[i] if daily.get("precipitation_sum") else None,
+                "windspeed_max": daily.get("windspeed_10m_max", [None])[i] if daily.get("windspeed_10m_max") else None
+            })
+
+        hourly_list = []
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        hums = hourly.get("relativehumidity_2m", [])
+        wcodes = hourly.get("weathercode", [])
+        precs = hourly.get("precipitation", [])
+        pops = hourly.get("precipitation_probability", [])
+        winds = hourly.get("windspeed_10m", [])
+        winddirs = hourly.get("winddirection_10m", [])
+        for i, t in enumerate(times):
+            code = wcodes[i] if i < len(wcodes) else None
+            base_desc = WEATHER_CODE_MAP.get(code) if code is not None else None
+            hourly_list.append({
+                "time": t,
+                "temperature": temps[i] if i < len(temps) else None,
+                "humidity": hums[i] if i < len(hums) else None,
+                "weather_desc": _nice_weather_desc(base_desc,
+                                                   precs[i] if i < len(precs) else None,
+                                                   pops[i] if i < len(pops) else None,
+                                                   winds[i] if i < len(winds) else None),
+                "precipitation": precs[i] if i < len(precs) else None,
+                "precip_probability": pops[i] if i < len(pops) else None,
+                "windspeed": winds[i] if i < len(winds) else None,
+                "winddir": winddirs[i] if i < len(winddirs) else None
+            })
+
+        # api_now: try current_weather if present
+        api_now = None
+        cur = data.get("current_weather", {})
+        if cur and cur.get("temperature") is not None:
+            api_now = cur.get("temperature")
+        if api_now is None:
+            api_now = find_closest_api_now(hourly_list)
+
+        yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        has_yesterday = any(d.get("date") == yesterday_str for d in daily_list)
+
+        return daily_list, hourly_list, has_yesterday, api_now
+    except Exception as e:
+        logger.warning(f"fetch_open_meteo_with_history error: {e}")
+        return None
+
 # ================== MAIN get_weather_forecast (uses provider order + captures per-provider now temps) ==================
 def get_weather_forecast():
     now = _now_local()
@@ -746,18 +825,35 @@ def get_weather_forecast():
                 api_now_temp = None
 
             providers_now[p] = api_now_temp
-            logger.info(f"provider={p} api_now={api_now_temp} (local now={datetime.now(ZoneInfo(TIMEZONE)) if ZoneInfo else datetime.now(timezone.utc)})")
+            try:
+                log_now = datetime.now(ZoneInfo(TIMEZONE)) if ZoneInfo else datetime.now(timezone.utc)
+            except Exception:
+                log_now = datetime.now(timezone.utc)
+            logger.info(f"provider={p} api_now={api_now_temp} (local now={log_now})")
             if selected_result is None:
                 selected_result = build_result_from_generic(daily_list, hourly_list, source_name=p, providers_now=providers_now)
                 selected_provider = p
+                # if this provider gives yesterday, prefer and stop
                 if has_yday:
                     break
         except Exception as e:
             logger.warning(f"fetcher {p} error: {e}")
             continue
 
+    # If none of the primary providers returned data, try Open-Meteo fallback
     if not selected_result:
-        # fallback: if both failed, return empty structure
+        try:
+            om = fetch_open_meteo_with_history()
+            if om:
+                daily_list, hourly_list, has_yday, api_now_temp = om
+                providers_now["open-meteo"] = api_now_temp
+                selected_result = build_result_from_generic(daily_list, hourly_list, source_name="open-meteo", providers_now=providers_now)
+                selected_provider = "open-meteo"
+        except Exception as e:
+            logger.warning(f"open-meteo fallback error: {e}")
+
+    if not selected_result:
+        # fallback: if all failed, return empty structure
         selected_result = {"meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": None, "providers_now": providers_now}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
         selected_provider = None
 
@@ -1045,6 +1141,6 @@ async def startup():
 
 # ================== NOTES ==================
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - Ensure OWM_API_KEY and/or WEATHER_API_KEY are set in environment.
+# - Ensure OWM_API_KEY and/or WEATHER_API_KEY are set in environment. Open-Meteo fallback requires no key.
 # - Set PROVIDER_PRIORITY env (optional) to e.g. "owm,weatherapi" to force order.
 # - Set WEATHER_CACHE_SECONDS small (e.g. 60) while testing.
