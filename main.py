@@ -1,9 +1,10 @@
 # main.py
 """
-Agri-bot main service — Open-Meteo primary (fixed).
-- Fix: DO NOT include "time" in hourly parameter (avoids Open-Meteo 400).
-- All *_weather_desc fields are short labels only.
-- AI/advice removed. Keeps forecast_bias/history.
+Agri-bot main service — Open-Meteo primary (fixed timezone parsing & index selection).
+- Fix: parse hourly times as timezone-aware (Asia/Ho_Chi_Minh).
+- Fix: select first hourly >= now (instead of nearest or falling back to midnight).
+- Keep weather_short only (no numeric clutter in labels).
+- AI/advice removed.
 """
 
 import os
@@ -151,8 +152,11 @@ def _now_local():
     return datetime.now()
 
 def _to_local_dt(timestr):
+    """Parse ISO-like string and return a timezone-aware datetime in TIMEZONE if possible."""
     if not timestr:
         return None
+    dt = None
+    # try fromisoformat (handles offsets)
     try:
         dt = datetime.fromisoformat(timestr)
     except Exception:
@@ -163,7 +167,19 @@ def _to_local_dt(timestr):
                 dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
             except Exception:
                 return None
-    return dt
+    # If zoneinfo available, convert or assign
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(TIMEZONE)
+            if dt.tzinfo is None:
+                # assume API times are local to TIMEZONE when no offset given -> attach tz
+                return dt.replace(tzinfo=tz)
+            else:
+                return dt.astimezone(tz)
+        except Exception:
+            return dt
+    else:
+        return dt
 
 def _normalize_text(s: str) -> str:
     if not s:
@@ -347,7 +363,6 @@ def fetch_open_meteo():
                 "temperature": h_temp[i] if i < len(h_temp) else None,
                 "humidity": h_humi[i] if i < len(h_humi) else None,
                 "weather_code": code,
-                # IMPORTANT: use only short label (no numeric additions)
                 "weather_short": short_desc,
                 "weather_desc": short_desc,
                 "precipitation": h_prec[i] if i < len(h_prec) else None,
@@ -404,12 +419,8 @@ def sanitize_for_tb(payload: dict):
         if k.endswith("_weather_desc") or k.endswith("_weather_short") or k.startswith("weather_"):
             if isinstance(v, str):
                 s = v
-                # remove parenthetical ranges and numeric clutter
-                s = re.sub(r"\([^)]*\d{1,2}[.,]?\d*°?[CF]?.*?\)", "", s)
-                s = re.sub(r"\d+[.,]?\d*\s*[-–]\s*\d+[.,]?\d*°?C", "", s)
-                s = re.sub(r"lượng mưa.*", "", s, flags=re.IGNORECASE)
-                s = re.sub(r"gió.*", "", s, flags=re.IGNORECASE)
-                s = re.sub(r"[0-9]+[.,]?[0-9]*\s*(mm|km/h|°C|%|kph|m/s)", "", s, flags=re.IGNORECASE)
+                s = re.sub(r"\([^)]*\)", "", s).strip()
+                s = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", s, flags=re.IGNORECASE)
                 s = s.strip()
                 if s == "":
                     sanitized[k] = None
@@ -472,23 +483,32 @@ def merge_weather_and_hours(existing_data=None):
     flattened["weather_yesterday_min"] = ty.get("min")
     flattened["weather_yesterday_date"] = ty.get("date")
 
-    # find index for current hour
+    # build parsed hourly times (timezone-aware)
     hour_times = [h.get("time") for h in hourly_list] if hourly_list else []
-    # convert to datetimes for matching
-    idx = 0
+    parsed_times = [_to_local_dt(t) for t in hour_times]
+
+    # choose index: first parsed_time >= now_rounded (hour), else fallback to nearest or 0
     now_rounded = now.replace(minute=0, second=0, microsecond=0)
+    start_idx = None
     try:
-        parsed_times = [_to_local_dt(t) for t in hour_times]
-        # pick nearest index
-        diffs = [abs((p - now_rounded).total_seconds()) if p is not None else float('inf') for p in parsed_times]
-        idx = int(min(range(len(diffs)), key=lambda i: diffs[i])) if parsed_times else 0
+        for i, p in enumerate(parsed_times):
+            if p is None:
+                continue
+            # ensure p is timezone-aware (we return aware when ZoneInfo available)
+            if p >= now_rounded:
+                start_idx = i
+                break
+        if start_idx is None:
+            # fallback: nearest index
+            diffs = [abs((p - now_rounded).total_seconds()) if p is not None else float('inf') for p in parsed_times]
+            start_idx = int(min(range(len(diffs)), key=lambda i: diffs[i])) if parsed_times else 0
     except Exception:
-        idx = 0
+        start_idx = 0
 
     # next hours
     next_hours = []
     for offset in range(0, EXTENDED_HOURS):
-        i = idx + offset
+        i = start_idx + offset
         if i >= len(hourly_list):
             break
         next_hours.append(hourly_list[i])
@@ -542,7 +562,6 @@ def merge_weather_and_hours(existing_data=None):
             rawdesc = h.get("weather_desc")
             short_label = translate_desc(rawdesc) if rawdesc else None
 
-        # clean just in case, remove numbers/parentheses
         if isinstance(short_label, str):
             short_label = re.sub(r"\([^)]*\)", "", short_label).strip()
             short_label = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", short_label, flags=re.IGNORECASE).strip()
@@ -659,8 +678,3 @@ async def startup():
     init_db()
     load_history_from_db()
     asyncio.create_task(auto_loop())
-
-# ============== NOTES ============
-# - Run: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - Important fix: do NOT include "time" in hourly param for Open-Meteo.
-# - If your dashboard still shows concatenated numeric strings, update the widget to display *_weather_desc or *_weather_short.
