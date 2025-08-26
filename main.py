@@ -1,10 +1,9 @@
 # main.py
 """
-Agri-bot main service (Open-Meteo primary, no AI/advice).
-- Open-Meteo primary, robust fallbacks.
-- All *_weather_desc fields are forced to SHORT LABELS only (no numbers, no ranges).
-- No AI helper / no advice fields.
-- Keeps forecast_bias and history.
+Agri-bot main service — Open-Meteo primary (fixed).
+- Fix: DO NOT include "time" in hourly parameter (avoids Open-Meteo 400).
+- All *_weather_desc fields are short labels only.
+- AI/advice removed. Keeps forecast_bias/history.
 """
 
 import os
@@ -22,7 +21,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from collections import deque
 
-# zoneinfo for local timezone if available
+# zoneinfo for timezone
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -164,37 +163,7 @@ def _to_local_dt(timestr):
                 dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
             except Exception:
                 return None
-    if dt.tzinfo is None and ZoneInfo is not None:
-        try:
-            dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
-        except Exception:
-            pass
     return dt
-
-def _find_hour_index(hour_times, now_local):
-    if not hour_times:
-        return 0
-    parsed = []
-    for t in hour_times:
-        parsed.append(_to_local_dt(t))
-    diffs = []
-    for p in parsed:
-        if p is None:
-            diffs.append(float('inf'))
-            continue
-        try:
-            if now_local.tzinfo is not None and p.tzinfo is None:
-                p = p.replace(tzinfo=now_local.tzinfo)
-            diffs.append(abs((p - now_local).total_seconds()))
-        except Exception:
-            diffs.append(float('inf'))
-    try:
-        idx = int(min(range(len(diffs)), key=lambda i: diffs[i]))
-        if diffs[idx] == float('inf'):
-            return 0
-        return idx
-    except Exception:
-        return 0
 
 def _normalize_text(s: str) -> str:
     if not s:
@@ -265,14 +234,15 @@ def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
         return None, None
     return round(min(temps), 1), round(max(temps), 1)
 
-# ================== OPEN-METEO FETCHER (robust) ==================
+# ================== OPEN-METEO FETCHER (fixed: DO NOT include 'time' in hourly param) ==================
 def fetch_open_meteo():
     now = _now_local()
     yesterday = (now - timedelta(days=1)).date().isoformat()
     base = "https://api.open-meteo.com/v1/forecast"
     daily_vars = "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
-    hourly_vars_full = "time,temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
-    hourly_vars_simple = "time,temperature_2m,relativehumidity_2m,precipitation,windspeed_10m,winddirection_10m"
+    # IMPORTANT: DO NOT include "time" here
+    hourly_vars_full = "temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
+    hourly_vars_simple = "temperature_2m,relativehumidity_2m,precipitation,windspeed_10m,winddirection_10m"
 
     base_params = {
         "latitude": LAT,
@@ -296,7 +266,7 @@ def fetch_open_meteo():
 
     data = None
     try:
-        # try full hourly set
+        # try full hourly set (WITHOUT 'time')
         try:
             data = _do_request(hourly_vars=hourly_vars_full)
         except requests.HTTPError as he:
@@ -356,7 +326,7 @@ def fetch_open_meteo():
                 "windspeed_max": wmx[i] if i < len(wmx) else None
             })
 
-        # parse hourly
+        # parse hourly — read hourly.time separately (we DID NOT request 'time' in hourly param)
         hourly_list = []
         h = data.get("hourly", {})
         h_times = h.get("time", [])
@@ -376,9 +346,10 @@ def fetch_open_meteo():
                 "time": time_iso,
                 "temperature": h_temp[i] if i < len(h_temp) else None,
                 "humidity": h_humi[i] if i < len(h_humi) else None,
-                "weather_desc": short_desc,
-                "weather_short": short_desc,
                 "weather_code": code,
+                # IMPORTANT: use only short label (no numeric additions)
+                "weather_short": short_desc,
+                "weather_desc": short_desc,
                 "precipitation": h_prec[i] if i < len(h_prec) else None,
                 "precip_probability": h_pp[i] if i < len(h_pp) else None,
                 "windspeed": h_wind[i] if i < len(h_wind) else None,
@@ -426,9 +397,6 @@ def update_bias_and_correct(next_hours, observed_temp):
 
 # ================== SANITIZE BEFORE TB PUSH ==================
 def sanitize_for_tb(payload: dict):
-    """Ensure all *_weather_desc fields are short labels (no numbers/ranges).
-    Remove parentheses, ranges, 'lượng mưa', 'gió', '°C' etc from desc values.
-    """
     sanitized = dict(payload)
     for k, v in list(sanitized.items()):
         if not isinstance(k, str):
@@ -436,13 +404,12 @@ def sanitize_for_tb(payload: dict):
         if k.endswith("_weather_desc") or k.endswith("_weather_short") or k.startswith("weather_"):
             if isinstance(v, str):
                 s = v
-                # remove parenthetical ranges e.g. (24.7–32.0°C)
+                # remove parenthetical ranges and numeric clutter
                 s = re.sub(r"\([^)]*\d{1,2}[.,]?\d*°?[CF]?.*?\)", "", s)
-                # remove phrases like "lượng mưa", "gió", "°C"
+                s = re.sub(r"\d+[.,]?\d*\s*[-–]\s*\d+[.,]?\d*°?C", "", s)
                 s = re.sub(r"lượng mưa.*", "", s, flags=re.IGNORECASE)
                 s = re.sub(r"gió.*", "", s, flags=re.IGNORECASE)
-                s = re.sub(r"°[CF]", "", s)
-                s = re.sub(r"\d+[.,]?\d*\s*[-–]\s*\d+[.,]?\d*°?C", "", s)
+                s = re.sub(r"[0-9]+[.,]?[0-9]*\s*(mm|km/h|°C|%|kph|m/s)", "", s, flags=re.IGNORECASE)
                 s = s.strip()
                 if s == "":
                     sanitized[k] = None
@@ -488,19 +455,17 @@ def merge_weather_and_hours(existing_data=None):
 
     flattened = {**existing_data}
 
-    # DAILY - today (short label only)
+    # DAILY fields (short labels only)
     t = weather.get("today", {}) or {}
     flattened["weather_today_desc"] = t.get("desc") if t.get("desc") is not None else None
     flattened["weather_today_max"] = t.get("max") if t.get("max") is not None else None
     flattened["weather_today_min"] = t.get("min") if t.get("min") is not None else None
 
-    # DAILY - tomorrow (short label only)
     tt = weather.get("tomorrow", {}) or {}
     flattened["weather_tomorrow_desc"] = tt.get("desc") if tt.get("desc") is not None else None
     flattened["weather_tomorrow_max"] = tt.get("max") if tt.get("max") is not None else None
     flattened["weather_tomorrow_min"] = tt.get("min") if tt.get("min") is not None else None
 
-    # DAILY - yesterday
     ty = weather.get("yesterday", {}) or {}
     flattened["weather_yesterday_desc"] = ty.get("desc")
     flattened["weather_yesterday_max"] = ty.get("max")
@@ -509,7 +474,16 @@ def merge_weather_and_hours(existing_data=None):
 
     # find index for current hour
     hour_times = [h.get("time") for h in hourly_list] if hourly_list else []
-    idx = _find_hour_index(hour_times, now)
+    # convert to datetimes for matching
+    idx = 0
+    now_rounded = now.replace(minute=0, second=0, microsecond=0)
+    try:
+        parsed_times = [_to_local_dt(t) for t in hour_times]
+        # pick nearest index
+        diffs = [abs((p - now_rounded).total_seconds()) if p is not None else float('inf') for p in parsed_times]
+        idx = int(min(range(len(diffs)), key=lambda i: diffs[i])) if parsed_times else 0
+    except Exception:
+        idx = 0
 
     # next hours
     next_hours = []
@@ -519,7 +493,7 @@ def merge_weather_and_hours(existing_data=None):
             break
         next_hours.append(hourly_list[i])
 
-    # attach hours (short label only for desc)
+    # attach hours
     for idx_h, h in enumerate(next_hours):
         time_label = None
         time_local_iso = None
@@ -555,7 +529,7 @@ def merge_weather_and_hours(existing_data=None):
         if h.get("winddir") is not None:
             flattened[f"hour_{idx_h}_winddir"] = h.get("winddir")
 
-        # short label
+        # short label only
         short_label = None
         if h.get("weather_short"):
             short_label = h.get("weather_short")
@@ -568,11 +542,10 @@ def merge_weather_and_hours(existing_data=None):
             rawdesc = h.get("weather_desc")
             short_label = translate_desc(rawdesc) if rawdesc else None
 
-        # defense cleanup: remove parentheses / ranges
+        # clean just in case, remove numbers/parentheses
         if isinstance(short_label, str):
             short_label = re.sub(r"\([^)]*\)", "", short_label).strip()
-            short_label = re.sub(r"lượng mưa.*", "", short_label, flags=re.IGNORECASE).strip()
-            short_label = re.sub(r"gió.*", "", short_label, flags=re.IGNORECASE).strip()
+            short_label = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", short_label, flags=re.IGNORECASE).strip()
             if short_label == "":
                 short_label = None
 
@@ -617,7 +590,6 @@ def root():
 
 @app.get("/weather")
 def weather_endpoint():
-    # return cached or fresh
     if time.time() - weather_cache.get("ts", 0) < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
         return weather_cache["data"]
     res = merge_weather_and_hours(existing_data={})
@@ -637,7 +609,6 @@ def receive_data(data: SensorData):
     weather = merge_weather_and_hours(existing_data={})
     next_hours = weather.get("next_hours", [])
 
-    # update bias only
     bias = update_bias_and_correct(next_hours, data.temperature)
 
     merged = {
@@ -656,7 +627,6 @@ def receive_data(data: SensorData):
 async def auto_loop():
     logger.info("Auto-loop simulator started")
     battery = 4.2
-    tick = 0
     while True:
         try:
             now = _now_local()
@@ -680,7 +650,6 @@ async def auto_loop():
 
             merged = merge_weather_and_hours(existing_data=merged)
             send_to_thingsboard(merged)
-            tick += 1
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
         await asyncio.sleep(AUTO_LOOP_INTERVAL)
@@ -693,7 +662,5 @@ async def startup():
 
 # ============== NOTES ============
 # - Run: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - This version: Open-Meteo primary, all textual desc fields forced to short labels,
-#   AI/advice removed. Keep dashboard widgets but if your ThingsBoard UI constructs
-#   description by concatenating numeric fields, you should update the dashboard
-#   to rely on *_weather_desc or *_weather_short keys.
+# - Important fix: do NOT include "time" in hourly param for Open-Meteo.
+# - If your dashboard still shows concatenated numeric strings, update the widget to display *_weather_desc or *_weather_short.
