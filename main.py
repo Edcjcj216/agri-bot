@@ -11,7 +11,7 @@ import asyncio
 import sqlite3
 from fastapi import FastAPI
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict
 
 # zoneinfo if available
@@ -175,7 +175,6 @@ def load_history_from_db():
         # load provider table - load recent MAX_HISTORY per provider
         cur.execute("SELECT provider, api_temp, observed_temp FROM bias_history_provider ORDER BY id DESC LIMIT ?", (MAX_HISTORY * 10,))
         rows2 = cur.fetchall()
-        # rows2 newest-first; process reverse to chronological and distribute
         rows2.reverse()
         for provider, api, obs in rows2:
             if provider is None:
@@ -214,8 +213,6 @@ def insert_history_to_db(api_temp, observed_temp, provider: str | None = None):
             conn.close()
         except Exception:
             pass
-
-# -------------------------------------------------------------------------
 
 # ----------------- Helpers -----------------
 def _now_local():
@@ -347,6 +344,63 @@ def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
     return round(min(temps), 1), round(max(temps), 1)
 
 
+# ----------------- timezone helpers & api_now selection -----------------
+def _to_zone(dt: datetime):
+    """Return timezone-aware datetime in configured TIMEZONE."""
+    if ZoneInfo is not None:
+        tz = ZoneInfo(TIMEZONE)
+    else:
+        tz = timezone.utc
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # assume UTC for naive datetimes
+        return dt.replace(tzinfo=timezone.utc).astimezone(tz)
+    return dt.astimezone(tz)
+
+
+def find_closest_api_now(hourly_list):
+    """Normalize times to TIMEZONE and pick temperature whose hour is closest to local now (hour granularity)."""
+    if not hourly_list:
+        return None
+    # build now in target tz (rounded to hour)
+    if ZoneInfo is not None:
+        now_local = datetime.now(ZoneInfo(TIMEZONE)).replace(minute=0, second=0, microsecond=0)
+    else:
+        now_local = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    best = None
+    min_diff = float("inf")
+    for h in hourly_list:
+        t = h.get("time")
+        if not t:
+            continue
+        dt = None
+        try:
+            # ISO with offset or 'Z' -> yields tz-aware
+            dt = datetime.fromisoformat(t)
+        except Exception:
+            try:
+                dt = datetime.strptime(t, "%Y-%m-%d %H:%M")
+                # assume this string is local to TIMEZONE
+                if ZoneInfo is not None:
+                    dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+                else:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        try:
+            dt_local = _to_zone(dt)
+        except Exception:
+            continue
+        diff = abs((dt_local - now_local).total_seconds())
+        if diff < min_diff:
+            min_diff = diff
+            best = h
+    if best:
+        return best.get("temperature")
+    return None
+
+
 # ----------------- Provider ordering (env or dynamic) -----------------
 def compute_mean_abs_error_for_provider(provider: str):
     dq = bias_history_per_provider.get(provider, None)
@@ -363,18 +417,15 @@ def get_provider_order():
     possible = ["owm", "weatherapi", "open-meteo"]
     if PROVIDER_PRIORITY_ENV:
         order = [p.strip() for p in PROVIDER_PRIORITY_ENV.split(",") if p.strip() in possible]
-        # append missing providers
         for p in possible:
             if p not in order:
                 order.append(p)
         return order
 
-    # dynamic: compute mean abs error for each provider
     scores = {}
     for p in possible:
         m = compute_mean_abs_error_for_provider(p)
         scores[p] = m if m is not None else float("inf")
-    # sort ascending by score; unknown (inf) will go last; stable default: owm first if tie
     ordered = sorted(possible, key=lambda x: (scores.get(x, float("inf")), x))
     return ordered
 
@@ -410,7 +461,8 @@ def fetch_owm_with_history():
 
         hourly_list = []
         for h in data.get("hourly", [])[:96]:
-            t_iso = datetime.utcfromtimestamp(h.get("dt") or 0).isoformat()
+            # make tz-aware ISO (OWM dt is UNIX UTC)
+            t_iso = datetime.utcfromtimestamp(h.get("dt") or 0).replace(tzinfo=timezone.utc).isoformat()
             desc_raw = None
             weather = h.get("weather")
             if weather and isinstance(weather, list) and len(weather) > 0:
@@ -435,7 +487,6 @@ def fetch_owm_with_history():
         yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
         has_yesterday = any(d.get("date") == yesterday_str for d in daily_list)
 
-        # decide if we need history (missing yesterday or missing min/max)
         need_history = (not has_yesterday) or not any(d for d in daily_list if d.get("date") == yesterday_str and d.get("min") is not None and d.get("max") is not None)
 
         if need_history:
@@ -448,7 +499,7 @@ def fetch_owm_with_history():
                     td = rt.json()
                     hist_hours = td.get("hourly", []) or td.get("data", [])
                     for h in reversed(hist_hours):
-                        t_iso = datetime.utcfromtimestamp(h.get("dt") or 0).isoformat()
+                        t_iso = datetime.utcfromtimestamp(h.get("dt") or 0).replace(tzinfo=timezone.utc).isoformat()
                         desc_raw = None
                         weather = h.get("weather")
                         if weather and isinstance(weather, list) and len(weather) > 0:
@@ -467,7 +518,6 @@ def fetch_owm_with_history():
                             "windspeed": h.get("wind_speed"),
                             "winddir": h.get("wind_deg")
                         })
-                    # compute yesterday min/max from hourly_list
                     y_min, y_max = compute_daily_min_max_from_hourly(hourly_list, yesterday_str)
                     if y_min is not None or y_max is not None:
                         found = False
@@ -485,26 +535,8 @@ def fetch_owm_with_history():
             except Exception as e:
                 logger.info(f"OWM timemachine error: {e}")
 
-        # api_now temperature if available (first hourly after now in hourly_list)
-        api_now_temp = None
-        if hourly_list:
-            # pick the closest to current UTC hour
-            try:
-                now_utc = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-                idx = 0
-                min_diff = float("inf")
-                for i, h in enumerate(hourly_list):
-                    try:
-                        dt = datetime.fromisoformat(h.get("time"))
-                    except Exception:
-                        continue
-                    diff = abs((dt - now_utc).total_seconds())
-                    if diff < min_diff:
-                        min_diff = diff
-                        idx = i
-                api_now_temp = hourly_list[idx].get("temperature")
-            except Exception:
-                api_now_temp = hourly_list[0].get("temperature")
+        # compute api_now_temp using timezone-aware selection
+        api_now_temp = find_closest_api_now(hourly_list)
 
         return daily_list, hourly_list, has_yesterday, api_now_temp
 
@@ -542,7 +574,13 @@ def fetch_weatherapi_with_history():
             for h in d.get("hour", []):
                 t_raw = h.get("time")
                 try:
-                    t_iso = datetime.strptime(t_raw, "%Y-%m-%d %H:%M").isoformat()
+                    dt = datetime.strptime(t_raw, "%Y-%m-%d %H:%M")
+                    # WeatherAPI hour strings are local to the location -> mark with TIMEZONE
+                    if ZoneInfo is not None:
+                        dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+                    else:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    t_iso = dt.isoformat()
                 except Exception:
                     t_iso = t_raw
                 desc_raw = h.get("condition", {}).get("text")
@@ -573,7 +611,12 @@ def fetch_weatherapi_with_history():
                         for h in reversed(fd.get("hour", [])):
                             t_raw = h.get("time")
                             try:
-                                t_iso = datetime.strptime(t_raw, "%Y-%m-%d %H:%M").isoformat()
+                                dt = datetime.strptime(t_raw, "%Y-%m-%d %H:%M")
+                                if ZoneInfo is not None:
+                                    dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+                                else:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                t_iso = dt.isoformat()
                             except Exception:
                                 t_iso = t_raw
                             desc_raw = h.get("condition", {}).get("text")
@@ -605,26 +648,7 @@ def fetch_weatherapi_with_history():
             except Exception as e:
                 logger.info(f"WeatherAPI history error: {e}")
 
-        # compute api_now_temp similar to OWM
-        api_now_temp = None
-        if hourly_list:
-            try:
-                now_utc = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-                idx = 0
-                min_diff = float("inf")
-                for i, h in enumerate(hourly_list):
-                    try:
-                        dt = datetime.fromisoformat(h.get("time"))
-                    except Exception:
-                        continue
-                    diff = abs((dt - now_utc).total_seconds())
-                    if diff < min_diff:
-                        min_diff = diff
-                        idx = i
-                api_now_temp = hourly_list[idx].get("temperature")
-            except Exception:
-                api_now_temp = hourly_list[0].get("temperature")
-
+        api_now_temp = find_closest_api_now(hourly_list)
         return daily_list, hourly_list, has_yesterday, api_now_temp
 
     except Exception as e:
@@ -686,8 +710,15 @@ def fetch_open_meteo():
             t = hour_times[i]
             code = safe_get(hourly.get("weathercode", []), i)
             base_desc = WEATHER_CODE_MAP.get(code) if code is not None else None
+            # Open-Meteo returned times are in timezone requested; ensure ISO format
+            try:
+                # If it's already ISO, fromisoformat handles it; else keep string
+                dt = datetime.fromisoformat(t)
+                t_iso = dt.isoformat()
+            except Exception:
+                t_iso = t
             hourly_list.append({
-                "time": t,
+                "time": t_iso,
                 "temperature": safe_get(hourly.get("temperature_2m", []), i),
                 "humidity": safe_get(hourly.get("relativehumidity_2m", []), i),
                 "weather_desc": _nice_weather_desc(base_desc,
@@ -700,27 +731,7 @@ def fetch_open_meteo():
                 "winddir": safe_get(hourly.get("winddirection_10m", []), i)
             })
 
-        # compute api_now_temp
-        api_now_temp = None
-        if hourly_list:
-            try:
-                now_utc = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-                idx = 0
-                min_diff = float("inf")
-                for i, h in enumerate(hourly_list):
-                    try:
-                        dt = datetime.fromisoformat(h.get("time"))
-                    except Exception:
-                        continue
-                    diff = abs((dt - now_utc).total_seconds())
-                    if diff < min_diff:
-                        min_diff = diff
-                        idx = i
-                api_now_temp = hourly_list[idx].get("temperature")
-            except Exception:
-                api_now_temp = hourly_list[0].get("temperature")
-
-        # determine has_yesterday based on daily_list
+        api_now_temp = find_closest_api_now(hourly_list)
         yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
         has_yesterday = any(d.get("date") == yesterday_str for d in daily_list)
 
@@ -787,9 +798,7 @@ def get_weather_forecast():
         }
         return result
 
-    # Try providers in computed order
     provider_order = get_provider_order()
-    # map short name -> fetcher
     fetchers = {
         "owm": fetch_owm_with_history,
         "weatherapi": fetch_weatherapi_with_history,
@@ -799,7 +808,6 @@ def get_weather_forecast():
     selected_result = None
     selected_provider = None
     providers_now = {}
-    # try each provider in order, but still capture providers_now for comparison
     for p in provider_order:
         fn = fetchers.get(p)
         if not fn:
@@ -808,29 +816,24 @@ def get_weather_forecast():
             out = fn()
             if not out:
                 continue
-            # functions return tuples; OWM/WeatherAPI returns 4 items, open-meteo returns 4 too in our wrapper
             if len(out) == 4:
                 daily_list, hourly_list, has_yday, api_now_temp = out
             else:
-                # safety fallback
                 daily_list, hourly_list = out[0], out[1]
                 has_yday = False
                 api_now_temp = None
 
             providers_now[p] = api_now_temp
-            # choose provider: prefer a provider that has yesterday (per requirement), else first in order
+            logger.info(f"provider={p} api_now={api_now_temp} (local now={datetime.now(ZoneInfo(TIMEZONE)) if ZoneInfo else datetime.now(timezone.utc)})")
             if selected_result is None:
                 selected_result = build_result_from_generic(daily_list, hourly_list, source_name=p, providers_now=providers_now)
                 selected_provider = p
-                # if this provider has yesterday present, stop (prefer providers that include yesterday)
                 if has_yday:
                     break
-                # otherwise continue to see if another provider has yesterday
         except Exception as e:
             logger.warning(f"fetcher {p} error: {e}")
             continue
 
-    # if none returned, try Open-Meteo specifically as fallback
     if not selected_result:
         try:
             out = fetch_open_meteo()
@@ -842,12 +845,10 @@ def get_weather_forecast():
         except Exception as e:
             logger.warning(f"Open-Meteo fallback error: {e}")
 
-    # final fallback empty structure
     if not selected_result:
         selected_result = {"meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": None, "providers_now": providers_now}, "yesterday": {}, "today": {}, "tomorrow": {}, "next_hours": [], "humidity_yesterday": None, "humidity_today": None, "humidity_tomorrow": None}
         selected_provider = None
 
-    # mark provider chosen in meta explicitly
     if isinstance(selected_result, dict):
         selected_result["meta"]["chosen_provider"] = selected_provider
         selected_result["meta"]["providers_now"] = providers_now
@@ -859,32 +860,23 @@ def get_weather_forecast():
 
 # ================== BIAS CORRECTION / RECORDING PER-PROVIDER ==================
 def record_provider_errors_and_compute_bias(observed_temp, weather_meta):
-    """
-    Record observed vs api_now for each provider present in weather_meta['providers_now'].
-    Return (selected_provider_bias, selected_provider_history_len, chosen_provider_name)
-    """
     providers_now = weather_meta.get("providers_now", {}) if weather_meta else {}
     chosen = weather_meta.get("chosen_provider")
-    # record each provider
     for p, api_temp in providers_now.items():
         if api_temp is None:
             continue
         try:
-            # append in-memory
             bias_history_per_provider[p].append((float(api_temp), float(observed_temp)))
-            # persist
             insert_history_to_db(float(api_temp), float(observed_temp), provider=p)
         except Exception:
             pass
 
-    # compute bias for chosen provider (mean obs - api)
     if chosen:
         dq = bias_history_per_provider.get(chosen, None)
         if dq and len(dq) > 0:
             diffs = [obs - api for api, obs in dq if api is not None and obs is not None]
             bias = round(sum(diffs) / len(diffs), 2) if diffs else 0.0
             return bias, len(dq), chosen
-    # fallback: compute overall bias from legacy bias_history
     if bias_history:
         diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
         bias = round(sum(diffs) / len(diffs), 2) if diffs else 0.0
@@ -1056,7 +1048,6 @@ def weather_endpoint():
 
 @app.get("/bias")
 def bias_status():
-    # report mean abs error per provider for debugging
     providers = list(bias_history_per_provider.keys())
     stats = {}
     for p in providers:
@@ -1073,10 +1064,8 @@ def receive_data(data: SensorData):
     weather = get_weather_forecast()
     next_hours = weather.get("next_hours", [])
 
-    # Record provider errors and compute bias for chosen provider
     bias, history_len, chosen_provider = record_provider_errors_and_compute_bias(data.temperature, weather.get("meta", {}))
 
-    # also append to legacy global bias_history for backward compatibility (use chosen provider api_now if exists)
     chosen_api_now = None
     if weather.get("meta") and weather["meta"].get("providers_now"):
         chosen_api_now = weather["meta"]["providers_now"].get(chosen_provider)
@@ -1087,7 +1076,6 @@ def receive_data(data: SensorData):
         except Exception:
             pass
 
-    # baseline (rule-based) advice
     advice_data = get_advice(data.temperature, data.humidity, upcoming_weather=next_hours)
 
     merged = {
@@ -1099,9 +1087,8 @@ def receive_data(data: SensorData):
         "forecast_history_len": history_len
     }
 
-    merged["llm_advice"] = None  # LLM removed
+    merged["llm_advice"] = None
 
-    # attach hours and push
     merged = merge_weather_and_hours(existing_data=merged)
     send_to_thingsboard(merged)
     return {"received": data.dict(), "pushed": merged}
@@ -1124,7 +1111,6 @@ async def auto_loop():
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
 
             weather = get_weather_forecast()
-            # simulate: record provider error using sample temp (so auto-loop also fills history)
             if weather.get("meta"):
                 record_provider_errors_and_compute_bias(sample["temperature"], weather.get("meta", {}))
 
@@ -1160,4 +1146,4 @@ async def startup():
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 # - Ensure OWM_API_KEY and/or WEATHER_API_KEY are set in environment; Open-Meteo fallback used if others fail.
 # - Set PROVIDER_PRIORITY env (optional) to e.g. "owm,weatherapi,open-meteo" to force order.
-# - This version: dynamic provider order (based on per-provider historical error) + per-provider bias persistence.
+# - This version: timezone-aware api_now selection (closest local hour) + per-provider bias persistence.
