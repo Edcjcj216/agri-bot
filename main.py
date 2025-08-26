@@ -49,6 +49,7 @@ class SensorData(BaseModel):
 WEATHER_CODE_MAP = {
     0: "Nắng", 1: "Nắng nhẹ", 2: "Ít mây", 3: "Nhiều mây",
     45: "Sương mù",
+    # note: code 48 removed per your request
     51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
     61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
     80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
