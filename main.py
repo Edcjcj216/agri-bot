@@ -1,4 +1,4 @@
-# main.py - Open-Meteo only, minimal keys, hour_0 = next hour (ceil)
+# main.py - Open-Meteo only, robust fetch (retry simpler hourly on 400), minimal keys
 import os
 import time
 import logging
@@ -6,7 +6,6 @@ import requests
 import asyncio
 import sqlite3
 import random
-import math
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -48,13 +47,14 @@ class SensorData(BaseModel):
 # ============ WEATHER CODE MAP (Open-Meteo WMO codes -> Vietnamese short labels) ============
 WEATHER_CODE_MAP = {
     0: "Nắng", 1: "Nắng nhẹ", 2: "Ít mây", 3: "Nhiều mây",
-    45: "Sương mù", 48: "Sương muối",
+    45: "Sương mù",
     51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
     61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
     80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
-    # Thunder replaced spelling: "Có giông"
+    # Thunder (simplified spelling per request)
     95: "Có giông", 96: "Có giông", 99: "Có giông",
 }
+# NOTE: code 48 ("Sương muối") removed as requested.
 
 # ============ STATE ============
 bias_history = deque(maxlen=MAX_HISTORY)
@@ -142,10 +142,12 @@ def _parse_iso_local(s):
             return dt
     return dt
 
-# ============ Open-Meteo fetcher ============
+# ============ Open-Meteo fetcher (robust: try full hourly, if 400 then try simpler hourly) ============
 def fetch_open_meteo():
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
+    base_url = "https://api.open-meteo.com/v1/forecast"
+
+    # preferred (full) hourly variables (includes precipitation_probability)
+    params_full = {
         "latitude": LAT,
         "longitude": LON,
         "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
@@ -155,15 +157,57 @@ def fetch_open_meteo():
         "timezone": TIMEZONE,
         "timeformat": "iso8601"
     }
+
+    # simpler fallback hourly (remove 'time' and 'precipitation_probability' which sometimes cause server parsing issues)
+    params_simple = {
+        "latitude": LAT,
+        "longitude": LON,
+        "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
+        "hourly": "temperature_2m,relativehumidity_2m,weathercode,precipitation,windspeed_10m,winddirection_10m",
+        "past_days": 1,
+        "forecast_days": 3,
+        "timezone": TIMEZONE,
+        "timeformat": "iso8601"
+    }
+
+    # Try full first
     try:
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
+        r = requests.get(base_url, params=params_full, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            # log details then try simpler request on 400 or other 4xx
+            logger.warning(f"Open-Meteo returned {r.status_code}: {r.text[:1000]}")
+            if r.status_code == 400:
+                # try simpler
+                try:
+                    r2 = requests.get(base_url, params=params_simple, timeout=REQUEST_TIMEOUT)
+                    if r2.status_code == 200:
+                        logger.info("Open-Meteo fallback (simpler hourly) succeeded")
+                        return r2.json()
+                    else:
+                        logger.warning(f"Open-Meteo simpler-hourly request failed: {r2.status_code} {r2.text[:1000]}")
+                        return None
+                except Exception as e2:
+                    logger.warning(f"Open-Meteo simpler-hourly request error: {e2}")
+                    return None
+            else:
+                return None
     except Exception as e:
         logger.warning(f"Open-Meteo fetch failed: {e}")
+        # final attempt with simpler params (best-effort)
+        try:
+            r3 = requests.get(base_url, params=params_simple, timeout=REQUEST_TIMEOUT)
+            if r3.status_code == 200:
+                logger.info("Open-Meteo fallback (simpler) succeeded after exception")
+                return r3.json()
+            else:
+                logger.warning(f"Open-Meteo fallback after exception returned {r3.status_code}: {r3.text[:500]}")
+        except Exception as e3:
+            logger.warning(f"Open-Meteo fallback error: {e3}")
         return None
 
-# ============ Build compact payload (hour_0 = next hour) ============
+# ============ Build compact payload (hour_0 = next hour ceil) ============
 def build_compact_weather(existing_obs=None):
     existing_obs = existing_obs or {}
     now = _now_local()
@@ -178,10 +222,7 @@ def build_compact_weather(existing_obs=None):
             weather_cache["ts"] = time.time()
         else:
             # fallback to last cache if exists
-            if weather_cache.get("data"):
-                data = weather_cache["data"]
-            else:
-                data = None
+            data = weather_cache.get("data")
 
     compact = {
         "temperature": existing_obs.get("temperature"),
@@ -286,7 +327,6 @@ def build_compact_weather(existing_obs=None):
         compact[label] = time_label
         compact[f"{label}_temperature"] = (h_temp[i] if i < len(h_temp) else None)
         compact[f"{label}_humidity"] = (h_humi[i] if i < len(h_humi) else None)
-        # short weather label only (no extra numbers)
         code = None
         try:
             code = int(h_code[i]) if i < len(h_code) else None
@@ -294,7 +334,7 @@ def build_compact_weather(existing_obs=None):
             code = None
         compact[f"{label}_weather"] = WEATHER_CODE_MAP.get(code) if code is not None else None
 
-    # humidity aggregates safe
+    # humidity aggregates (safe)
     try:
         hums = [h for h in h_humi if h is not None]
         if len(hums) >= 24:
@@ -336,7 +376,7 @@ def send_to_thingsboard(data: dict):
 # ============ ROUTES ============
 @app.get("/")
 def root():
-    return {"status": "running", "extended_hours": EXTENDED_HOURS, "weather_cached": weather_cache.get("ts") is not None}
+    return {"status": "running", "extended_hours": EXTENDED_HOURS, "weather_cached": bool(weather_cache.get("data"))}
 
 @app.get("/weather")
 def weather_endpoint():
@@ -373,7 +413,7 @@ async def auto_loop():
             hour = now.hour + now.minute / 60.0
             base = 27.0
             amplitude = 6.0
-            temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * math.pi) + random.uniform(-0.7, 0.7)
+            temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * 3.14159) + random.uniform(-0.7, 0.7)
             humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
@@ -399,4 +439,5 @@ async def startup():
 
 # ============ NOTES ============
 # - Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
-# - This version uses Open-Meteo only, minimal keys, hour_0 is next hour (ceil).
+# - This version uses Open-Meteo only, tries a simpler hourly parameter set if Open-Meteo returns 400.
+# - hour_0 is the next full hour (ceil). Telemetry keys are kept minimal to avoid excessive ThingsBoard entries.
