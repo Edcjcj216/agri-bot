@@ -6,5 +6,6 @@ apscheduler
 pydantic
 geopy
 cohere
-python-dotenv           # nếu muốn load .env local (Render không cần)
+python-dotenv            # nếu muốn load .env local (Render không cần)
 google-generativeai
+pytz
