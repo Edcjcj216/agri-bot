@@ -356,7 +356,8 @@ def sanitize_for_tb(payload: dict):
     for k, v in list(sanitized.items()):
         if not isinstance(k, str):
             continue
-        if k.endswith("_weather_desc") or k.endswith("_weather_short") or k.startswith("weather_"):
+        # cleaning only for text desc fields if present
+        if k.endswith("_weather_desc") or k.endswith("_weather_short") or k.startswith("weather_") or k.endswith("_weather") or k.startswith("tomorrow_"):
             if isinstance(v, str):
                 s = v
                 s = re.sub(r"\([^)]*\)", "", s).strip()
@@ -364,6 +365,41 @@ def sanitize_for_tb(payload: dict):
                 s = s.strip()
                 sanitized[k] = s if s != "" else None
     return sanitized
+
+# ================== MAP TO DASHBOARD (MINIMAL payload) ==================
+def map_to_dashboard(flattened: dict) -> dict:
+    """
+    Return a minimal payload containing only fields needed for the simple dashboard:
+      - latitude, longitude
+      - air_temperature, air_humidity
+      - forecast_0..3: temp, humidity, weather (short)
+      - tomorrow_min_temp, tomorrow_max_temp, tomorrow_avg_humidity, tomorrow_weather
+    """
+    mapped = {}
+
+    # location
+    mapped["latitude"] = LAT
+    mapped["longitude"] = LON
+
+    # current sensor (observed)
+    mapped["air_temperature"] = flattened.get("temperature")
+    mapped["air_humidity"] = flattened.get("humidity")
+
+    # 4-hour forecast (take available hour_0..hour_3 from merged hourly)
+    for i in range(4):
+        mapped[f"forecast_{i}_temp"] = flattened.get(f"hour_{i}_temperature")
+        mapped[f"forecast_{i}_humidity"] = flattened.get(f"hour_{i}_humidity")
+        # weather short description
+        mapped[f"forecast_{i}_weather"] = flattened.get(f"hour_{i}_weather_short")
+
+    # tomorrow summary
+    mapped["tomorrow_min_temp"] = flattened.get("weather_tomorrow_min")
+    mapped["tomorrow_max_temp"] = flattened.get("weather_tomorrow_max")
+    # humidity_tomorrow may be None if not enough hours; fallback to humidity_today if needed
+    mapped["tomorrow_avg_humidity"] = flattened.get("humidity_tomorrow") if flattened.get("humidity_tomorrow") is not None else flattened.get("humidity_today")
+    mapped["tomorrow_weather"] = flattened.get("weather_tomorrow_desc")
+
+    return mapped
 
 # ================== MERGE HELPERS ==================
 def merge_weather_and_hours(existing_data=None):
@@ -553,6 +589,7 @@ def merge_weather_and_hours(existing_data=None):
         flattened["humidity_today"] = round(sum(hlist)/len(hlist),1) if hlist else None
     flattened["humidity_tomorrow"] = weather.get("humidity_tomorrow")
     flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
+    flattened["next_hours"] = next_hours
 
     # keep observed if present
     if "temperature" not in flattened:
@@ -569,7 +606,9 @@ def merge_weather_and_hours(existing_data=None):
 # ================== THINGSBOARD ==================
 def send_to_thingsboard(data: dict):
     try:
-        sanitized = sanitize_for_tb(data)
+        # Map to minimal dashboard payload
+        dashboard_payload = map_to_dashboard(data)
+        sanitized = sanitize_for_tb(dashboard_payload)
         logger.info(f"TB ▶ sending payload (keys: {list(sanitized.keys())})")
         r = requests.post(TB_DEVICE_URL, json=sanitized, timeout=REQUEST_TIMEOUT)
         logger.info(f"TB ◀ {r.status_code}")
@@ -599,22 +638,24 @@ def bias_status():
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
     logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
-    weather = merge_weather_and_hours(existing_data={})
-    next_hours = weather.get("next_hours", [])
-
-    bias = update_bias_and_correct(next_hours, data.temperature)
-
+    # merge weather + observed
     merged = {
         **data.dict(),
         "location": "An Phú, Hồ Chí Minh",
         "crop": "Rau muống",
-        "forecast_bias": bias,
+        "forecast_bias": 0.0,
         "forecast_history_len": len(bias_history)
     }
 
+    # merge weather will add hourly fields
     merged = merge_weather_and_hours(existing_data=merged)
+    # update bias with available next_hours
+    bias = update_bias_and_correct(merged.get("next_hours", []), data.temperature)
+    merged["forecast_bias"] = bias
+    merged["forecast_history_len"] = len(bias_history)
+
     send_to_thingsboard(merged)
-    return {"received": data.dict(), "pushed": merged}
+    return {"received": data.dict(), "pushed": map_to_dashboard(merged)}
 
 # ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
@@ -631,17 +672,19 @@ async def auto_loop():
             battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
             sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
 
-            weather = merge_weather_and_hours(existing_data={})
-            bias = update_bias_and_correct(weather.get("next_hours", []), sample["temperature"])
             merged = {
                 **sample,
                 "location": "An Phú, Hồ Chí Minh",
                 "crop": "Rau muống",
-                "forecast_bias": bias,
+                "forecast_bias": 0.0,
                 "forecast_history_len": len(bias_history)
             }
 
             merged = merge_weather_and_hours(existing_data=merged)
+            bias = update_bias_and_correct(merged.get("next_hours", []), sample["temperature"])
+            merged["forecast_bias"] = bias
+            merged["forecast_history_len"] = len(bias_history)
+
             send_to_thingsboard(merged)
         except Exception as e:
             logger.error(f"AUTO loop error: {e}")
@@ -651,4 +694,4 @@ async def auto_loop():
 async def startup():
     init_db()
     load_history_from_db()
-    asyncio.create_task(auto_loop()) 
+    asyncio.create_task(auto_loop())
