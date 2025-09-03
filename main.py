@@ -1,6 +1,5 @@
 # main.py
-# Agri-bot — Open-Meteo + sensor, dashboard-ready keys
-
+# Agri-bot — Open-Meteo primary, robust timezone handling & reliable hour index selection.
 import os
 import time
 import json
@@ -16,27 +15,26 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from collections import deque
 
-# timezone handling
+# zoneinfo for timezone handling (preferred)
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-# ---------------- CONFIG ----------------
+# ============== CONFIG =================
 TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "DEOAyARAvPbZkHKFVJQa")
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
-LAT = float(os.getenv("LAT", 10.7639))
-LON = float(os.getenv("LON", 106.6563))
-LOCATION_NAME = "An Phú, Hồ Chí Minh"
-AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 300))  # 5 phút
+LAT = float(os.getenv("LAT", "10.79"))
+LON = float(os.getenv("LON", "106.70"))
+AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 600))  # 600 giây = 10 phút
 WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", 15 * 60))
 TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
 EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
 
 # bias history
-MAX_HISTORY = 48
+MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
 bias_history = deque(maxlen=MAX_HISTORY)
 BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
 
@@ -48,26 +46,42 @@ app = FastAPI()
 class SensorData(BaseModel):
     temperature: float
     humidity: float
-    illuminance: float | None = 0
-    avg_soil_moisture: float | None = 0
     battery: float | None = None
 
-# ---------------- WEATHER CODE MAP ----------------
+# ============== MAPPINGS =================
 WEATHER_CODE_MAP = {
-    0: "Trời quang", 1: "Ít mây", 2: "Có mây", 3: "Nhiều mây",
-    45: "Sương mù", 48: "Sương muối",
+    0: "Nắng", 1: "Nắng nhẹ", 2: "Ít mây", 3: "Nhiều mây",
+    45: "Sương muối", 48: "Sương muối",
     51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
-    61: "Mưa nhỏ", 63: "Mưa vừa", 65: "Mưa to",
+    56: "Mưa phùn lạnh", 57: "Mưa phùn lạnh dày",
+    61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
+    66: "Mưa lạnh nhẹ", 67: "Mưa lạnh to",
     80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
-    95: "Có giông", 96: "Có giông nhẹ", 99: "Có giông mạnh",
+    95: "Có giông", 96: "Có giông", 99: "Có giông",
 }
 
-# ---------------- DB helpers ----------------
+WEATHER_MAP = {
+    "Sunny": "Nắng", "Clear": "Trời quang", "Partly cloudy": "Ít mây",
+    "Cloudy": "Nhiều mây", "Overcast": "Âm u",
+    "Patchy light rain": "Mưa nhẹ", "Patchy rain nearby": "Có mưa rải rác gần đó",
+    "Light rain": "Mưa nhẹ", "Light rain shower": "Mưa rào nhẹ",
+    "Patchy light drizzle": "Mưa phùn nhẹ", "Moderate rain": "Mưa vừa", "Heavy rain": "Mưa to",
+    "Moderate or heavy rain shower": "Mưa rào vừa hoặc to", "Torrential rain shower": "Mưa rất to",
+    "Patchy rain possible": "Có thể có mưa",
+    "Thundery outbreaks possible": "Có giông", "Patchy light rain with thunder": "Mưa giông nhẹ",
+    "Moderate or heavy rain with thunder": "Mưa giông to",
+    "Storm": "Bão", "Tropical storm": "Áp thấp nhiệt đới",
+}
+
+weather_cache = {"ts": 0, "data": {}}
+
+# ----------------- DB helpers -----------------
 def init_db():
     try:
         conn = sqlite3.connect(BIAS_DB_FILE)
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS bias_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_temp REAL NOT NULL,
@@ -75,10 +89,11 @@ def init_db():
                 ts INTEGER NOT NULL,
                 provider TEXT
             )
-        """)
+            """
+        )
         conn.commit()
     except Exception as e:
-        logger.warning(f"Failed to init DB: {e}")
+        logger.warning(f"Failed to init bias DB: {e}")
     finally:
         try:
             conn.close()
@@ -94,9 +109,9 @@ def load_history_from_db():
         rows.reverse()
         for api, obs in rows:
             bias_history.append((float(api), float(obs)))
-        logger.info(f"Loaded {len(rows)} bias samples from DB")
+        logger.info(f"Loaded {len(rows)} bias_history samples from DB")
     except Exception as e:
-        logger.warning(f"Failed to load bias DB: {e}")
+        logger.warning(f"Failed to load bias history from DB: {e}")
     finally:
         try:
             conn.close()
@@ -113,16 +128,16 @@ def insert_history_to_db(api_temp, observed_temp, provider="open-meteo"):
         )
         conn.commit()
     except Exception as e:
-        logger.warning(f"Failed to insert bias DB: {e}")
+        logger.warning(f"Failed to insert bias history to DB: {e}")
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
-# ---------------- TIME utils ----------------
+# ----------------- Time / utils -----------------
 def _now_local():
-    if ZoneInfo:
+    if ZoneInfo is not None:
         try:
             return datetime.now(ZoneInfo(TIMEZONE))
         except Exception:
@@ -130,33 +145,116 @@ def _now_local():
     return datetime.now()
 
 def _to_local_dt(timestr):
+    """Parse ISO-like string and return a datetime.
+    If timezone info is missing, we return naive datetime (which we treat as local).
+    If zoneinfo available, attach TIMEZONE for naive datetimes.
+    """
     if not timestr:
         return None
     dt = None
     try:
         dt = datetime.fromisoformat(timestr)
-    except:
+    except Exception:
         try:
             dt = datetime.strptime(timestr, "%Y-%m-%d %H:%M")
-        except:
-            return None
-    if dt.tzinfo is None and ZoneInfo:
-        dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+        except Exception:
+            try:
+                dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
+    # if dt has no tzinfo and ZoneInfo available, attach local tz (Open-Meteo returns local times when timezone param used)
+    if dt is not None and dt.tzinfo is None and ZoneInfo is not None:
+        try:
+            return dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+        except Exception:
+            return dt
     return dt
 
-# ---------------- OPEN-METEO ----------------
+def _normalize_text(s: str) -> str:
+    if not s:
+        return s
+    s = re.sub(r"\([^)]*\d{1,2}[.,]?\d*°?[CF]?.*?\)", "", s)
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+PARTIAL_MAP = [
+    (r"patchy rain nearby", "Có mưa rải rác gần đó"),
+    (r"patchy.*rain", "Có mưa rải rác"),
+    (r"patchy.*drizzle", "Mưa phùn nhẹ"),
+    (r"light drizzle", "Mưa phùn nhẹ"),
+    (r"light rain shower", "Mưa rào nhẹ"),
+    (r"rain shower", "Mưa rào"),
+    (r"heavy rain", "Mưa to"),
+    (r"thunder", "Có giông"),
+    (r"storm", "Bão"),
+    (r"cloudy", "Nhiều mây"),
+    (r"partly cloudy", "Ít mây"),
+    (r"clear", "Trời quang"),
+    (r"sunny", "Nắng"),
+]
+
+def translate_desc(desc_raw):
+    if not desc_raw:
+        return None
+    cleaned = _normalize_text(desc_raw)
+    if not cleaned:
+        return None
+    for k, v in WEATHER_MAP.items():
+        if k.lower() == cleaned.lower():
+            return v
+    low = cleaned.lower()
+    for pat, mapped in PARTIAL_MAP:
+        if re.search(pat, low):
+            return mapped
+    return cleaned
+
+# ---------- compute daily min/max from hourly ------------
+def _normalize_time_str(t):
+    if not t:
+        return None
+    try:
+        return datetime.fromisoformat(t)
+    except Exception:
+        try:
+            return datetime.strptime(t, "%Y-%m-%d %H:%M")
+        except Exception:
+            return None
+
+def compute_daily_min_max_from_hourly(hourly_list, target_date_str):
+    temps = []
+    for h in hourly_list:
+        t = h.get("time")
+        temp = h.get("temperature")
+        if t and temp is not None:
+            dt = _normalize_time_str(t)
+            if dt is None:
+                continue
+            if dt.date().isoformat() == target_date_str:
+                try:
+                    temps.append(float(temp))
+                except Exception:
+                    pass
+    if not temps:
+        return None, None
+    return round(min(temps), 1), round(max(temps), 1)
+
+# ================== OPEN-METEO FETCHER ==================
 def fetch_open_meteo():
+    now = _now_local()
+    yesterday = (now - timedelta(days=1)).date().isoformat()
     base = "https://api.open-meteo.com/v1/forecast"
-    daily_vars = "weathercode,temperature_2m_max,temperature_2m_min"
-    hourly_vars = "temperature_2m,relativehumidity_2m,weathercode"
+    daily_vars = "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
+    hourly_vars = "temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
     params = {
         "latitude": LAT,
         "longitude": LON,
         "daily": daily_vars,
         "hourly": hourly_vars,
         "timezone": TIMEZONE,
-        "forecast_days": 2,
-        "past_days": 1
+        "timeformat": "iso8601",
+        "past_days": 1,
+        "forecast_days": 3
     }
     try:
         r = requests.get(base, params=params, timeout=REQUEST_TIMEOUT)
@@ -164,154 +262,311 @@ def fetch_open_meteo():
         data = r.json()
     except Exception as e:
         logger.warning(f"Open-Meteo request failed: {e}")
-        return [], [], {}
+        return [], [], False, {}
 
-    # daily
+    # parse daily
     daily_list = []
     d = data.get("daily", {})
-    for i, date in enumerate(d.get("time", [])):
+    times = d.get("time", [])
+    wc = d.get("weathercode", [])
+    tmax = d.get("temperature_2m_max", [])
+    tmin = d.get("temperature_2m_min", [])
+    psum = d.get("precipitation_sum", [])
+    wmx = d.get("windspeed_10m_max", [])
+    for i in range(len(times)):
+        date = times[i]
+        code = wc[i] if i < len(wc) else None
+        desc = WEATHER_CODE_MAP.get(code) if code is not None else None
         daily_list.append({
             "date": date,
-            "desc": WEATHER_CODE_MAP.get(d.get("weathercode", [None]*len(d.get("time")))[i]),
-            "max": d.get("temperature_2m_max", [None]*len(d.get("time")))[i],
-            "min": d.get("temperature_2m_min", [None]*len(d.get("time")))[i]
+            "desc": desc,
+            "max": tmax[i] if i < len(tmax) else None,
+            "min": tmin[i] if i < len(tmin) else None,
+            "precipitation_sum": psum[i] if i < len(psum) else None,
+            "windspeed_max": wmx[i] if i < len(wmx) else None
         })
 
-    # hourly
+    # parse hourly
     hourly_list = []
     h = data.get("hourly", {})
-    times = h.get("time", [])
-    temps = h.get("temperature_2m", [])
-    hums = h.get("relativehumidity_2m", [])
-    codes = h.get("weathercode", [])
-    for i, t in enumerate(times):
+    h_times = h.get("time", [])
+    h_temp = h.get("temperature_2m", [])
+    h_humi = h.get("relativehumidity_2m", [])
+    h_code = h.get("weathercode", [])
+    h_prec = h.get("precipitation", [])
+    h_pp = h.get("precipitation_probability", [])
+    h_wind = h.get("windspeed_10m", [])
+    h_wd = h.get("winddirection_10m", [])
+
+    for i in range(len(h_times)):
+        time_iso = h_times[i]
+        code = h_code[i] if i < len(h_code) else None
+        short_desc = WEATHER_CODE_MAP.get(code) if code is not None else None
         hourly_list.append({
-            "time": t,
-            "temperature": temps[i] if i < len(temps) else None,
-            "humidity": hums[i] if i < len(hums) else None,
-            "weather_code": codes[i] if i < len(codes) else None,
-            "weather_short": WEATHER_CODE_MAP.get(codes[i]) if i < len(codes) else None,
-            "weather_desc": WEATHER_CODE_MAP.get(codes[i]) if i < len(codes) else None
+            "time": time_iso,
+            "temperature": h_temp[i] if i < len(h_temp) else None,
+            "humidity": h_humi[i] if i < len(h_humi) else None,
+            "weather_code": code,
+            "weather_short": short_desc,
+            "weather_desc": short_desc,
+            "precipitation": h_prec[i] if i < len(h_prec) else None,
+            "precipitation_probability": h_pp[i] if i < len(h_pp) else None,
+            "windspeed": h_wind[i] if i < len(h_wind) else None,
+            "winddir": h_wd[i] if i < len(h_wd) else None
         })
 
-    return daily_list, hourly_list, data
+    has_yesterday = any(d.get("date") == yesterday for d in daily_list)
+    if not has_yesterday and hourly_list:
+        ymin, ymax = compute_daily_min_max_from_hourly(hourly_list, yesterday)
+        if ymin is not None or ymax is not None:
+            daily_list.insert(0, {"date": yesterday, "desc": None, "max": ymax, "min": ymin, "precipitation_sum": None, "windspeed_max": None})
+            has_yesterday = True
 
-# ---------------- BIAS ----------------
+    return daily_list, hourly_list, has_yesterday, data
+
+# ================== BIAS CORRECTION ==================
 def update_bias_and_correct(next_hours, observed_temp):
+    global bias_history
     if not next_hours:
         return 0.0
+
     api_now = next_hours[0].get("temperature")
     if api_now is not None and observed_temp is not None:
-        bias_history.append((api_now, observed_temp))
-        insert_history_to_db(api_now, observed_temp)
+        try:
+            bias_history.append((api_now, observed_temp))
+            insert_history_to_db(api_now, observed_temp)
+        except Exception:
+            pass
+
     if bias_history:
         diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
-        bias = round(sum(diffs)/len(diffs),1)
+    else:
+        diffs = []
+
+    if diffs:
+        bias = round(sum(diffs) / len(diffs), 1)
     else:
         bias = 0.0
+
     return bias
 
-# ---------------- SANITIZE ----------------
+# ================== SANITIZE BEFORE TB PUSH ==================
 def sanitize_for_tb(payload: dict):
     sanitized = dict(payload)
     for k, v in list(sanitized.items()):
-        if isinstance(v, str):
-            s = re.sub(r"\([^)]*\)", "", v).strip()
-            s = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", s, flags=re.IGNORECASE).strip()
-            sanitized[k] = s if s else None
+        if not isinstance(k, str):
+            continue
+        if k.endswith("_weather_desc") or k.endswith("_weather_short") or k.startswith("weather_"):
+            if isinstance(v, str):
+                s = v
+                s = re.sub(r"\([^)]*\)", "", s).strip()
+                s = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", s, flags=re.IGNORECASE)
+                s = s.strip()
+                sanitized[k] = s if s != "" else None
     return sanitized
 
-# ---------------- MERGE ----------------
+# ================== MERGE HELPERS ==================
 def merge_weather_and_hours(existing_data=None):
     if existing_data is None:
         existing_data = {}
 
-    daily_list, hourly_list, raw = fetch_open_meteo()
+    daily_list, hourly_list, has_yday, raw = fetch_open_meteo()
+
     now = _now_local()
+    yesterday_str = (now - timedelta(days=1)).date().isoformat()
     today_str = now.date().isoformat()
     tomorrow_str = (now + timedelta(days=1)).date().isoformat()
 
-    def find_daily(date):
+    def find_daily_by_date(date):
         for d in daily_list:
             if d.get("date") == date:
                 return d
         return {}
 
     weather = {
-        "today": find_daily(today_str),
-        "tomorrow": find_daily(tomorrow_str),
-        "next_hours": hourly_list
+        "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": "open-meteo"},
+        "yesterday": find_daily_by_date(yesterday_str),
+        "today": find_daily_by_date(today_str),
+        "tomorrow": find_daily_by_date(tomorrow_str),
+        "next_hours": hourly_list,
+        "raw": raw
     }
 
-    merged = {**existing_data}
+    # aggregated humidity
+    hums = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
+    if len(hums) >= 24:
+        weather["humidity_yesterday"] = round(sum(hums[0:24]) / 24.0, 1)
+    if len(hums) >= 48:
+        weather["humidity_today"] = round(sum(hums[24:48]) / 24.0, 1)
+    if len(hums) >= 72:
+        weather["humidity_tomorrow"] = round(sum(hums[48:72]) / 24.0, 1)
 
-    # today
-    merged["weather_today_desc"] = weather["today"].get("desc")
-    merged["weather_today_max"] = weather["today"].get("max")
-    merged["weather_today_min"] = weather["today"].get("min")
-    # tomorrow
-    merged["weather_tomorrow_desc"] = weather["tomorrow"].get("desc")
-    merged["weather_tomorrow_max"] = weather["tomorrow"].get("max")
-    merged["weather_tomorrow_min"] = weather["tomorrow"].get("min")
+    flattened = {**existing_data}
 
-    # next hours
-    parsed_times = [_to_local_dt(h.get("time")) for h in hourly_list]
+    # DAILY fields
+    t = weather.get("today", {}) or {}
+    flattened["weather_today_desc"] = t.get("desc") if t.get("desc") is not None else None
+    flattened["weather_today_max"] = t.get("max") if t.get("max") is not None else None
+    flattened["weather_today_min"] = t.get("min") if t.get("min") is not None else None
+
+    tt = weather.get("tomorrow", {}) or {}
+    flattened["weather_tomorrow_desc"] = tt.get("desc") if tt.get("desc") is not None else None
+    flattened["weather_tomorrow_max"] = tt.get("max") if tt.get("max") is not None else None
+    flattened["weather_tomorrow_min"] = tt.get("min") if tt.get("min") is not None else None
+
+    ty = weather.get("yesterday", {}) or {}
+    flattened["weather_yesterday_desc"] = ty.get("desc")
+    flattened["weather_yesterday_max"] = ty.get("max")
+    flattened["weather_yesterday_min"] = ty.get("min")
+    flattened["weather_yesterday_date"] = ty.get("date")
+
+    # parse hourly times robustly
+    hour_times = [h.get("time") for h in hourly_list] if hourly_list else []
+    parsed_times = []
+    for t in hour_times:
+        p = _to_local_dt(t)
+        parsed_times.append(p)
+
+    # choose index: first parsed_time >= now_rounded; robust comparison for tz/no-tz
     now_rounded = now.replace(minute=0, second=0, microsecond=0)
-    start_idx = 0
-    for i, t in enumerate(parsed_times):
-        if t and t >= now_rounded:
-            start_idx = i
-            break
+    start_idx = None
+    try:
+        for i, p in enumerate(parsed_times):
+            if p is None:
+                continue
+            try:
+                # both tz-aware
+                if p.tzinfo is not None and now_rounded.tzinfo is not None:
+                    if p >= now_rounded:
+                        start_idx = i
+                        break
+                # parsed naive, now tz-aware -> compare naive to naive local
+                elif p.tzinfo is None and now_rounded.tzinfo is not None:
+                    if p >= now_rounded.replace(tzinfo=None):
+                        start_idx = i
+                        break
+                # parsed tz-aware, now naive -> compare with both naive
+                elif p.tzinfo is not None and now_rounded.tzinfo is None:
+                    if p.replace(tzinfo=None) >= now_rounded:
+                        start_idx = i
+                        break
+                else:
+                    if p >= now_rounded:
+                        start_idx = i
+                        break
+            except Exception:
+                # continue searching; don't crash here
+                continue
+        if start_idx is None:
+            # fallback nearest
+            diffs = []
+            for p in parsed_times:
+                if p is None:
+                    diffs.append(float('inf'))
+                    continue
+                try:
+                    if p.tzinfo is not None and now_rounded.tzinfo is not None:
+                        diffs.append(abs((p - now_rounded).total_seconds()))
+                    elif p.tzinfo is None and now_rounded.tzinfo is not None:
+                        diffs.append(abs((p - now_rounded.replace(tzinfo=None)).total_seconds()))
+                    elif p.tzinfo is not None and now_rounded.tzinfo is None:
+                        diffs.append(abs((p.replace(tzinfo=None) - now_rounded).total_seconds()))
+                    else:
+                        diffs.append(abs((p - now_rounded).total_seconds()))
+                except Exception:
+                    diffs.append(float('inf'))
+            if diffs and any(d != float('inf') for d in diffs):
+                start_idx = int(min(range(len(diffs)), key=lambda i: diffs[i]))
+            else:
+                start_idx = 0
+    except Exception as e:
+        logger.warning(f"Error selecting start_idx: {e}")
+        start_idx = 0
 
+    # debug log for troubleshooting
+    try:
+        first_hour = parsed_times[0].isoformat() if parsed_times and parsed_times[0] is not None else "N/A"
+        logger.info(f"now_rounded={now_rounded.isoformat()}, first_hour={first_hour}, start_idx={start_idx}")
+    except Exception:
+        pass
+
+    # compose next hours starting at start_idx
     next_hours = []
-    for offset in range(EXTENDED_HOURS):
+    for offset in range(0, EXTENDED_HOURS):
         i = start_idx + offset
         if i >= len(hourly_list):
             break
         next_hours.append(hourly_list[i])
-    weather["next_hours"] = next_hours
 
-    merged["next_hours"] = next_hours
+    for idx_h, h in enumerate(next_hours):
+        # time label (HH:MM) using local parse if possible
+        time_label = None
+        time_local_iso = None
+        if h and h.get("time"):
+            parsed = _to_local_dt(h.get("time"))
+            if parsed is not None:
+                try:
+                    time_label = parsed.strftime("%H:%M")
+                    time_local_iso = parsed.isoformat()
+                except Exception:
+                    time_label = h.get("time")
+                    time_local_iso = h.get("time")
+            else:
+                time_label = h.get("time")
+                time_local_iso = h.get("time")
+        if time_label is not None:
+            flattened[f"hour_{idx_h}"] = time_label
+            flattened[f"hour_{idx_h}_time_local"] = time_local_iso
 
-    return merged
+        if h.get("temperature") is not None:
+            flattened[f"hour_{idx_h}_temperature"] = h.get("temperature")
+        if h.get("humidity") is not None:
+            flattened[f"hour_{idx_h}_humidity"] = h.get("humidity")
 
-# ---------------- DASHBOARD MAPPING ----------------
-def map_for_dashboard(data: dict):
-    mapped = {}
+        # short label only (no numeric suffixes in desc)
+        short_label = None
+        if h.get("weather_short"):
+            short_label = h.get("weather_short")
+        elif h.get("weather_code") is not None:
+            try:
+                short_label = WEATHER_CODE_MAP.get(int(h.get("weather_code")))
+            except Exception:
+                short_label = None
+        else:
+            rawdesc = h.get("weather_desc")
+            short_label = translate_desc(rawdesc) if rawdesc else None
 
-    # vị trí
-    mapped["latitude"] = data.get("latitude", LAT)
-    mapped["longitude"] = data.get("longitude", LON)
+        if isinstance(short_label, str):
+            short_label = re.sub(r"\([^)]*\)", "", short_label).strip()
+            short_label = re.sub(r"\d+[.,]?\d*\s*(mm|km/h|°C|%|kph|m/s)", "", short_label, flags=re.IGNORECASE).strip()
+            if short_label == "":
+                short_label = None
 
-    # sensor
-    mapped["temperature_h"] = data.get("temperature") or data.get("temperature_h")
-    mapped["humidity"] = data.get("humidity") or data.get("humidity_h")
-    mapped["illuminance"] = data.get("illuminance", 0)
-    mapped["avg_soil_moisture"] = data.get("avg_soil_moisture", 0)
-    mapped["battery"] = data.get("battery", 0)
+        flattened[f"hour_{idx_h}_weather_short"] = short_label
+        flattened[f"hour_{idx_h}_weather_desc"] = short_label
 
-    # dự báo 4 giờ tới
-    for i in range(4):
-        h = data.get("next_hours", [])
-        if i < len(h):
-            hour_data = h[i]
-            mapped[f"hour_{i+1}"] = _to_local_dt(hour_data.get("time")).strftime("%H:%M") if hour_data.get("time") else None
-            mapped[f"hour_{i+1}_temperature"] = hour_data.get("temperature")
-            mapped[f"hour_{i+1}_humidity"] = hour_data.get("humidity")
-            mapped[f"hour_{i+1}_weather_desc"] = hour_data.get("weather_desc")
+    # humidity aggregated fields
+    if weather.get("humidity_today") is not None:
+        flattened["humidity_today"] = weather.get("humidity_today")
+    else:
+        hlist = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
+        flattened["humidity_today"] = round(sum(hlist)/len(hlist),1) if hlist else None
+    flattened["humidity_tomorrow"] = weather.get("humidity_tomorrow")
+    flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
 
-    # ngày mai
-    mapped["weather_tomorrow_min"] = data.get("weather_tomorrow_min")
-    mapped["weather_tomorrow_max"] = data.get("weather_tomorrow_max")
-    mapped["humidity_tomorrow"] = data.get("humidity_tomorrow")
-    mapped["weather_tomorrow_desc"] = data.get("weather_tomorrow_desc")
+    # keep observed if present
+    if "temperature" not in flattened:
+        flattened["temperature"] = existing_data.get("temperature")
+    if "humidity" not in flattened:
+        flattened["humidity"] = existing_data.get("humidity")
+    if "location" not in flattened:
+        flattened["location"] = existing_data.get("location", "An Phú, Hồ Chí Minh")
+    if "crop" not in flattened:
+        flattened["crop"] = existing_data.get("crop", "Rau muống")
 
-    # location
-    mapped["location"] = data.get("location", LOCATION_NAME)
+    return flattened
 
-    return mapped
-
-# ---------------- THINGSBOARD ----------------
+# ================== THINGSBOARD ==================
 def send_to_thingsboard(data: dict):
     try:
         sanitized = sanitize_for_tb(data)
@@ -321,67 +576,79 @@ def send_to_thingsboard(data: dict):
     except Exception as e:
         logger.error(f"ThingsBoard push error: {e}")
 
-# ---------------- ROUTES ----------------
-weather_cache = {"ts":0, "data":{}}
-
+# ================== ROUTES ==================
 @app.get("/")
 def root():
-    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4]+"***"}
+    return {"status": "running", "demo_token": TB_DEMO_TOKEN[:4] + "***", "extended_hours": EXTENDED_HOURS}
 
 @app.get("/weather")
 def weather_endpoint():
-    if time.time() - weather_cache.get("ts",0) < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
+    if time.time() - weather_cache.get("ts", 0) < WEATHER_CACHE_SECONDS and weather_cache.get("data"):
         return weather_cache["data"]
-    raw = merge_weather_and_hours(existing_data={})
-    mapped = map_for_dashboard(raw)
-    weather_cache["data"] = mapped
+    res = merge_weather_and_hours(existing_data={})
+    weather_cache["data"] = res
     weather_cache["ts"] = time.time()
-    return mapped
+    return res
+
+@app.get("/bias")
+def bias_status():
+    diffs = [round(obs - api, 2) for api, obs in bias_history if api is not None and obs is not None]
+    bias = round(sum(diffs) / len(diffs), 2) if diffs else 0.0
+    return {"bias": bias, "history_len": len(diffs)}
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ received data: {data.dict()}")
-    merged = merge_weather_and_hours(existing_data=data.dict())
-    bias = update_bias_and_correct(merged.get("next_hours", []), data.temperature)
-    merged["forecast_bias"] = bias
-    merged["forecast_history_len"] = len(bias_history)
-    dashboard_data = map_for_dashboard(merged)
-    send_to_thingsboard(dashboard_data)
-    return {"received": data.dict(), "pushed": dashboard_data}
+    logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
+    weather = merge_weather_and_hours(existing_data={})
+    next_hours = weather.get("next_hours", [])
 
-# ---------------- AUTO LOOP (simulator) ----------------
+    bias = update_bias_and_correct(next_hours, data.temperature)
+
+    merged = {
+        **data.dict(),
+        "location": "An Phú, Hồ Chí Minh",
+        "crop": "Rau muống",
+        "forecast_bias": bias,
+        "forecast_history_len": len(bias_history)
+    }
+
+    merged = merge_weather_and_hours(existing_data=merged)
+    send_to_thingsboard(merged)
+    return {"received": data.dict(), "pushed": merged}
+
+# ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
     logger.info("Auto-loop simulator started")
     battery = 4.2
     while True:
         try:
             now = _now_local()
-            hour = now.hour + now.minute/60.0
+            hour = now.hour + now.minute / 60.0
             base = 27.0
             amplitude = 6.0
-            temp = base + amplitude*math.sin((hour-14)/24*2*math.pi) + random.uniform(-0.5, 0.5)
-            humidity = 60 + 10*math.sin((hour-6)/24*2*math.pi) + random.uniform(-2,2)
+            temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * math.pi) + random.uniform(-0.7, 0.7)
+            humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
+            battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
+            sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
 
-            data = SensorData(
-                temperature=temp,
-                humidity=humidity,
-                illuminance=random.randint(100,1000),
-                avg_soil_moisture=random.uniform(20,60),
-                battery=battery
-            )
-            merged = merge_weather_and_hours(existing_data=data.dict())
-            bias = update_bias_and_correct(merged.get("next_hours", []), data.temperature)
-            merged["forecast_bias"] = bias
-            merged["forecast_history_len"] = len(bias_history)
-            dashboard_data = map_for_dashboard(merged)
-            send_to_thingsboard(dashboard_data)
-            await asyncio.sleep(AUTO_LOOP_INTERVAL)
+            weather = merge_weather_and_hours(existing_data={})
+            bias = update_bias_and_correct(weather.get("next_hours", []), sample["temperature"])
+            merged = {
+                **sample,
+                "location": "An Phú, Hồ Chí Minh",
+                "crop": "Rau muống",
+                "forecast_bias": bias,
+                "forecast_history_len": len(bias_history)
+            }
+
+            merged = merge_weather_and_hours(existing_data=merged)
+            send_to_thingsboard(merged)
         except Exception as e:
-            logger.error(f"Auto-loop error: {e}")
-            await asyncio.sleep(10)
+            logger.error(f"AUTO loop error: {e}")
+        await asyncio.sleep(AUTO_LOOP_INTERVAL)
 
-# ---------------- START ----------------
-if __name__ == "__main__":
+@app.on_event("startup")
+async def startup():
     init_db()
     load_history_from_db()
-    asyncio.run(auto_loop())
+    asyncio.create_task(auto_loop()) 
