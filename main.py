@@ -30,7 +30,8 @@ LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 600))  # 600 giây = 10 phút
 WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", 15 * 60))
 TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
+# keep default to 4 hours (hour_0 .. hour_3)
+EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 4))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
 
 # bias history
@@ -46,7 +47,7 @@ app = FastAPI()
 class SensorData(BaseModel):
     temperature: float
     humidity: float
-    battery: float | None = None
+    # removed battery to slim payload
 
 # ============== MAPPINGS =================
 WEATHER_CODE_MAP = {
@@ -319,6 +320,7 @@ def fetch_open_meteo():
     if not has_yesterday and hourly_list:
         ymin, ymax = compute_daily_min_max_from_hourly(hourly_list, yesterday)
         if ymin is not None or ymax is not None:
+            # we keep fetcher's behavior but merge logic will no longer expose 'yesterday' fields
             daily_list.insert(0, {"date": yesterday, "desc": None, "max": ymax, "min": ymin, "precipitation_sum": None, "windspeed_max": None})
             has_yesterday = True
 
@@ -373,7 +375,7 @@ def merge_weather_and_hours(existing_data=None):
     daily_list, hourly_list, has_yday, raw = fetch_open_meteo()
 
     now = _now_local()
-    yesterday_str = (now - timedelta(days=1)).date().isoformat()
+    # NOTE: we intentionally do not expose 'yesterday' fields in flattened output (slimmed)
     today_str = now.date().isoformat()
     tomorrow_str = (now + timedelta(days=1)).date().isoformat()
 
@@ -385,7 +387,6 @@ def merge_weather_and_hours(existing_data=None):
 
     weather = {
         "meta": {"latitude": LAT, "longitude": LON, "tz": TIMEZONE, "fetched_at": now.isoformat(), "source": "open-meteo"},
-        "yesterday": find_daily_by_date(yesterday_str),
         "today": find_daily_by_date(today_str),
         "tomorrow": find_daily_by_date(tomorrow_str),
         "next_hours": hourly_list,
@@ -413,12 +414,6 @@ def merge_weather_and_hours(existing_data=None):
     flattened["weather_tomorrow_desc"] = tt.get("desc") if tt.get("desc") is not None else None
     flattened["weather_tomorrow_max"] = tt.get("max") if tt.get("max") is not None else None
     flattened["weather_tomorrow_min"] = tt.get("min") if tt.get("min") is not None else None
-
-    ty = weather.get("yesterday", {}) or {}
-    flattened["weather_yesterday_desc"] = ty.get("desc")
-    flattened["weather_yesterday_max"] = ty.get("max")
-    flattened["weather_yesterday_min"] = ty.get("min")
-    flattened["weather_yesterday_date"] = ty.get("date")
 
     # parse hourly times robustly
     hour_times = [h.get("time") for h in hourly_list] if hourly_list else []
@@ -490,7 +485,7 @@ def merge_weather_and_hours(existing_data=None):
     except Exception:
         pass
 
-    # compose next hours starting at start_idx
+    # compose next hours starting at start_idx (limited by EXTENDED_HOURS; default 4 -> hour_0..hour_3)
     next_hours = []
     for offset in range(0, EXTENDED_HOURS):
         i = start_idx + offset
@@ -561,8 +556,6 @@ def merge_weather_and_hours(existing_data=None):
         flattened["humidity"] = existing_data.get("humidity")
     if "location" not in flattened:
         flattened["location"] = existing_data.get("location", "An Phú, Hồ Chí Minh")
-    if "crop" not in flattened:
-        flattened["crop"] = existing_data.get("crop", "Rau muống")
 
     return flattened
 
@@ -598,7 +591,7 @@ def bias_status():
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':..., 'battery':...}}")
+    logger.info(f"ESP32 ▶ received sensor data: {{'temperature':..., 'humidity':...}}")
     weather = merge_weather_and_hours(existing_data={})
     next_hours = weather.get("next_hours", [])
 
@@ -607,7 +600,6 @@ def receive_data(data: SensorData):
     merged = {
         **data.dict(),
         "location": "An Phú, Hồ Chí Minh",
-        "crop": "Rau muống",
         "forecast_bias": bias,
         "forecast_history_len": len(bias_history)
     }
@@ -619,7 +611,6 @@ def receive_data(data: SensorData):
 # ================== AUTO LOOP (simulator) ==================
 async def auto_loop():
     logger.info("Auto-loop simulator started")
-    battery = 4.2
     while True:
         try:
             now = _now_local()
@@ -628,15 +619,13 @@ async def auto_loop():
             amplitude = 6.0
             temp = base + amplitude * math.sin((hour - 14) / 24.0 * 2 * math.pi) + random.uniform(-0.7, 0.7)
             humi = max(20.0, min(95.0, 75 - (temp - base) * 3 + random.uniform(-5, 5)))
-            battery = max(3.3, battery - random.uniform(0.0005, 0.0025))
-            sample = {"temperature": round(temp, 1), "humidity": round(humi, 1), "battery": round(battery, 3)}
+            sample = {"temperature": round(temp, 1), "humidity": round(humi, 1)}
 
             weather = merge_weather_and_hours(existing_data={})
             bias = update_bias_and_correct(weather.get("next_hours", []), sample["temperature"])
             merged = {
                 **sample,
                 "location": "An Phú, Hồ Chí Minh",
-                "crop": "Rau muống",
                 "forecast_bias": bias,
                 "forecast_history_len": len(bias_history)
             }
@@ -651,4 +640,4 @@ async def auto_loop():
 async def startup():
     init_db()
     load_history_from_db()
-    asyncio.create_task(auto_loop()) 
+    asyncio.create_task(auto_loop())
