@@ -1,6 +1,5 @@
 # main.py
-# Agri-bot — Forecast only (Open-Meteo), ThingsBoard uploader
-
+# Agri-bot — Forecast only (Open-Meteo), push 4 next hours + avg humidity, VN time
 import os
 import time
 import logging
@@ -56,6 +55,7 @@ def _now_local():
 def _to_local_dt(timestr):
     if not timestr:
         return None
+    # Open-Meteo trả ISO có phút (YYYY-MM-DDTHH:MM)
     try:
         dt = datetime.fromisoformat(timestr)
     except Exception:
@@ -145,7 +145,7 @@ def merge_weather():
         "forecast_meta_longitude": LON,
     }
 
-    # today / tomorrow
+    # today / tomorrow summaries
     t = find_daily_by_date(today_str)
     flattened["forecast_today_desc"] = t.get("desc")
     flattened["forecast_today_max"] = t.get("max")
@@ -156,9 +156,34 @@ def merge_weather():
     flattened["forecast_tomorrow_max"] = tt.get("max")
     flattened["forecast_tomorrow_min"] = tt.get("min")
 
-    # Hourly forecast (4 giờ kế tiếp)
+    # === Avg humidity (today & tomorrow) ===
+    def avg_humidity_for(date_iso):
+        vals = []
+        for h in hourly_list:
+            dt = _to_local_dt(h.get("time"))
+            if dt and dt.date().isoformat() == date_iso:
+                hv = h.get("humidity")
+                if hv is not None:
+                    vals.append(float(hv))
+        if not vals:
+            return None
+        return round(sum(vals) / len(vals), 1)
+
+    today_avg_h = avg_humidity_for(today_str)
+    tomorrow_avg_h = avg_humidity_for(tomorrow_str)
+    if today_avg_h is not None:
+        flattened["forecast_today_avg_humidity"] = today_avg_h
+    if tomorrow_avg_h is not None:
+        flattened["forecast_tomorrow_avg_humidity"] = tomorrow_avg_h
+
+    # === Hourly forecast (4 giờ kế tiếp) ===
     parsed_times = [_to_local_dt(h.get("time")) for h in hourly_list]
+
+    # ===== LÀM TRÒN GIỜ THEO YÊU CẦU: nếu phút >= 1 thì round up lên giờ kế tiếp =====
     now_rounded = now.replace(minute=0, second=0, microsecond=0)
+    if now.minute >= 1:
+        now_rounded = now_rounded + timedelta(hours=1)
+
     start_idx = None
     for i, p in enumerate(parsed_times):
         if p and p >= now_rounded:
@@ -167,7 +192,7 @@ def merge_weather():
     if start_idx is None:
         start_idx = 0
 
-    for idx_h in range(0, EXTENDED_HOURS):  # chỉ lấy 0..3
+    for idx_h in range(0, EXTENDED_HOURS):  # 0..3
         i = start_idx + idx_h
         if i >= len(hourly_list):
             break
