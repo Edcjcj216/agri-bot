@@ -4,10 +4,8 @@
 import os
 import time
 import logging
-import re
 import requests
 import asyncio
-import math
 from fastapi import FastAPI
 from datetime import datetime, timedelta
 
@@ -26,7 +24,7 @@ LON = float(os.getenv("LON", "106.70"))
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 600))  # 600 giây = 10 phút
 WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", 15 * 60))
 TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
+EXTENDED_HOURS = 4   # chỉ lấy 4 giờ kế tiếp
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -142,10 +140,9 @@ def merge_weather():
         return {}
 
     flattened = {
+        "forecast_fetched_at": now.isoformat(),
         "forecast_meta_latitude": LAT,
         "forecast_meta_longitude": LON,
-        "forecast_meta_tz": TIMEZONE,
-        "forecast_fetched_at": now.isoformat(),
     }
 
     # today / tomorrow
@@ -159,7 +156,7 @@ def merge_weather():
     flattened["forecast_tomorrow_max"] = tt.get("max")
     flattened["forecast_tomorrow_min"] = tt.get("min")
 
-    # Hourly forecast (next EXTENDED_HOURS)
+    # Hourly forecast (4 giờ kế tiếp)
     parsed_times = [_to_local_dt(h.get("time")) for h in hourly_list]
     now_rounded = now.replace(minute=0, second=0, microsecond=0)
     start_idx = None
@@ -170,7 +167,7 @@ def merge_weather():
     if start_idx is None:
         start_idx = 0
 
-    for idx_h in range(0, EXTENDED_HOURS):
+    for idx_h in range(0, EXTENDED_HOURS):  # chỉ lấy 0..3
         i = start_idx + idx_h
         if i >= len(hourly_list):
             break
