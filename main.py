@@ -359,4 +359,29 @@ async def auto_loop():
             hour = now.hour + now.minute/60.0
             base = 27.0
             amplitude = 6.0
-            temp = base + amplitude*math.sin((hour-14)/24*2*math.pi) + random.uniform(-0
+            temp = base + amplitude*math.sin((hour-14)/24*2*math.pi) + random.uniform(-0.5, 0.5)
+            humidity = 60 + 10*math.sin((hour-6)/24*2*math.pi) + random.uniform(-2,2)
+
+            data = SensorData(
+                temperature=temp,
+                humidity=humidity,
+                illuminance=random.randint(100,1000),
+                avg_soil_moisture=random.uniform(20,60),
+                battery=battery
+            )
+            merged = merge_weather_and_hours(existing_data=data.dict())
+            bias = update_bias_and_correct(merged.get("next_hours", []), data.temperature)
+            merged["forecast_bias"] = bias
+            merged["forecast_history_len"] = len(bias_history)
+            dashboard_data = map_for_dashboard(merged)
+            send_to_thingsboard(dashboard_data)
+            await asyncio.sleep(AUTO_LOOP_INTERVAL)
+        except Exception as e:
+            logger.error(f"Auto-loop error: {e}")
+            await asyncio.sleep(10)
+
+# ---------------- START ----------------
+if __name__ == "__main__":
+    init_db()
+    load_history_from_db()
+    asyncio.run(auto_loop())
