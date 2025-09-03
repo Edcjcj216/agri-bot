@@ -22,7 +22,7 @@ except Exception:
     ZoneInfo = None
 
 # ============== CONFIG =================
-TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "yt9TkDLhB4NXFx9W1GW5")
+TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "N0wYjbpcm7wCw7YnSCiJ")
 TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 
 LAT = float(os.getenv("LAT", "10.79"))
