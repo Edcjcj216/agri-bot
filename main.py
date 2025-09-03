@@ -395,8 +395,6 @@ def merge_weather_and_hours(existing_data=None):
 
     # aggregated humidity
     hums = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
-    if len(hums) >= 24:
-        weather["humidity_yesterday"] = round(sum(hums[0:24]) / 24.0, 1)
     if len(hums) >= 48:
         weather["humidity_today"] = round(sum(hums[24:48]) / 24.0, 1)
     if len(hums) >= 72:
@@ -547,7 +545,6 @@ def merge_weather_and_hours(existing_data=None):
         hlist = [h.get("humidity") for h in hourly_list if h.get("humidity") is not None]
         flattened["humidity_today"] = round(sum(hlist)/len(hlist),1) if hlist else None
     flattened["humidity_tomorrow"] = weather.get("humidity_tomorrow")
-    flattened["humidity_yesterday"] = weather.get("humidity_yesterday")
 
     # keep observed if present
     if "temperature" not in flattened:
