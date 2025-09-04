@@ -64,31 +64,26 @@ logger.info(f"[ENV] TB_TOKEN={_mask_token(_raw_token)} (len={len(_raw_token)})")
 logger.info(f"[ENV] TB_DEVICE_URL present = {bool(TB_DEVICE_URL)}")
 
 # ============================================================
-# WEATHER CODE → Tiếng Việt (bám theo mapping bạn đã dùng)
+# WEATHER CODE → Tiếng Việt (sửa: bỏ các mô tả tuyết/mưa đá)
 # ============================================================
 WEATHER_CODE_MAP = {
-    0: "Nắng",
-    1: "Nắng nhẹ",
-    2: "Ít mây",
-    3: "Nhiều mây",
-    45: "Sương muối",
-    48: "Sương muối",
+    0: "Trời quang",
+    1: "Ít mây",
+    2: "Nhiều mây",
+    3: "U ám",
+    45: "Sương mù",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
-    55: "Mưa phùn dày",
-    56: "Mưa phùn lạnh",
-    57: "Mưa phùn lạnh dày",
+    55: "Mưa phùn dày hạt",
     61: "Mưa nhẹ",
     63: "Mưa vừa",
     65: "Mưa to",
-    66: "Mưa lạnh nhẹ",
-    67: "Mưa lạnh to",
     80: "Mưa rào nhẹ",
     81: "Mưa rào vừa",
-    82: "Mưa rào mạnh",
-    95: "Có giông",
-    96: "Có giông",
-    99: "Có giông",
+    82: "Mưa rào to",
+    95: "Giông bão",
+    96: "Giông bão",
+    99: "Giông bão",
 }
 
 # ============================================================
