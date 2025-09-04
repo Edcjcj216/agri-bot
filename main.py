@@ -5,7 +5,6 @@ import os
 import time
 import json
 import logging
-import re
 import requests
 import asyncio
 import sqlite3
@@ -13,7 +12,7 @@ import math
 import random
 from fastapi import FastAPI
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 
 # timezone handling
@@ -120,6 +119,9 @@ def merge_weather_and_hours(existing_data=None):
 
     for i, t in enumerate(times):
         ts = datetime.fromisoformat(t)
+        # fix: ensure timezone aware
+        if ts.tzinfo is None and LOCAL_TZ:
+            ts = ts.replace(tzinfo=LOCAL_TZ)
         if ts >= now:
             hours.append({
                 "time": t,
