@@ -1,220 +1,192 @@
 # main.py
-# Agri-bot — Open-Meteo + sensor, dashboard-ready keys
+# Agri-bot — FastAPI + Open-Meteo + ThingsBoard push
 
 import os
 import time
 import json
 import logging
-import re
 import requests
 import asyncio
 import sqlite3
-import math
 import random
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from collections import deque
+from zoneinfo import ZoneInfo
 
-# timezone handling
-try:
-    from zoneinfo import ZoneInfo
-    LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-except Exception:
-    LOCAL_TZ = None
-
-# logging config
+# ================== Logging ==================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("agri-bot")
 
-# fastapi
-app = FastAPI()
-
-# database
-DB_FILE = "agri_bot.db"
-conn = sqlite3.connect(DB_FILE)
-c = conn.cursor()
-c.execute("CREATE TABLE IF NOT EXISTS bias_history (ts TEXT, bias REAL)")
-conn.commit()
-conn.close()
-
-# in-memory bias history (last 50)
-bias_history = deque(maxlen=50)
-
-# weather API
-OPEN_METEO_URL = (
-    "https://api.open-meteo.com/v1/forecast?"
-    "latitude=10.762622&longitude=106.660172&hourly=temperature_2m,relative_humidity_2m,"
-    "precipitation_probability,weathercode&forecast_days=1&timezone=auto"
-)
-
-# ThingsBoard config (from Render env)
-TB_TOKEN = os.getenv("TB_TOKEN", "demoToken")
-TB_URL = os.getenv("TB_URL", "https://thingsboard.cloud/api/v1/")
-TB_DEVICE_URL = f"{TB_URL}{TB_TOKEN}/telemetry"
-
+# ================== Config ==================
+TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+DB_FILE = "sensor.db"
+TB_DEMO_TOKEN = os.getenv("TB_DEMO_TOKEN", "")
+TB_DEVICE_URL = f"https://thingsboard.cloud/api/v1/{TB_DEMO_TOKEN}/telemetry"
 REQUEST_TIMEOUT = 10
 
+# ================== Weather mapping ==================
+WEATHER_CODE_MAP = {
+    0: "Nắng", 1: "Nắng nhẹ", 2: "Ít mây", 3: "Nhiều mây",
+    45: "Sương muối", 48: "Sương muối",
+    51: "Mưa phùn nhẹ", 53: "Mưa phùn vừa", 55: "Mưa phùn dày",
+    56: "Mưa phùn lạnh", 57: "Mưa phùn lạnh dày",
+    61: "Mưa nhẹ", 63: "Mưa vừa", 65: "Mưa to",
+    66: "Mưa lạnh nhẹ", 67: "Mưa lạnh to",
+    80: "Mưa rào nhẹ", 81: "Mưa rào vừa", 82: "Mưa rào mạnh",
+    95: "Có giông", 96: "Có giông", 99: "Có giông",
+}
 
-# helper functions
-def _now_local():
-    if LOCAL_TZ:
-        return datetime.now(LOCAL_TZ)
-    return datetime.now()
+WEATHER_MAP = {
+    "Sunny": "Nắng", "Clear": "Trời quang", "Partly cloudy": "Ít mây",
+    "Cloudy": "Nhiều mây", "Overcast": "Âm u",
+    "Patchy light rain": "Mưa nhẹ", "Patchy rain nearby": "Có mưa rải rác gần đó",
+    "Light rain": "Mưa nhẹ", "Light rain shower": "Mưa rào nhẹ",
+    "Patchy light drizzle": "Mưa phùn nhẹ", "Moderate rain": "Mưa vừa", "Heavy rain": "Mưa to",
+    "Moderate or heavy rain shower": "Mưa rào vừa hoặc to", "Torrential rain shower": "Mưa rất to",
+    "Patchy rain possible": "Có thể có mưa",
+    "Thundery outbreaks possible": "Có giông", "Patchy light rain with thunder": "Mưa giông nhẹ",
+    "Moderate or heavy rain with thunder": "Mưa giông to",
+    "Storm": "Bão", "Tropical storm": "Áp thấp nhiệt đới",
+}
 
+# ================== Database ==================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sensor_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        temperature REAL,
+        humidity REAL,
+        battery REAL
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-def sanitize_for_tb(data: dict) -> dict:
-    """Ensure telemetry keys/values are valid"""
+def save_sensor_data(temp: float, hum: float, bat: float):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sensor_data (timestamp, temperature, humidity, battery) VALUES (?, ?, ?, ?)",
+        (datetime.now(TZ).isoformat(), temp, hum, bat)
+    )
+    conn.commit()
+    conn.close()
+
+# ================== Weather fetch (Open-Meteo) ==================
+def fetch_open_meteo(lat=10.762622, lon=106.660172):
+    try:
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&hourly=temperature_2m,relative_humidity_2m,weathercode"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum"
+            f"&forecast_days=2&timezone=auto"
+        )
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        return data
+    except Exception as e:
+        logger.error(f"Open-Meteo fetch error: {e}")
+        return {}
+
+# ================== Merge weather + sensor ==================
+def merge_weather_and_hours(existing_data: dict):
+    data = fetch_open_meteo()
+    if not data:
+        return existing_data
+
+    merged = existing_data.copy()
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", [])
+
+    # Map 6 giờ tới
+    now = datetime.now(TZ)
+    for i in range(6):
+        if i < len(times):
+            t = datetime.fromisoformat(times[i]).astimezone(TZ)
+            merged[f"hour_{i}_time"] = t.strftime("%H:%M")
+            merged[f"hour_{i}_temperature"] = hourly.get("temperature_2m", [None])[i]
+            code_raw = hourly.get("weathercode", [None])[i]
+            merged[f"hour_{i}_weather_desc"] = WEATHER_CODE_MAP.get(code_raw, str(code_raw))
+
+    # Daily info
+    daily = data.get("daily", {})
+    merged["today_temp_max"] = daily.get("temperature_2m_max", [None])[0]
+    merged["today_temp_min"] = daily.get("temperature_2m_min", [None])[0]
+    merged["today_precipitation"] = daily.get("precipitation_sum", [None])[0]
+
+    return merged
+
+# ================== ThingsBoard push ==================
+def sanitize_for_tb(data: dict):
     clean = {}
     for k, v in data.items():
-        key = re.sub(r"[^a-zA-Z0-9_]", "_", str(k))
-        try:
-            json.dumps(v)
-            clean[key] = v
-        except Exception:
-            clean[key] = str(v)
+        if isinstance(v, (int, float, str)):
+            clean[k] = v
+        elif isinstance(v, (list, dict)):
+            clean[k] = json.dumps(v, ensure_ascii=False)
     return clean
-
 
 def send_to_thingsboard(data: dict):
     try:
         sanitized = sanitize_for_tb(data)
-        logger.info(f"[TB PUSH] Payload = {json.dumps(sanitized, ensure_ascii=False)}")
+        logger.info(f"[TB PUSH] {json.dumps(sanitized, ensure_ascii=False)}")
         r = requests.post(TB_DEVICE_URL, json=sanitized, timeout=REQUEST_TIMEOUT)
-        logger.info(f"[TB RESP] Status = {r.status_code}, Body = {r.text}")
+        logger.info(f"[TB RESP] {r.status_code} {r.text}")
     except Exception as e:
-        logger.error(f"[TB PUSH ERROR] {e}")
+        logger.error(f"ThingsBoard push error: {e}")
 
+# ================== FastAPI ==================
+app = FastAPI(title="Agri-Bot")
 
-def merge_weather_and_hours(data: dict):
-    try:
-        now = _now_local()
-        times = data.get("hourly", {}).get("time", [])
-        temps = data.get("hourly", {}).get("temperature_2m", [])
-        hums = data.get("hourly", {}).get("relative_humidity_2m", [])
-        precs = data.get("hourly", {}).get("precipitation_probability", [])
-        codes = data.get("hourly", {}).get("weathercode", [])
-
-        hours = []
-        for i, t in enumerate(times):
-            ts = datetime.fromisoformat(t)
-            # ép timezone local nếu thiếu
-            if ts.tzinfo is None and LOCAL_TZ:
-                ts = ts.replace(tzinfo=LOCAL_TZ)
-            if ts >= now:
-                hours.append(
-                    {
-                        "time": t,
-                        "temperature": temps[i],
-                        "humidity": hums[i],
-                        "precipitation_probability": precs[i],
-                        "weathercode": codes[i],
-                    }
-                )
-            if len(hours) >= 12:
-                break
-        return hours
-    except Exception as e:
-        logger.error(f"merge_weather_and_hours error: {e}")
-        return []
-
-
-# FastAPI models
 class SensorData(BaseModel):
     temperature: float
     humidity: float
     battery: float
 
+@app.post("/esp32-data")
+def receive_data(data: SensorData):
+    logger.info(f"[RX] Sensor data: {data}")
+    save_sensor_data(data.temperature, data.humidity, data.battery)
+    merged = merge_weather_and_hours(data.dict())
+    send_to_thingsboard(merged)
+    return {"status": "ok", "merged": merged}
 
 @app.get("/")
-async def root():
-    return {"status": "ok", "time": _now_local().isoformat()}
+def root():
+    return {"msg": "Agri-Bot API running"}
 
-
-@app.get("/weather")
-async def weather():
-    try:
-        r = requests.get(OPEN_METEO_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        return {"status": "ok", "hours": merge_weather_and_hours(data)}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-@app.post("/sensor")
-async def sensor(data: SensorData):
-    # lưu bias vào sqlite + in-memory
-    bias = data.temperature - 25.0
-    ts = _now_local().isoformat()
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO bias_history VALUES (?,?)", (ts, bias))
-    conn.commit()
-    conn.close()
-
-    bias_history.append((ts, bias))
-
-    payload = {"temperature": data.temperature, "humidity": data.humidity, "battery": data.battery}
-    send_to_thingsboard(payload)
-    return {"status": "ok", "saved_bias": bias}
-
-
-@app.get("/history")
-async def history():
-    return list(bias_history)
-
-
-@app.get("/last")
-async def last_telemetry():
-    if not bias_history:
-        return {"status": "no data"}
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT ts, bias FROM bias_history ORDER BY ts DESC LIMIT 1")
-    row = c.fetchone()
-    conn.close()
-    return {
-        "status": "ok",
-        "last_bias": row[1] if row else None,
-        "history_len": len(bias_history),
-    }
-
-
-# background task for auto loop
+# ================== Background Auto-loop ==================
 async def auto_loop():
-    await asyncio.sleep(2)
-    logger.info("✅ Auto-loop simulator started")
     while True:
         try:
             sample = {
-                "temperature": round(20 + random.random() * 10, 1),
-                "humidity": round(60 + random.random() * 30, 1),
-                "battery": round(3.7 + random.random() * 0.5, 3),
+                "temperature": round(random.uniform(20, 35), 1),
+                "humidity": round(random.uniform(50, 95), 1),
+                "battery": round(random.uniform(3.7, 4.2), 3),
             }
-            logger.info(f"[AUTO] Sensor sample ▶ {sample}")
-            send_to_thingsboard(sample)
-
-            # save bias
-            bias = sample["temperature"] - 25.0
-            ts = _now_local().isoformat()
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("INSERT INTO bias_history VALUES (?,?)", (ts, bias))
-            conn.commit()
-            conn.close()
-            bias_history.append((ts, bias))
-
+            logger.info(f"[AUTO] Sample ▶ {sample}")
+            merged = merge_weather_and_hours(sample)
+            send_to_thingsboard(merged)
         except Exception as e:
             logger.error(f"[AUTO] Loop error: {e}")
-
-        await asyncio.sleep(60)  # mỗi phút gửi 1 lần
-
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup_event():
+    init_db()
     asyncio.create_task(auto_loop())
+    logger.info("✅ Auto-loop simulator started")
+
+# ================== Main ==================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
