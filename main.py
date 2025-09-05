@@ -80,9 +80,9 @@ WEATHER_CODE_MAP = {
     80: "Mưa rào nhẹ",
     81: "Mưa rào vừa",
     82: "Mưa rào to",
-    95: "Giông bão",
-    96: "Giông bão",
-    99: "Giông bão",
+    95: "Có giông nhẹ",
+    96: "Có giông vừa",
+    99: "Có giông lớn",
 }
 
 # ============================================================
