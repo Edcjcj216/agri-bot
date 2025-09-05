@@ -69,9 +69,8 @@ logger.info(f"[ENV] TB_DEVICE_URL present = {bool(TB_DEVICE_URL)}")
 WEATHER_CODE_MAP = {
     0: "Trời quang",
     1: "Ít mây",
-    2: "Nhiều mây",
-    3: "U ám",
-    45: "Sương mù",
+    2: "Có mây",
+    3: "Nhiều mây",
     51: "Mưa phùn nhẹ",
     53: "Mưa phùn vừa",
     55: "Mưa phùn dày hạt",
