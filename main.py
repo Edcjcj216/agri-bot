@@ -1,67 +1,71 @@
-# main.py — Agri-bot Full
-# ========================================
-# ✅ Tính năng:
-#  - Lấy dự báo thời tiết (Open-Meteo → OWM → OpenRouter fallback).
-#  - Chọn block 4 giờ kế tiếp, làm tròn giờ hiện tại +1 phút.
-#  - Auto-loop: cứ mỗi AUTO_LOOP_INTERVAL giây tự fetch & push ThingsBoard.
-#  - Lưu/truy xuất bias nhiệt độ vào SQLite.
-#  - Xuất FastAPI với endpoint /weather, /bias, /esp32-data để test.
+# ============================================================
+# main.py
+# Agri-bot — Open-Meteo only (FULL, verbose, VN comments)
+#
+# Tính năng chính:
+#  - Lấy dự báo từ Open-Meteo (hourly + daily).
+#  - START HOUR = làm tròn lên giờ kế tiếp (vd 09:12 -> 10:00).
+#  - Dashboard cần 4 giờ tới: xuất các key hour_1 .. hour_4
+#    (bắt đầu từ giờ kế tiếp).
+#  - temperature_h, humidity = lấy từ hour_1_*.
+#  - Có weather_tomorrow_desc, min, max, và humidity_tomorrow.
+#  - Chỉ push các key dashboard yêu cầu. KHÔNG push: crop, battery, next_hours.
+#  - illuminance, avg_soil_moisture: nếu có sensor thì push, không có thì giữ None.
+#  - Có auto-loop, logging, DB lưu bias_history tối giản (không bắt buộc, nhưng giữ theo bản dài).
+# ============================================================
 
 import os
 import time
 import json
 import logging
-import requests
-import asyncio
 import sqlite3
-import math
-import random
-import re
+import asyncio
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
+import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
-from datetime import datetime, timedelta
-from collections import deque
 
-# Xử lý timezone
+# ---------------- Timezone ----------------
 try:
     from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception:
-    ZoneInfo = None
+    LOCAL_TZ = None
 
-# ============== CONFIG =================
-TB_HOST = os.getenv("TB_HOST", "https://thingsboard.cloud")
-TB_TOKEN = os.getenv("TB_TOKEN", "DEOAyARAvPbZkHKFVJQa")
-TB_DEVICE_URL = os.getenv("TB_DEVICE_URL", f"{TB_HOST}/api/v1/{TB_TOKEN}/telemetry")
+# ---------------- Cấu hình chung ----------------
+AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "600"))   # giây giữa các lần auto-push
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))          # timeout HTTP
+DB_FILE = os.getenv("DB_FILE", "agri_bot.db")                      # file DB SQLite để lưu bias
+LAT = float(os.getenv("LAT", "10.762622"))                         # toạ độ mặc định (HCM)
+LON = float(os.getenv("LON", "106.660172"))
+EXTENDED_HOURS = 4  # Dashboard cần đúng 4 giờ tới: hour_1..hour_4
 
-LAT = float(os.getenv("LAT", "10.79"))
-LON = float(os.getenv("LON", "106.70"))
-TIMEZONE = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+# ---------------- ThingsBoard ----------------
+_raw_token = (os.getenv("TB_DEMO_TOKEN") or os.getenv("TB_TOKEN") or os.getenv("TB_DEVICE_TOKEN") or "").strip()
+TB_HOST = (os.getenv("TB_HOST") or os.getenv("TB_URL") or "https://thingsboard.cloud").strip().rstrip("/")
+TB_DEVICE_URL = f"{TB_HOST}/api/v1/{_raw_token}/telemetry" if _raw_token else None
 
-AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", 600))  # 10 phút
-WEATHER_CACHE_SECONDS = int(os.getenv("WEATHER_CACHE_SECONDS", 900))  # 15 phút
-EXTENDED_HOURS = int(os.getenv("EXTENDED_HOURS", 12))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
-
-OWM_API_KEY = os.getenv("OWM_API_KEY", None)
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", None)
-
-# bias history
-MAX_HISTORY = int(os.getenv("BIAS_MAX_HISTORY", 48))
-BIAS_DB_FILE = os.getenv("BIAS_DB_FILE", "bias_history.db")
-bias_history = deque(maxlen=MAX_HISTORY)
-
-# Logging
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("agribot")
+logger = logging.getLogger("agri-bot")
 
-app = FastAPI()
+def _mask_token(t: str) -> str:
+    if not t:
+        return "<empty>"
+    if len(t) <= 8:
+        return t[:2] + "***"
+    return t[:4] + "..." + t[-4:]
 
-class SensorData(BaseModel):
-    temperature: float
-    humidity: float
-    battery: float | None = None
+logger.info(f"[ENV] TB_HOST={TB_HOST}")
+logger.info(f"[ENV] TB_TOKEN={_mask_token(_raw_token)} (len={len(_raw_token)})")
+logger.info(f"[ENV] TB_DEVICE_URL present = {bool(TB_DEVICE_URL)}")
 
-# ============== WEATHER CODE MAP ==============
+# ============================================================
+# WEATHER CODE → Tiếng Việt (sửa: bỏ các mô tả tuyết/mưa đá)
+# ============================================================
 WEATHER_CODE_MAP = {
     0: "Trời nắng đẹp",
     1: "Trời không mây",
@@ -81,232 +85,509 @@ WEATHER_CODE_MAP = {
     99: "Có giông lớn",
 }
 
-# ============== DB Helpers ==============
+# ============================================================
+# DB: lưu một ít lịch sử để tính bias nhiệt độ (tuỳ chọn)
+# ============================================================
 def init_db():
     try:
-        conn = sqlite3.connect(BIAS_DB_FILE)
+        conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bias_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                api_temp REAL NOT NULL,
-                observed_temp REAL NOT NULL,
-                ts INTEGER NOT NULL,
-                provider TEXT
+                api_temp REAL,          -- nhiệt độ dự báo tại giờ gần nhất
+                observed_temp REAL,     -- nhiệt độ đo thực tế (nếu có)
+                ts INTEGER,             -- timestamp
+                provider TEXT           -- 'open-meteo' | 'sensor'
             )
         """)
         conn.commit()
     except Exception as e:
-        logger.warning(f"DB init error: {e}")
+        logger.warning(f"init_db error: {e}")
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
-def load_history_from_db():
+def insert_history_to_db(api_temp: Optional[float], observed_temp: Optional[float], provider="open-meteo"):
     try:
-        conn = sqlite3.connect(BIAS_DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=10)
         cur = conn.cursor()
-        cur.execute("SELECT api_temp, observed_temp FROM bias_history ORDER BY id DESC LIMIT ?", (MAX_HISTORY,))
-        rows = cur.fetchall()
-        rows.reverse()
-        for api, obs in rows:
-            bias_history.append((float(api), float(obs)))
-        logger.info(f"Loaded {len(rows)} bias samples")
+        cur.execute(
+            "INSERT INTO bias_history (api_temp, observed_temp, ts, provider) VALUES (?, ?, ?, ?)",
+            (None if api_temp is None else float(api_temp),
+             None if observed_temp is None else float(observed_temp),
+             int(time.time()),
+             provider)
+        )
+        conn.commit()
     except Exception as e:
-        logger.warning(f"DB load error: {e}")
+        logger.warning(f"insert_history_to_db error: {e}")
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
-# ============== Time Utils ==============
-def _now_local():
-    if ZoneInfo:
-        try:
-            return datetime.now(ZoneInfo(TIMEZONE))
-        except Exception:
-            return datetime.now()
-    return datetime.now()
+# Giữ tối đa N mẫu gần nhất trong RAM
+bias_history: deque[tuple[Optional[float], Optional[float]]] = deque(maxlen=int(os.getenv("BIAS_MAX_HISTORY", "48")))
 
-def _to_local_dt(timestr):
+# ============================================================
+# Tiện ích thời gian
+# ============================================================
+def _now_local() -> datetime:
+    """Trả về thời gian hiện tại theo timezone VN (nếu có ZoneInfo)."""
     try:
-        dt = datetime.fromisoformat(timestr)
+        return datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.now()
     except Exception:
+        return datetime.now()
+
+def _to_local_dt(timestr: Optional[str]) -> Optional[datetime]:
+    """Parse ISO/naive và gán tz local nếu thiếu tzinfo."""
+    if not timestr:
+        return None
+    dt: Optional[datetime] = None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
         try:
-            dt = datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
+            dt = datetime.strptime(timestr, fmt)
+            break
+        except Exception:
+            continue
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(timestr)
         except Exception:
             return None
-    if dt and dt.tzinfo is None and ZoneInfo:
-        dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    if dt.tzinfo is None and LOCAL_TZ:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
     return dt
 
-# ============== Fetch Weather ==============
-def fetch_open_meteo():
+def ceil_to_next_hour(dt: datetime) -> datetime:
+    """
+    Nếu dt đang chưa đến đầu giờ (có phút/giây) -> làm tròn lên đầu giờ kế tiếp.
+    Nếu đang đúng hh:00:00 -> giữ nguyên.
+    """
+    if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
+        return dt
+    return (dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+
+# ============================================================
+# Open-Meteo fetcher
+# ============================================================
+def fetch_open_meteo() -> tuple[list[dict], list[dict], dict]:
+    """
+    Trả về (daily_list, hourly_list, raw_json)
+      - daily_list: [{date, desc, max, min, precipitation_sum}]
+      - hourly_list: [{time, temperature, humidity, weather_code, weather_*,
+                       precipitation, precipitation_probability, windspeed, winddir}]
+    """
     base = "https://api.open-meteo.com/v1/forecast"
+    daily_vars = "weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum"
+    hourly_vars = "temperature_2m,relativehumidity_2m,weathercode,precipitation,precipitation_probability,windspeed_10m,winddirection_10m"
+
     params = {
         "latitude": LAT,
         "longitude": LON,
-        "hourly": "temperature_2m,relativehumidity_2m,weathercode",
-        "timezone": TIMEZONE,
+        "daily": daily_vars,
+        "hourly": hourly_vars,
+        "timezone": "auto",
+        "timeformat": "iso8601",
+        "past_days": 1,       # để tính humidity_today (trong 24h gần nhất)
+        "forecast_days": 3    # hôm nay + mai + mốt
     }
+
     try:
         r = requests.get(base, params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        return r.json(), "open-meteo"
+        data = r.json()
     except Exception as e:
-        logger.warning(f"Open-Meteo fail: {e}")
-        return None, None
+        logger.error(f"Open-Meteo fetch error: {e}")
+        return [], [], {}
 
-def fetch_owm():
-    if not OWM_API_KEY:
-        return None, None
-    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={LAT}&lon={LON}&appid={OWM_API_KEY}&units=metric"
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json(), "owm"
-    except Exception as e:
-        logger.warning(f"OWM fail: {e}")
-        return None, None
+    # ----- Parse daily -----
+    daily_list: list[dict] = []
+    d = data.get("daily", {})
+    times = d.get("time", []) or []
+    wc = d.get("weathercode", []) or []
+    tmax = d.get("temperature_2m_max", []) or []
+    tmin = d.get("temperature_2m_min", []) or []
+    psum = d.get("precipitation_sum", []) or []
 
-def fetch_openrouter():
-    if not OPENROUTER_API_KEY:
-        return None, None
-    try:
-        # Demo: trả về None (chưa kết nối OpenRouter thực)
-        return None, None
-    except Exception as e:
-        logger.warning(f"OpenRouter fail: {e}")
-        return None, None
+    for i, date in enumerate(times):
+        code = wc[i] if i < len(wc) else None
+        desc = WEATHER_CODE_MAP.get(code) if code is not None else None
+        daily_list.append({
+            "date": date,
+            "desc": desc,
+            "max": tmax[i] if i < len(tmax) else None,
+            "min": tmin[i] if i < len(tmin) else None,
+            "precipitation_sum": psum[i] if i < len(psum) else None,
+        })
 
-# ============== Weather Merge ==============
-def get_next_hours():
-    # Lấy dữ liệu thời tiết với fallback
-    data, source = fetch_open_meteo()
-    if data is None:
-        data, source = fetch_owm()
-    if data is None:
-        data, source = fetch_openrouter()
-    if data is None:
-        logger.error("Không fetch được thời tiết từ bất kỳ nguồn nào")
-        return []
+    # ----- Parse hourly -----
+    hourly_list: list[dict] = []
+    h = data.get("hourly", {})
+    h_times = h.get("time", []) or []
+    h_temp = h.get("temperature_2m", []) or []
+    h_humi = h.get("relativehumidity_2m", []) or []
+    h_code = h.get("weathercode", []) or []
+    h_prec = h.get("precipitation", []) or []
+    h_pp = h.get("precipitation_probability", []) or []
+    h_wind = h.get("windspeed_10m", []) or []
+    h_wd = h.get("winddirection_10m", []) or []
+
+    for i, t in enumerate(h_times):
+        code = h_code[i] if i < len(h_code) else None
+        label = WEATHER_CODE_MAP.get(code) if code is not None else None
+        hourly_list.append({
+            "time": t,
+            "temperature": h_temp[i] if i < len(h_temp) else None,
+            "humidity": h_humi[i] if i < len(h_humi) else None,
+            "weather_code": code,
+            "weather_short": label,
+            "weather_desc": label,
+            "precipitation": h_prec[i] if i < len(h_prec) else None,
+            "precipitation_probability": h_pp[i] if i < len(h_pp) else None,
+            "windspeed": h_wind[i] if i < len(h_wind) else None,
+            "winddir": h_wd[i] if i < len(h_wd) else None,
+        })
+
+    return daily_list, hourly_list, data
+
+# ============================================================
+# Merge dữ liệu & chọn 4 giờ tới (giờ kế tiếp là hour_1)
+# ============================================================
+def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
+    """
+    - Xác định start_time = ceil_to_next_hour(now_local).
+    - Từ danh sách hourly, lấy 4 điểm tại/ sau start_time:
+        hour_1 (start_time), hour_2 (+1h), hour_3 (+2h), hour_4 (+3h).
+    - Top-level temperature_h, humidity = từ hour_1_*.
+    - Bổ sung weather_tomorrow_* và humidity_tomorrow (nếu đủ dữ liệu).
+    """
+    existing = existing or {}
+    daily_list, hourly_list, raw = fetch_open_meteo()
 
     now = _now_local()
-    now_rounded = (now + timedelta(minutes=1)).replace(minute=0, second=0, microsecond=0)
-    logger.info(f"Giờ hiện tại: {now.isoformat()}, chọn block từ: {now_rounded.isoformat()}")
+    start_time = ceil_to_next_hour(now)
 
-    hours = []
-    if source == "open-meteo":
-        h_times = data.get("hourly", {}).get("time", [])
-        h_temp = data.get("hourly", {}).get("temperature_2m", [])
-        h_humi = data.get("hourly", {}).get("relativehumidity_2m", [])
-        h_code = data.get("hourly", {}).get("weathercode", [])
-        for i in range(len(h_times)):
-            t = _to_local_dt(h_times[i])
-            if not t:
-                continue
-            if t >= now_rounded:
-                for j in range(4):
-                    if i + j < len(h_times):
-                        hours.append({
-                            "time": _to_local_dt(h_times[i+j]).strftime("%H:%M"),
-                            "temperature": h_temp[i+j],
-                            "humidity": h_humi[i+j],
-                            "weather": WEATHER_CODE_MAP.get(h_code[i+j], str(h_code[i+j]))
-                        })
-                break
+    # ----- Daily: today / tomorrow -----
+    today_iso = now.date().isoformat()
+    tomorrow_iso = (now + timedelta(days=1)).date().isoformat()
+    today = next((d for d in daily_list if d.get("date") == today_iso), {})
+    tomorrow = next((d for d in daily_list if d.get("date") == tomorrow_iso), {})
 
-    elif source == "owm":
-        for item in data.get("list", []):
-            t = datetime.fromtimestamp(item["dt"])
-            if ZoneInfo:
-                t = t.replace(tzinfo=ZoneInfo(TIMEZONE))
-            if t >= now_rounded:
-                for j in range(4):
-                    if j < len(data["list"]):
-                        sub = data["list"][j]
-                        hours.append({
-                            "time": datetime.fromtimestamp(sub["dt"]).strftime("%H:%M"),
-                            "temperature": sub["main"]["temp"],
-                            "humidity": sub["main"]["humidity"],
-                            "weather": sub["weather"][0]["description"]
-                        })
-                break
+    merged: dict[str, Any] = {}
+    if today:
+        merged["weather_today_desc"] = today.get("desc")
+        merged["weather_today_max"] = today.get("max")
+        merged["weather_today_min"] = today.get("min")
+    if tomorrow:
+        merged["weather_tomorrow_desc"] = tomorrow.get("desc")  # BẮT BUỘC có
+        merged["weather_tomorrow_max"] = tomorrow.get("max")
+        merged["weather_tomorrow_min"] = tomorrow.get("min")
 
-    logger.info(f"Giờ đã chọn: {hours}")
-    return hours
+    # ----- Hourly: tìm index >= start_time -----
+    parsed_times: List[Optional[datetime]] = []
+    for h in hourly_list:
+        parsed_times.append(_to_local_dt(h.get("time")))
 
-# ============== ThingsBoard Push ==============
-def send_to_thingsboard(payload: dict):
+    start_idx = None
+    for i, p in enumerate(parsed_times):
+        if p is None:
+            continue
+        s_comp = start_time
+        p_comp = p
+        if p_comp.tzinfo is None and s_comp.tzinfo is not None:
+            p_comp = p_comp.replace(tzinfo=s_comp.tzinfo)
+        if s_comp.tzinfo is None and p_comp.tzinfo is not None:
+            s_comp = s_comp.replace(tzinfo=p_comp.tzinfo)
+        if p_comp >= s_comp:
+            start_idx = i
+            break
+
+    if start_idx is None:
+        start_idx = 0  # hiếm khi xảy ra, nhưng cứ lấy đầu danh sách
+
+    # ----- Lấy đúng 4 giờ: hour_1..hour_4 -----
+    selected: list[dict] = []
+    for offset in range(EXTENDED_HOURS):
+        i = start_idx + offset
+        if i >= len(hourly_list):
+            break
+        selected.append(hourly_list[i])
+
+    # map vào merged theo format dashboard
+    for k, item in enumerate(selected, start=1):  # k: 1..4
+        dt_local = _to_local_dt(item.get("time"))
+        label = dt_local.strftime("%H:%M") if dt_local else item.get("time")
+        merged[f"hour_{k}"] = label
+        if item.get("temperature") is not None:
+            merged[f"hour_{k}_temperature"] = item.get("temperature")
+        if item.get("humidity") is not None:
+            merged[f"hour_{k}_humidity"] = item.get("humidity")
+        wlabel = item.get("weather_short") or item.get("weather_desc")
+        merged[f"hour_{k}_weather_desc"] = wlabel
+
+    # ----- Top-level hiển thị: từ hour_1 -----
+    merged["temperature_h"] = merged.get("hour_1_temperature")
+    merged["humidity"] = merged.get("hour_1_humidity")
+
+    # ----- Humidity trung bình hôm nay / ngày mai (nếu đủ 48 điểm) -----
+    hums = [h.get("humidity") for h in hourly_list if isinstance(h.get("humidity"), (int, float))]
+    if len(hums) >= 24:
+        merged["humidity_today"] = round(sum(hums[:24]) / 24.0, 1)
+    if len(hums) >= 48:
+        merged["humidity_tomorrow"] = round(sum(hums[24:48]) / 24.0, 1)
+
+    # ----- Meta + location -----
+    merged["location"] = existing.get("location", "An Phú, Hồ Chí Minh")
+    merged["latitude"] = LAT
+    merged["longitude"] = LON
+    merged["meta_fetched_at"] = _now_local().isoformat()
+
+    return merged
+
+# ============================================================
+# Bias (tùy chọn): cập nhật chênh lệch nếu có nhiệt độ thực tế
+# ============================================================
+def update_bias_and_correct(selected_first: Optional[dict], observed_temp: Optional[float]) -> float:
+    """
+    Lấy nhiệt độ dự báo tại hour_1 (điểm đầu của 'selected') so với observed_temp.
+    Lưu vào deque + DB để tính bias trung bình = mean(observed - api).
+    """
+    if not selected_first or observed_temp is None:
+        return 0.0
+    api_now = selected_first.get("temperature")
     try:
-        logger.info(f"TB ▶ {json.dumps(payload, ensure_ascii=False)}")
-        r = requests.post(TB_DEVICE_URL, json=payload, timeout=REQUEST_TIMEOUT)
-        logger.info(f"TB ◀ {r.status_code} {r.text}")
-    except Exception as e:
-        logger.error(f"TB push error: {e}")
+        bias_history.append((api_now, observed_temp))
+        insert_history_to_db(api_now, observed_temp, provider="sensor")
+    except Exception:
+        pass
+    diffs = [obs - api for api, obs in bias_history if api is not None and obs is not None]
+    return round(sum(diffs) / len(diffs), 1) if diffs else 0.0
 
-# ============== Bias Correction ==============
-def update_bias(api_temp, observed_temp, provider="open-meteo"):
+# ============================================================
+# Build payload đẩy ThingsBoard (đúng schema dashboard)
+# ============================================================
+# Lưu giá trị cảm biến gần nhất (illum, soil_moisture) để auto-loop có thể dùng
+LATEST_SENSOR: dict[str, Optional[float]] = {
+    "illuminance": None,
+    "avg_soil_moisture": None,
+}
+
+def build_dashboard_payload(merged: dict) -> dict:
+    """
+    Xuất đúng các key mà dashboard sẽ bind:
+      - location, latitude, longitude
+      - temperature_h, humidity (từ hour_1)
+      - hour_1..hour_4 (time), kèm *_temperature, *_humidity, *_weather_desc
+      - weather_tomorrow_min, weather_tomorrow_max, weather_tomorrow_desc
+      - humidity_tomorrow
+      - illuminance, avg_soil_moisture (có sensor thì push, không thì None)
+    """
+    payload = {
+        "location": merged.get("location"),
+        "latitude": merged.get("latitude"),
+        "longitude": merged.get("longitude"),
+
+        # Top-level hiển thị
+        "temperature_h": merged.get("hour_1_temperature"),
+        "humidity": merged.get("hour_1_humidity"),
+
+        # 4 giờ tới
+        "hour_1": merged.get("hour_1"),
+        "hour_1_temperature": merged.get("hour_1_temperature"),
+        "hour_1_humidity": merged.get("hour_1_humidity"),
+        "hour_1_weather_desc": merged.get("hour_1_weather_desc"),
+
+        "hour_2": merged.get("hour_2"),
+        "hour_2_temperature": merged.get("hour_2_temperature"),
+        "hour_2_humidity": merged.get("hour_2_humidity"),
+        "hour_2_weather_desc": merged.get("hour_2_weather_desc"),
+
+        "hour_3": merged.get("hour_3"),
+        "hour_3_temperature": merged.get("hour_3_temperature"),
+        "hour_3_humidity": merged.get("hour_3_humidity"),
+        "hour_3_weather_desc": merged.get("hour_3_weather_desc"),
+
+        "hour_4": merged.get("hour_4"),
+        "hour_4_temperature": merged.get("hour_4_temperature"),
+        "hour_4_humidity": merged.get("hour_4_humidity"),
+        "hour_4_weather_desc": merged.get("hour_4_weather_desc"),
+
+        # Ngày mai
+        "weather_tomorrow_min": merged.get("weather_tomorrow_min"),
+        "weather_tomorrow_max": merged.get("weather_tomorrow_max"),
+        "weather_tomorrow_desc": merged.get("weather_tomorrow_desc"),
+        "humidity_tomorrow": merged.get("humidity_tomorrow"),
+
+        # Sensor (nếu không có, để None -> TB sẽ lưu null)
+        "illuminance": LATEST_SENSOR.get("illuminance"),
+        "avg_soil_moisture": LATEST_SENSOR.get("avg_soil_moisture"),
+    }
+
+    # Loại bỏ key có giá trị None? => KHÔNG. Bạn yêu cầu: không có sensor thì để null.
+    # Tuy nhiên TB chấp nhận null. Nếu cần loại None thì bỏ comment dưới:
+    # payload = {k: v for k, v in payload.items() if v is not None}
+
+    return payload
+
+# ---------------- Các key bị cấm đẩy lên TB ----------------
+BANNED_KEYS = {
+    "battery",       # không push
+    "crop",          # không push
+    "next_hours",    # không push
+}
+
+def sanitize_for_tb(payload: dict) -> dict:
+    cleaned: dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in BANNED_KEYS:
+            continue
+        # Cho phép None (null) với illuminance/avg_soil_moisture theo yêu cầu
+        if v is None:
+            cleaned[k] = None
+        elif isinstance(v, (str, int, float, bool)):
+            cleaned[k] = v
+        else:
+            try:
+                cleaned[k] = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                cleaned[k] = str(v)
+    return cleaned
+
+def send_to_thingsboard(data: dict):
+    if not TB_DEVICE_URL:
+        logger.warning("[TB SKIP] No TB token configured; skip push.")
+        return None
+    sanitized = sanitize_for_tb(data)
+    logger.info(f"[TB PUSH] keys={list(sanitized.keys())}")
     try:
-        bias_history.append((api_temp, observed_temp))
-        conn = sqlite3.connect(BIAS_DB_FILE)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO bias_history (api_temp, observed_temp, ts, provider) VALUES (?,?,?,?)",
-                    (api_temp, observed_temp, int(time.time()), provider))
-        conn.commit()
-        conn.close()
+        r = requests.post(TB_DEVICE_URL, json=sanitized, timeout=REQUEST_TIMEOUT)
+        logger.info(f"[TB RESP] {r.status_code} {r.text[:200]}")
+        return r
     except Exception as e:
-        logger.warning(f"Bias update fail: {e}")
+        logger.error(f"[TB ERROR] {e}")
+        return None
 
-# ============== AUTO LOOP ==============
-async def auto_loop():
-    logger.info("Auto loop bắt đầu...")
-    while True:
-        try:
-            hours = get_next_hours()
-            if hours:
-                payload = {
-                    "timestamp": _now_local().isoformat(),
-                    "hour_1": hours[0],
-                    "hour_2": hours[1] if len(hours) > 1 else None,
-                    "hour_3": hours[2] if len(hours) > 2 else None,
-                    "hour_4": hours[3] if len(hours) > 3 else None,
-                }
-                send_to_thingsboard(payload)
-        except Exception as e:
-            logger.error(f"Auto loop error: {e}")
-        await asyncio.sleep(AUTO_LOOP_INTERVAL)
+# ============================================================
+# FastAPI
+# ============================================================
+app = FastAPI(title="Agri-Bot (Open-Meteo only, hour_1 display, VN)")
 
-# ============== API ROUTES ==============
+class SensorData(BaseModel):
+    """
+    Endpoint nhận dữ liệu cảm biến thật (nếu có).
+    - temperature / humidity: dùng để tính bias (optional).
+    - illuminance / avg_soil_moisture: lưu lại và push ra dashboard (nếu có).
+    - battery: nhận nhưng KHÔNG push (bị cấm).
+    """
+    temperature: Optional[float] = None
+    humidity: Optional[float] = None
+    illuminance: Optional[float] = None
+    avg_soil_moisture: Optional[float] = None
+    battery: Optional[float] = None  # sẽ bỏ qua khi push
+
 @app.get("/")
 def root():
-    return {"status": "running", "tb_url": TB_DEVICE_URL, "lat": LAT, "lon": LON}
+    return {
+        "status": "running",
+        "time": _now_local().isoformat(),
+        "tb_ok": bool(TB_DEVICE_URL),
+        "lat": LAT,
+        "lon": LON,
+    }
 
 @app.get("/weather")
-def weather():
-    return {"hours": get_next_hours()}
-
-@app.get("/bias")
-def bias():
-    diffs = [obs - api for api, obs in bias_history if api and obs]
-    return {"bias": round(sum(diffs)/len(diffs), 2) if diffs else 0.0, "len": len(diffs)}
+def weather_endpoint():
+    """
+    Trả về gói merged cho kiểm tra nhanh (KHÔNG có next_hours).
+    """
+    merged = merge_weather_and_hours({})
+    # Bảo đảm không lòi key thừa
+    merged.pop("next_hours", None)
+    return merged
 
 @app.post("/esp32-data")
 def receive_data(data: SensorData):
-    logger.info(f"ESP32 ▶ {data.dict()}")
-    hours = get_next_hours()
-    if hours and data.temperature:
-        update_bias(hours[0]["temperature"], data.temperature)
-    payload = {**data.dict(), "hours": hours}
-    send_to_thingsboard(payload)
-    return {"pushed": payload}
+    """
+    Nhận sensor thật. Hành vi:
+    - Cập nhật bộ nhớ LATEST_SENSOR (illum/soil).
+    - Nếu có temperature thực tế: cập nhật bias_history.
+    - Sau đó build payload forecast-only (hour_1..hour_4) + sensor (illum/soil) -> push TB.
+    - KHÔNG push battery/crop/next_hours.
+    """
+    logger.info(f"[RX SENSOR] {data.json()}")
 
-# ============== STARTUP ==============
+    # Cập nhật 2 sensor có ích cho dashboard
+    if data.illuminance is not None:
+        LATEST_SENSOR["illuminance"] = float(data.illuminance)
+    if data.avg_soil_moisture is not None:
+        LATEST_SENSOR["avg_soil_moisture"] = float(data.avg_soil_moisture)
+
+    # Lấy forecast và tính bias nếu có observed temperature
+    merged = merge_weather_and_hours({})
+    # "first selected hour" = hour_1 => lấy lại từ merged
+    selected_first = {
+        "temperature": merged.get("hour_1_temperature"),
+        "humidity": merged.get("hour_1_humidity"),
+    }
+    bias = 0.0
+    try:
+        if data.temperature is not None:
+            bias = update_bias_and_correct(selected_first, float(data.temperature))
+    except Exception:
+        pass
+
+    # Có thể lưu meta bias (không push thêm key lạ)
+    merged["forecast_bias"] = bias
+    merged["forecast_history_len"] = len(bias_history)
+
+    payload = build_dashboard_payload(merged)
+    # đảm bảo banned keys không xuất hiện
+    for k in list(BANNED_KEYS):
+        payload.pop(k, None)
+    send_to_thingsboard(payload)
+
+    return {"ok": True, "bias": bias, "saved_illum": LATEST_SENSOR["illuminance"], "saved_soil": LATEST_SENSOR["avg_soil_moisture"]}
+
+# ============================================================
+# AUTO-LOOP: định kỳ pull Open-Meteo & push TB
+# ============================================================
+async def auto_loop():
+    logger.info("Auto-loop started (Open-Meteo only, hour_1 as display)")
+    while True:
+        try:
+            merged = merge_weather_and_hours({})
+            # không thêm key lạ; bias không có sensor thì giữ 0
+            merged.setdefault("forecast_bias", 0.0)
+            merged.setdefault("forecast_history_len", len(bias_history))
+
+            payload = build_dashboard_payload(merged)
+            for k in list(BANNED_KEYS):
+                payload.pop(k, None)
+            send_to_thingsboard(payload)
+        except Exception as e:
+            logger.error(f"[AUTO] {e}")
+        await asyncio.sleep(AUTO_LOOP_INTERVAL)
+
 @app.on_event("startup")
-async def startup():
+async def on_startup():
     init_db()
-    load_history_from_db()
+    logger.info(f"Startup: TB_DEVICE_URL present: {bool(TB_DEVICE_URL)}")
+    # Chạy auto-loop nền
     asyncio.create_task(auto_loop())
+
+# ============================================================
+# CLI runner (chạy cục bộ)
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+        log_level="info",
+    )
