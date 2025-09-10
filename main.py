@@ -38,7 +38,7 @@ except Exception:
     LOCAL_TZ = None
 
 # ---------------- Cấu hình chung ----------------
-AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "300"))   # giây giữa các lần auto-push (mặc định 5 phút)
+AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "600"))  # giây giữa các lần auto-push (mặc định 10 phút)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))          # timeout HTTP
 DB_FILE = os.getenv("DB_FILE", "agri_bot.db")                      # file DB SQLite để lưu bias
 LAT = float(os.getenv("LAT", "10.762622"))                         # toạ độ mặc định (HCM)
@@ -707,24 +707,28 @@ _auto_task: Optional[asyncio.Task] = None
 
 async def auto_loop():
     logger.info("Auto-loop started (Open-Meteo primary, fallback OWM/OpenRouter)")
-    while True:
-        loop_started = _now_local()
-        try:
-            merged = merge_weather_and_hours({})
-            merged.setdefault("forecast_bias", 0.0)
-            merged.setdefault("forecast_history_len", len(bias_history))
-            payload = build_dashboard_payload(merged)
-            for k in list(BANNED_KEYS):
-                payload.pop(k, None)
-            send_to_thingsboard(payload)
-        except asyncio.CancelledError:
-            logger.info("Auto-loop task cancelled. Exiting loop.")
-            break
-        except Exception as e:
-            logger.error(f"[AUTO] {e}")
-        next_run = loop_started + timedelta(seconds=AUTO_LOOP_INTERVAL)
-        logger.info(f"Auto-loop sleep {AUTO_LOOP_INTERVAL}s, next_run≈{next_run.isoformat()}")
-        await asyncio.sleep(AUTO_LOOP_INTERVAL)
+    try:
+        while True:
+            loop_started = _now_local()
+            try:
+                merged = merge_weather_and_hours({})
+                merged.setdefault("forecast_bias", 0.0)
+                merged.setdefault("forecast_history_len", len(bias_history))
+                payload = build_dashboard_payload(merged)
+                for k in list(BANNED_KEYS):
+                    payload.pop(k, None)
+                send_to_thingsboard(payload)
+            except Exception as e:
+                logger.error(f"[AUTO] {e}")
+
+            next_run = loop_started + timedelta(seconds=AUTO_LOOP_INTERVAL)
+            logger.info(f"Auto-loop sleep {AUTO_LOOP_INTERVAL}s, next_run≈{next_run.isoformat()}")
+            await asyncio.sleep(AUTO_LOOP_INTERVAL)
+
+    except asyncio.CancelledError:
+        # Khi shutdown, task sẽ bị cancel → bắt lại và thoát sạch sẽ
+        logger.info("Auto-loop cancelled, exiting cleanly.")
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -733,16 +737,18 @@ async def on_startup():
     global _auto_task
     _auto_task = asyncio.create_task(auto_loop())
 
+
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Shutting down application...")
     global _auto_task
-    if _auto_task and not _auto_task.done():
+    if _auto_task:
         _auto_task.cancel()
         try:
             await _auto_task
-        except Exception:
-            pass
+        except asyncio.CancelledError:
+            logger.info("Auto-loop task shutdown cleanly.")
+    logger.info("Application shutdown completed.")
 
 # ============================================================
 # CLI runner (chạy cục bộ)
