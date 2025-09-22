@@ -187,7 +187,6 @@ def ceil_to_next_hour(dt: datetime) -> datetime:
     if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return dt
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-
 # ============================================================
 # Open-Meteo fetcher (không đổi)
 # ============================================================
@@ -275,10 +274,6 @@ def fetch_open_meteo() -> tuple[list[dict], list[dict], dict]:
 # ============================================================
 
 def fetch_owm_and_map() -> tuple[list[dict], list[dict], dict]:
-    """
-    Gọi OWM 5-day/3-hour forecast (endpoint forecast) và map về cấu trúc daily_list, hourly_list
-    Trả về daily_list, hourly_list, raw_json
-    """
     if not OWM_API_KEY:
         return [], [], {}
     url = "https://api.openweathermap.org/data/2.5/forecast"
@@ -291,10 +286,9 @@ def fetch_owm_and_map() -> tuple[list[dict], list[dict], dict]:
         logger.warning(f"OWM fetch error: {e}")
         return [], [], {}
 
-    # hourly_list: OWM provides 3-hour steps — map each item
+    # hourly_list: OWM provides 3-hour steps
     hourly_list: list[dict] = []
     for item in data.get("list", []):
-        # item.dt is unix
         try:
             dt = datetime.utcfromtimestamp(item.get("dt"))
             if LOCAL_TZ:
@@ -353,7 +347,6 @@ def fetch_owm_and_map() -> tuple[list[dict], list[dict], dict]:
 def fetch_openrouter_and_map() -> tuple[list[dict], list[dict], dict]:
     if not OPENROUTER_API_KEY:
         return [], [], {}
-    # NOTE: OpenRouter weather endpoints may thay đổi; best-effort
     url = "https://api.openrouter.ai/v1/weather/forecast"
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
     params = {"latitude": LAT, "longitude": LON, "units": "metric", "lang": "en"}
@@ -470,18 +463,14 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
         merged["weather_tomorrow_desc"] = tomorrow.get("desc")
         merged["weather_tomorrow_max"] = tomorrow.get("max")
         merged["weather_tomorrow_min"] = tomorrow.get("min")
-
     # ----- Hourly: tìm index >= start_time (robust tz handling) -----
-    parsed_times: List[Optional[datetime]] = []
-    for h in hourly_list:
-        parsed_times.append(_to_local_dt(h.get("time")))
+    parsed_times: List[Optional[datetime]] = [_to_local_dt(h.get("time")) for h in hourly_list]
 
     start_idx = None
     for i, p in enumerate(parsed_times):
         if p is None:
             continue
-        s_comp = start_time
-        p_comp = p
+        s_comp, p_comp = start_time, p
         if p_comp.tzinfo is None and s_comp.tzinfo is not None:
             p_comp = p_comp.replace(tzinfo=s_comp.tzinfo)
         if s_comp.tzinfo is None and p_comp.tzinfo is not None:
@@ -489,7 +478,6 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
         if p_comp >= s_comp:
             start_idx = i
             break
-
     if start_idx is None:
         start_idx = 0
 
@@ -501,8 +489,8 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
             break
         selected.append(hourly_list[i])
 
-    # map vào merged theo format dashboard (CHỈ các key cần thiết)
-    for k, item in enumerate(selected, start=1):  # k: 1..4
+    # map vào merged theo format dashboard
+    for k, item in enumerate(selected, start=1):
         dt_local = _to_local_dt(item.get("time"))
         label = dt_local.strftime("%H:%M") if dt_local else item.get("time")
         merged[f"hour_{k}"] = label
@@ -517,7 +505,7 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
     merged["temperature_h"] = merged.get("hour_1_temperature")
     merged["humidity"] = merged.get("hour_1_humidity")
 
-    # ----- Humidity trung bình hôm nay / ngày mai (nếu đủ số điểm) -----
+    # ----- Humidity trung bình hôm nay / ngày mai -----
     hums = [h.get("humidity") for h in hourly_list if isinstance(h.get("humidity"), (int, float))]
     if len(hums) >= 24:
         merged["humidity_today"] = round(sum(hums[:24]) / 24.0, 1)
@@ -538,7 +526,7 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
     return merged
 
 # ============================================================
-# Bias (tùy chọn): cập nhật chênh lệch nếu có nhiệt độ thực tế
+# Bias: cập nhật chênh lệch nếu có nhiệt độ thực tế
 # ============================================================
 
 def update_bias_and_correct(selected_first: Optional[dict], observed_temp: Optional[float]) -> float:
@@ -554,23 +542,18 @@ def update_bias_and_correct(selected_first: Optional[dict], observed_temp: Optio
     return round(sum(diffs) / len(diffs), 1) if diffs else 0.0
 
 # ============================================================
-# Build payload đẩy ThingsBoard (đúng schema dashboard)
+# Build payload ThingsBoard
 # ============================================================
 
-LATEST_SENSOR: dict[str, Optional[float]] = {
-    "illuminance": None,
-    "avg_soil_moisture": None,
-}
+LATEST_SENSOR: dict[str, Optional[float]] = {"illuminance": None, "avg_soil_moisture": None}
 
 def build_dashboard_payload(merged: dict) -> dict:
     payload = {
         "location": merged.get("location"),
         "latitude": merged.get("latitude"),
         "longitude": merged.get("longitude"),
-        # Top-level hiển thị
         "temperature_h": merged.get("hour_1_temperature"),
         "humidity": merged.get("hour_1_humidity"),
-        # 4 giờ tới
         "hour_1": merged.get("hour_1"),
         "hour_1_temperature": merged.get("hour_1_temperature"),
         "hour_1_humidity": merged.get("hour_1_humidity"),
@@ -587,23 +570,16 @@ def build_dashboard_payload(merged: dict) -> dict:
         "hour_4_temperature": merged.get("hour_4_temperature"),
         "hour_4_humidity": merged.get("hour_4_humidity"),
         "hour_4_weather_desc": merged.get("hour_4_weather_desc"),
-        # Ngày mai
         "weather_tomorrow_min": merged.get("weather_tomorrow_min"),
         "weather_tomorrow_max": merged.get("weather_tomorrow_max"),
         "weather_tomorrow_desc": merged.get("weather_tomorrow_desc"),
         "humidity_tomorrow": merged.get("humidity_tomorrow"),
-        # Sensor (nếu không có, để None -> TB sẽ lưu null)
         "illuminance": LATEST_SENSOR.get("illuminance"),
         "avg_soil_moisture": LATEST_SENSOR.get("avg_soil_moisture"),
     }
     return payload
 
-# ---------------- Các key bị cấm đẩy lên TB ----------------
-BANNED_KEYS = {
-    "battery",
-    "crop",
-    "next_hours",
-}
+BANNED_KEYS = {"battery", "crop", "next_hours"}
 
 def sanitize_for_tb(payload: dict) -> dict:
     cleaned: dict[str, Any] = {}
@@ -635,6 +611,79 @@ def send_to_thingsboard(data: dict):
         logger.error(f"[TB ERROR] {e}")
         return None
 
+# ============================================================
+# FastAPI
+# ============================================================
+
+app = FastAPI(title="Agri-Bot (Open-Meteo primary, fallback OWM/OpenRouter)")
+
+from pydantic import BaseModel
+
+class SensorData(BaseModel):
+    temperature: Optional[float] = None
+    humidity: Optional[float] = None
+    illuminance: Optional[float] = None
+    avg_soil_moisture: Optional[float] = None
+    battery: Optional[float] = None
+
+@app.get("/")
+def root():
+    return {"status": "running", "time": _now_local().isoformat(), "tb_ok": bool(TB_DEVICE_URL), "lat": LAT, "lon": LON, "interval_s": AUTO_LOOP_INTERVAL}
+
+@app.get("/weather")
+def weather_endpoint():
+    merged = merge_weather_and_hours({})
+    merged.pop("next_hours", None)
+    return merged
+
+@app.post("/esp32-data")
+def receive_data(data: SensorData):
+    logger.info(f"[RX SENSOR] {data.json()}")
+    if data.illuminance is not None:
+        LATEST_SENSOR["illuminance"] = float(data.illuminance)
+    if data.avg_soil_moisture is not None:
+        LATEST_SENSOR["avg_soil_moisture"] = float(data.avg_soil_moisture)
+
+    merged = merge_weather_and_hours({})
+    selected_first = {"temperature": merged.get("hour_1_temperature"), "humidity": merged.get("hour_1_humidity")}
+    bias = 0.0
+    try:
+        if data.temperature is not None:
+            bias = update_bias_and_correct(selected_first, float(data.temperature))
+    except Exception:
+        pass
+
+    merged["forecast_bias"] = bias
+    merged["forecast_history_len"] = len(bias_history)
+    payload = build_dashboard_payload(merged)
+    for k in list(BANNED_KEYS):
+        payload.pop(k, None)
+    send_to_thingsboard(payload)
+
+    return {"ok": True, "bias": bias, "saved_illum": LATEST_SENSOR["illuminance"], "saved_soil": LATEST_SENSOR["avg_soil_moisture"]}
+
+# ============================================================
+# Auto-loop runner
+# ============================================================
+
+def auto_loop():
+    while True:
+        try:
+            merged = merge_weather_and_hours({})
+            payload = build_dashboard_payload(merged)
+            send_to_thingsboard(payload)
+        except Exception as e:
+            logger.error(f"[AUTO LOOP ERROR] {e}")
+        time.sleep(AUTO_LOOP_INTERVAL)
+
+# ============================================================
+# CLI entry
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn, threading
+    threading.Thread(target=auto_loop, daemon=True).start()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 # ============================================================
 # FastAPI
 # ============================================================
@@ -756,4 +805,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "10000")),
         log_level="info",
-    )  
+    )
