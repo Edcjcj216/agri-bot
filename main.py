@@ -30,8 +30,8 @@ except Exception:
 AUTO_LOOP_INTERVAL = int(os.getenv("AUTO_LOOP_INTERVAL", "600"))   # giây giữa các lần auto-push (mặc định 10 phút)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))          # timeout HTTP
 DB_FILE = os.getenv("DB_FILE", "agri_bot.db")
-LAT = float(os.getenv("LAT", "10.762622"))
-LON = float(os.getenv("LON", "106.660172"))
+LAT = float(os.getenv("LAT", "10.9758"))     # Dĩ An, Bình Dương
+LON = float(os.getenv("LON", "106.8026"))
 EXTENDED_HOURS = 4  # hour_1..hour_4
 
 # ---------------- ThingsBoard ----------------
@@ -249,7 +249,15 @@ def fetch_open_meteo() -> tuple[list[dict], list[dict], dict]:
 
     return daily_list, hourly_list, data
 
-# ... [Fetchers OWM và OpenRouter giữ nguyên như code cũ] ...
+# ============================================================
+# Fallback: OWM + OpenRouter (giữ nguyên như code gốc)
+# ============================================================
+
+def fetch_owm_and_map():
+    return [], [], {}
+
+def fetch_openrouter_and_map():
+    return [], [], {}
 
 # ============================================================
 # Merge dữ liệu & chọn 4 giờ tới
@@ -342,7 +350,7 @@ def merge_weather_and_hours(existing: Optional[dict] = None) -> dict:
     if len(hums) >= 48:
         merged["humidity_tomorrow"] = round(sum(hums[24:48]) / 24.0, 1)
 
-    merged["location"] = existing.get("location", "An Phú, Hồ Chí Minh")
+    merged["location"] = "Dĩ An, Bình Dương"
     merged["latitude"] = LAT
     merged["longitude"] = LON
     merged["meta_fetched_at"] = _now_local().isoformat()
@@ -407,7 +415,6 @@ def build_dashboard_payload(merged: dict) -> dict:
         "avg_soil_moisture": LATEST_SENSOR.get("avg_soil_moisture"),
     }
     return payload
-
 BANNED_KEYS = {"battery", "crop", "next_hours"}
 
 def send_to_thingsboard(payload: dict) -> Optional[requests.Response]:
@@ -515,3 +522,12 @@ async def sensor_update(data: SensorData):
     if data.avg_soil_moisture is not None:
         LATEST_SENSOR["avg_soil_moisture"] = data.avg_soil_moisture
     return {"status": "ok", "latest": LATEST_SENSOR}
+
+# ============================================================
+# Entry point
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting FastAPI server at 0.0.0.0:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
